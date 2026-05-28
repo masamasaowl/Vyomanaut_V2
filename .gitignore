@@ -1,0 +1,30 @@
+# Compiled binaries and executables
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+out/
+dist/
+
+# Test artifacts
+*.test
+*.out
+coverage.txt
+
+# Dependency directory 
+# (Optional: Only ignore if you don't want to commit vendored dependencies)
+# vendor/
+
+# Local environment and secret files
+.env
+.env.*
+!.env.example
+
+# IDE and System files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
