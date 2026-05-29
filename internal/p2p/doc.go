@@ -1,4 +1,4 @@
-/* 
+/*
 Package p2p provides peer identity management, transport stack initialisation, and the Kademlia DHT
 interface. Goroutine-safe after construction.
 

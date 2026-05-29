@@ -1,7 +1,7 @@
 /*
 Components:
-	- NetworkProfile struct
-	- ProductionProfile
-	- DemoProfile
+  - NetworkProfile struct
+  - ProductionProfile
+  - DemoProfile
 */
 package config

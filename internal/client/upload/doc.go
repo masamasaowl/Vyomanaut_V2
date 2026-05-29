@@ -1,8 +1,8 @@
 /*
 Components
-	- Upload orchestrator 
-		- encode 
-		- assignment 
-		- parallel transfer
+  - Upload orchestrator
+  - encode
+  - assignment
+  - parallel transfer
 */
 package upload
