@@ -1,0 +1,49 @@
+# CODEOWNERS — Vyomanaut V2
+# REF: MVP §8.4
+#
+# GitHub enforces this file on every PR. A PR modifying a listed path
+# cannot be merged until ALL listed owners approve it.
+#
+# Current team:
+#   @masamasaowl  — project lead
+#   @reviewer1      — core contributor
+#   @reviewer2     — core contributor
+#
+# TODO: replace placeholder handles with real ones as team grows.
+
+# ─── CI / CODEOWNERS — changes here require unanimous approval ────────────────
+# A PR that removes a required CI check is automatically blocked.
+/.github/                   @masamasaowl @reviewer2 @reviewer1
+
+# ─── Migrations — highest-sensitivity path; all three owners required ─────────
+# REF: MVP §8.4 — "/migrations/ directory requires three reviewers"
+/migrations/                @masamasaowl @reviewer2 @reviewer1
+
+# ─── Core internal packages — two reviewers each ──────────────────────────────
+/internal/crypto/           @masamasaowl @reviewer2
+/internal/payment/          @masamasaowl @reviewer2
+/internal/audit/            @masamasaowl @reviewer2
+/internal/scoring/          @masamasaowl @reviewer2
+/internal/repair/           @masamasaowl @reviewer1
+/internal/erasure/          @masamasaowl @reviewer1
+/internal/storage/          @masamasaowl @reviewer1
+/internal/p2p/              @masamasaowl @reviewer2
+/internal/cluster/          @masamasaowl @reviewer2
+/internal/vettingchunk/     @masamasaowl @reviewer1
+/internal/config/           @masamasaowl @reviewer2
+/internal/api/              @masamasaowl @reviewer2
+/internal/secrets/          @masamasaowl @reviewer2
+/internal/metrics/          @masamasaowl @reviewer1
+/internal/client/           @masamasaowl @reviewer1
+
+# ─── Binaries — one reviewer sufficient ───────────────────────────────────────
+/cmd/                       @masamasaowl
+
+# ─── Scripts and CI checks ────────────────────────────────────────────────────
+/scripts/                   @masamasaowl @reviewer2
+
+# ─── Docs ─────────────────────────────────────────────────────────────────────
+/docs/                      @masamasaowl
+
+# ─── Catch-all: everything else requires at least the project lead ────────────
+*                           @masamasaowl

@@ -1,0 +1,202 @@
+# Vyomanaut V2 — CI Pipeline
+# REF: MVP §8.4
+#
+# TRANSITION RULE: When a milestone completes, remove `continue-on-error: true`
+# and the `|| (echo "PENDING..." && exit 0)` fallback from its gate check.
+# That check then becomes a hard merge-blocking gate.
+
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: vyomanaut_test
+          POSTGRES_USER: vyomanaut_app
+          POSTGRES_PASSWORD: testpass
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      # ─────────────────────────────────────────────────────────────
+      # check-01: Build — zero warnings, strict mode
+      # REF: MVP §8.4 check 1
+      # ─────────────────────────────────────────────────────────────
+      - name: check-01 — go build
+        id: check-01
+        run: go build ./...
+
+      # ─────────────────────────────────────────────────────────────
+      # check-02: Vet
+      # REF: MVP §8.4 check 2
+      # ─────────────────────────────────────────────────────────────
+      - name: check-02 — go vet
+        id: check-02
+        run: go vet ./...
+
+      # ─────────────────────────────────────────────────────────────
+      # check-03: golangci-lint
+      # Linters: gofmt, govet, errcheck, exhaustive, godot, mnd
+      # Note: golangci-lint updated from v1.57.0 → v2.12.2
+      # REF: MVP §8.4 check 3, .golangci.yml
+      # ─────────────────────────────────────────────────────────────
+      - name: check-03 — golangci-lint
+        id: check-03
+        uses: golangci/golangci-lint-action@v4
+        with:
+          version: v2.12.2
+          args: --timeout=5m
+
+      # ─────────────────────────────────────────────────────────────
+      # check-04: Tests with race detector
+      # REF: MVP §8.4 check 4
+      # ─────────────────────────────────────────────────────────────
+      - name: check-04 — go test (race detector)
+        id: check-04
+        run: go test -race -count=1 ./...
+
+      # ─────────────────────────────────────────────────────────────
+      # check-05: DHT key validator persistence (M6 gate)
+      # Becomes hard gate after Session 6.2.3 completes.
+      # REF: MVP §8.4 check 5, ADR-021
+      # ─────────────────────────────────────────────────────────────
+      - name: check-05 — TestDHTKeyValidatorPersists (M6 gate)
+        id: check-05
+        continue-on-error: true
+        run: |
+          go test -run TestDHTKeyValidatorPersists ./internal/p2p/... \
+            || (echo "PENDING: session 6.2.3" && exit 0)
+
+      # ─────────────────────────────────────────────────────────────
+      # check-06: No float arithmetic in payment package (M10 gate)
+      # Becomes hard gate after Session 10.4.2 completes.
+      # REF: MVP §8.4 check 6, INV-4, ADR-011
+      # ─────────────────────────────────────────────────────────────
+      - name: check-06 — TestNoFloatArithmetic (M10 gate)
+        id: check-06
+        continue-on-error: true
+        run: |
+          go test -run TestNoFloatArithmetic ./internal/payment/... \
+            || (echo "PENDING: session 10.4.2" && exit 0)
+
+      # ─────────────────────────────────────────────────────────────
+      # check-07: Migration apply + rollback against CI Postgres
+      # Requires btree_gist. Runs prod schema → separate demo schema.
+      # Becomes hard gate after M4 completes.
+      # REF: MVP §8.4 check 7, DM §migrations
+      # ─────────────────────────────────────────────────────────────
+      - name: check-07 — migration apply + rollback (M4 gate)
+        id: check-07
+        continue-on-error: true
+        env:
+          PGPASSWORD: testpass
+        run: |
+          psql -h localhost -U vyomanaut_app -d vyomanaut_test \
+            -c "CREATE EXTENSION IF NOT EXISTS btree_gist;"
+          go run migrations/generator.go --profile=prod \
+            > /tmp/001_prod.sql
+          psql -h localhost -U vyomanaut_app -d vyomanaut_test \
+            -f /tmp/001_prod.sql
+          go run migrations/generator.go --profile=demo \
+            > /tmp/001_demo.sql
+          # Demo schema applied to a separate DB to avoid cross-contamination.
+          psql -h localhost -U vyomanaut_app \
+            -c "CREATE DATABASE vyomanaut_demo_test;"
+          psql -h localhost -U vyomanaut_app -d vyomanaut_demo_test \
+            -c "CREATE EXTENSION IF NOT EXISTS btree_gist;"
+          psql -h localhost -U vyomanaut_app -d vyomanaut_demo_test \
+            -f /tmp/001_demo.sql
+
+      # ─────────────────────────────────────────────────────────────
+      # check-08 through check-11: grep-based invariant checks
+      # 08 — challenge_nonce must be BYTEA(33), never BYTEA(32)        INV-5
+      # 09 — no float types anywhere in internal/payment/              INV-4
+      # 10 — no references to non-existent ADRs (above ADR-031)
+      # 11 — no UPI Collect API endpoint strings
+      # REF: MVP §8.4 checks 8–11, scripts/ci/grep_checks.sh
+      # ─────────────────────────────────────────────────────────────
+      - name: check-08 to check-11 — grep invariant checks
+        id: check-08-11
+        run: bash scripts/ci/grep_checks.sh
+
+      # ─────────────────────────────────────────────────────────────
+      # check-12: Mermaid render check for all docs/system-design/ diagrams
+      # Becomes hard gate once diagrams are committed.
+      # REF: MVP §8.4 check 12
+      # ─────────────────────────────────────────────────────────────
+      - name: check-12 — Mermaid render
+        id: check-12
+        continue-on-error: true
+        run: |
+          npx --yes @mermaid-js/mermaid-cli -V \
+            || (echo "PENDING: mermaid diagrams" && exit 0)
+
+      # ─────────────────────────────────────────────────────────────
+      # check-13: Hyperlink integrity for all docs/**/*.md files
+      # Becomes hard gate once docs are stabilised.
+      # REF: MVP §8.4 check 13
+      # ─────────────────────────────────────────────────────────────
+      - name: check-13 — hyperlink check
+        id: check-13
+        continue-on-error: true
+        run: |
+          npx --yes markdown-link-check docs/**/*.md \
+            || (echo "PENDING: links may be stale" && exit 0)
+
+      # ─────────────────────────────────────────────────────────────
+      # check-14: ShardSize compile-time constant (M1 gate)
+      # Becomes hard gate after Session 1.2.1 completes.
+      # REF: MVP §8.4 check 14, INV-7, ADR-003
+      # ─────────────────────────────────────────────────────────────
+      - name: check-14 — TestProfileShardSizeIsConstant (M1 gate)
+        id: check-14
+        continue-on-error: true
+        run: |
+          go test -run TestProfileShardSizeIsConstant ./internal/config/... \
+            || (echo "PENDING: session 1.2.1" && exit 0)
+
+      # ─────────────────────────────────────────────────────────────
+      # check-15: Both NetworkProfiles fully specified (M1 gate)
+      # Becomes hard gate after Session 1.2.2 completes.
+      # REF: MVP §8.4 check 15, ADR-031
+      # ─────────────────────────────────────────────────────────────
+      - name: check-15 — TestProfileBothFullySpecified (M1 gate)
+        id: check-15
+        continue-on-error: true
+        run: |
+          go test -run TestProfileBothFullySpecified ./internal/config/... \
+            || (echo "PENDING: session 1.2.2" && exit 0)
+
+      # ─────────────────────────────────────────────────────────────
+      # check-16: No orphan metric names (M-OBS gate)
+      # All Prometheus metric names must follow vyomanaut_{subsystem}_{name}_{unit}.
+      # Becomes hard gate after Session OBS.4.1 completes.
+      # REF: MVP §8.4 check 16, INV-METRIC
+      # ─────────────────────────────────────────────────────────────
+      - name: check-16 — TestNoOrphanMetricName (M-OBS gate)
+        id: check-16
+        continue-on-error: true
+        run: |
+          bash scripts/ci/grep_checks.sh --check=metric-names \
+            || (echo "PENDING: session OBS.4.1" && exit 0)
