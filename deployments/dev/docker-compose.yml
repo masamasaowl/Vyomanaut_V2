@@ -1,0 +1,112 @@
+# deployments/dev/docker-compose.yml
+# Development environment for Vyomanaut V2.
+#
+# REF: MVP §8.5 — dev docker-compose requirements
+# REF: architecture.md §27.5 — relay provisioning threshold
+#
+# Bring up:  docker-compose -f deployments/dev/docker-compose.yml up
+# Tear down: docker-compose -f deployments/dev/docker-compose.yml down -v
+#
+# TRANSITION RULES (mirror the pattern in .github/workflows/ci.yml):
+#   M12 — replace microservice stub with cmd/microservice binary
+#   M13 — replace provider stub with cmd/provider binary + real flags
+#   M17 — replace relay placeholder with cmd/relay binary
+#
+# SCALE NOTE (architecture.md §27.5): provision a 4th relay node before
+# provider count reaches 400 in production. This dev compose runs zero
+# real relay nodes; NAT traversal is not tested here.
+
+services:
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # postgres
+  # One postgres:16 instance with btree_gist pre-installed via init-db.sql.
+  # The health-check gate ensures dependent services wait for readiness.
+  # REF: MVP §8.5, data-model.md §migrations
+  # ──────────────────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: vyomanaut_dev
+      POSTGRES_USER: vyomanaut_app
+      POSTGRES_PASSWORD: devpass
+    ports:
+      - "5432:5432"
+    volumes:
+      # init-db.sql runs once on first container startup and installs btree_gist.
+      # This command runs it
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vyomanaut_app"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # relay  (placeholder — cmd/relay binary created in M17 Session 17.2.2)
+  # Keeps docker-compose valid and explicitly documented until M17.
+  # REF: MVP §8.5, architecture.md §27.5
+  # ──────────────────────────────────────────────────────────────────────────
+  relay:
+    image: alpine:3.19
+    command:
+      - sh
+      - -c
+      - "echo 'relay placeholder — implement M17' && sleep infinity"
+    # TODO(M17): replace with:
+    #   build:
+    #     context: ../..
+    #     dockerfile: deployments/docker/Dockerfile.relay
+    #   command:
+    #     - ./relay
+    #     - --listen=/ip4/0.0.0.0/udp/4001/quic-v1
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # provider  (stub — binary built from cmd/provider after M13)
+  # Runs in --sim-count=5 --sim-asn-count=5 simulation mode once M13 ships.
+  # REF: MVP §8.5, build.md M13
+  # ──────────────────────────────────────────────────────────────────────────
+  provider:
+    image: alpine:3.19
+    command:
+      - sh
+      - -c
+      - "echo 'provider stub — implement M13' && sleep infinity"
+    environment:
+      VYOMANAUT_MODE: demo
+    # TODO(M13): replace with:
+    #   build:
+    #     context: ../..
+    #     dockerfile: deployments/docker/Dockerfile.provider
+    #   command:
+    #     - ./provider
+    #     - --microservice-url=http://microservice:8080
+    #     - --sim-count=5
+    #     - --sim-asn-count=5
+    #     - --declared-storage-gb=50
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # microservice  (stub — replace with cmd/microservice binary after M12)
+  # VYOMANAUT_CLUSTER_MASTER_SEED is dev-only; never use this value in prod.
+  # REF: MVP §8.5, build.md M12, ADR-017 (cluster secret derivation)
+  # ──────────────────────────────────────────────────────────────────────────
+  microservice:
+    image: alpine:3.19
+    command:
+      - sh
+      - -c
+      - "echo 'microservice stub — implement M12' && sleep infinity"
+    environment:
+      VYOMANAUT_MODE: demo
+      # DEV ONLY — never commit a real master seed to source control.
+      VYOMANAUT_CLUSTER_MASTER_SEED: "devonlysecret00000000000000000000"
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # TODO(M12): replace with:
+    #   build:
+    #     context: ../..
+    #     dockerfile: deployments/docker/Dockerfile.microservice
+    #   command: ["./microservice"]
