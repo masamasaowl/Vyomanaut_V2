@@ -1,5 +1,7 @@
 // Package config is declared in doc.go.
 // This file defines the two canonical NetworkProfile instances.
+// 1. ProductionProfile (PROD)
+// 2. DemoProfile (DEMO)
 //
 // INVARIANT (OR-03): Every field of NetworkProfile must appear explicitly in both struct literals below. Go's named-field literal syntax makes an omission visible at code review; a missing field silently receives its zero value which may be catastrophically wrong for production (e.g. a zero AuditPeriodDuration or a zero MinActiveProviders).
 //
