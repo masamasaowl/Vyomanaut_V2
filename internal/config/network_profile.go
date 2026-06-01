@@ -1,0 +1,119 @@
+// Package config is declared in doc.go.
+// This file defines the NetworkProfile struct — the single authoritative container for all parameters that differ between DEMO and PROD mode.
+//
+// [REF: MVP §5.1]
+// [REF: ADR-001, ADR-003, ADR-004, ADR-005, ADR-006, ADR-007, ADR-008,ADR-014, ADR-015, ADR-016, ADR-020, ADR-024, ADR-028, ADR-029, ADR-031]
+
+package config
+
+import "time"
+
+// NetworkProfile is the single authoritative container for all parameters that
+// differ between DEMO and PROD mode.
+//
+// It is constructed once at startup (see select.go) and passed via dependency injection to every subsystem. No subsystem may read VYOMANAUT_MODE directly; all mode-variable behaviour must be derived from the fields of this struct.
+//
+// INVARIANT: Every field that affects wire format, cryptographic output, or database schema (ShardSize, challenge nonce length, amount_paise type) must be identical in both profiles. Only performance thresholds, time windows, and infrastructure scale parameters are mode-variable.
+//
+// [REF: MVP §5.1]
+// [REF: MVP §6.3 OR-03 — struct literal syntax enforces both profiles are complete]
+type NetworkProfile struct {
+
+	// ── Erasure coding ────────────────────────────────────────────────────────
+	// [REF: ADR-003]
+	DataShards   int // s — data shard count
+	ParityShards int // r — parity shard count
+	TotalShards  int // n = s + r — total shard count
+	// ShardSize is present in the struct solely for Go compiler completeness
+	// enforcement via struct literal syntax (MVP §6.3 OR-03). Its value MUST
+	// equal the canonical shard byte length (2^18 = 262,144) in both profiles.
+	// The cross-package assertion against the erasure package constant is
+	// deferred to M3 Session 3.1.1. [REF: ADR-003, INV-7]
+	ShardSize    int
+	LazyRepairR0 int // r0 — minimum shards required before lazy repair triggers
+
+	// ── Readiness gate ────────────────────────────────────────────────────────
+	// Minimum conditions that must be satisfied before the assignment service
+	// accepts upload requests.
+	// [REF: ADR-029]
+	MinActiveProviders int
+	MinDistinctASNs    int
+	MinMetroRegions    int
+	MinRelayNodes      int
+	MinCooledAccounts  int
+
+	// ── ASN cap ───────────────────────────────────────────────────────────────
+	// MaxShardsPerASN = floor(TotalShards * ASNCapFraction).
+	// Production: floor(56 * 0.20) = 11 shards per ASN.
+	// Demo:       floor(5  * 0.20) = 1 shard per ASN (5 synthetic ASNs satisfy).
+	// [REF: ADR-014]
+	ASNCapFraction float64
+
+	// ── Time windows ──────────────────────────────────────────────────────────
+	HeartbeatInterval    time.Duration // provider → microservice liveness signal interval [REF: ADR-028]
+	HeartbeatJitter      time.Duration // random jitter added to each heartbeat interval   [REF: ADR-028]
+	PollingInterval      time.Duration // audit-scheduler polling cadence                  [REF: ADR-006]
+	DHTRepublishInterval time.Duration // DHT key republication interval                   [REF: ADR-001]
+	DHTExpiryDuration    time.Duration // DHT record TTL                                   [REF: ADR-001]
+	DepartureThreshold   time.Duration // silence duration before a provider is DEPARTED   [REF: ADR-006, ADR-007]
+
+	// PromisedDowntimeMaximum is the maximum duration a provider may declare as
+	// planned maintenance before the network treats the absence as a departure.
+	// [REF: ADR-007]
+	PromisedDowntimeMaximum time.Duration
+
+	AuditPeriodDuration    time.Duration // length of a single audit billing period          [REF: ADR-016]
+	EscrowHoldWindow       time.Duration // lookback window used by the release computation  [REF: ADR-024]
+	VettingHoldWindow      time.Duration // minimum time funds are held during vetting        [REF: ADR-024]
+	PendingReceiptGCAge    time.Duration // age at which un-responded challenges are GC'd     [REF: ADR-015]
+	RepairPromotionTimeout time.Duration // PRE_WARNING jobs older than this become PERMANENT [REF: ADR-004, FR-043]
+
+	// ── Scoring windows ───────────────────────────────────────────────────────
+	// The three windows used to compute the provider reliability score.
+	// DualWindowDrop is always 0.20 (20%) regardless of mode.
+	// [REF: ADR-008]
+	ScoreWindowShort  time.Duration
+	ScoreWindowMedium time.Duration
+	ScoreWindowLong   time.Duration
+	DualWindowDrop    float64 // always 0.20; never mode-variable
+
+	// ── Vetting ───────────────────────────────────────────────────────────────
+	// VettingCapFraction is always 0.10 (10% of declared_storage_gb) regardless
+	// of mode.
+	// [REF: ADR-005]
+	VettingMinPasses   int
+	VettingMinDuration time.Duration
+	VettingCapFraction float64 // always 0.10; never mode-variable
+
+	// ── Cryptographic cost ────────────────────────────────────────────────────
+	// Argon2id parameters passed to the crypto package's DeriveMasterSecret.
+	// [REF: ADR-020]
+	Argon2Time    uint32
+	Argon2Memory  uint32 // in KiB
+	Argon2Threads uint8
+
+	// ── Infrastructure ────────────────────────────────────────────────────────
+	RequireSecretsManager bool   // if false, read VYOMANAUT_CLUSTER_MASTER_SEED env var
+	RequireQuorum         bool   // if false, gossip cluster allows N=1 with quorum disabled
+	PaymentMode           string // "razorpay_live" | "razorpay_test" | "mock"
+	SkipMnemonicConfirm   bool   // if true, client skips two-word mnemonic confirmation step
+	RazorpayCoolingPeriod time.Duration
+
+	// ── Release computation cycle ─────────────────────────────────────────────
+	// 0 means calendar-driven (production: computed on the 23rd of each month).
+	// Non-zero means ticker-driven (demo: computed every ReleaseComputationInterval).
+	// Callers branch on `profile.ReleaseComputationInterval == 0`.
+	// [REF: ADR-024, ADR-031]
+	ReleaseComputationInterval time.Duration
+
+	// ── GC retry backoff ─────────────────────────────────────────────────────
+	// Slice of back-off durations for vetting GC delivery retries.
+	// Access via profile.GCRetryBackoff[attempt] (bounds-checked by caller).
+	// [REF: IC §4.5]
+	GCRetryBackoff []time.Duration
+
+	// ── Mode identifier ───────────────────────────────────────────────────────
+	// Printed in full at startup (MVP §6.3 OR-01). MUST NOT be used for
+	// runtime branching inside business logic — use the typed fields above.
+	Mode string // "demo" | "prod"
+}
