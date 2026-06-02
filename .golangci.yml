@@ -10,29 +10,25 @@ linters:
     - exhaustive
     - godot
     - mnd
-
-formatters:
-  enable:
-    - gofmt
-
-linters-settings:
-  exhaustive:
+  settings:
+    exhaustive:
     # Types added here as they are defined in subsequent milestones.
     # Format: <package_import_path>.<TypeName>
     # M7: internal/audit.AuditResult
     # M9: internal/repair.Priority, internal/repair.TriggerType
     # M10: internal/payment.EscrowEventType
-    default-signifies-exhaustive: false
+      default-signifies-exhaustive: false
+    errcheck:
+      check-type-assertions: true
+    mnd:
+      ignored-functions:
+        - "argon2.IDKey"
+  exclusions:
+    rules:
+      - path: "_test\\.go"
+        linters:
+          - mnd
 
-  errcheck:
-    check-type-assertions: true
-
-  mnd:
-    ignored-functions:
-      - "argon2.IDKey"
-
-issues:
-  exclude-rules:
-    - path: "_test\\.go"
-      linters:
-        - mnd
+formatters:
+  enable:
+    - gofmt
