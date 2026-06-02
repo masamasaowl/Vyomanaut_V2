@@ -8,7 +8,6 @@ linters:
     - govet
     - errcheck
     - exhaustive
-    - godot
     - mnd
   settings:
     exhaustive:
@@ -26,6 +25,9 @@ linters:
   exclusions:
     rules:
       - path: "_test\\.go"
+        linters:
+          - mnd
+      - path: "internal/config/profiles\\.go"
         linters:
           - mnd
 

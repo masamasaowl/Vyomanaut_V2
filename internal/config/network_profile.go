@@ -1,8 +1,8 @@
 // Package config is declared in doc.go.
 // This file defines the NetworkProfile struct — the single authoritative container for all parameters that differ between DEMO and PROD mode.
 //
-// [REF: MVP §5.1]
-// [REF: ADR-001, ADR-003, ADR-004, ADR-005, ADR-006, ADR-007, ADR-008,ADR-014, ADR-015, ADR-016, ADR-020, ADR-024, ADR-028, ADR-029, ADR-031]
+// [REF: MVP §5.1].
+// [REF: ADR-001, ADR-003, ADR-004, ADR-005, ADR-006, ADR-007, ADR-008,ADR-014, ADR-015, ADR-016, ADR-020, ADR-024, ADR-028, ADR-029, ADR-031].
 
 package config
 

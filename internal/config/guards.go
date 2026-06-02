@@ -1,7 +1,7 @@
 // Package config is declared in doc.go.
 // This file implements mandatory startup guard rails (MVP §2.3, IC §3.3).
 //
-// [REF: MVP §2.3, IC §3.3, build.md Phase 1.3 Session 1.3.2]
+// [REF: MVP §2.3, IC §3.3, build.md Phase 1.3 Session 1.3.2].
 
 package config
 
