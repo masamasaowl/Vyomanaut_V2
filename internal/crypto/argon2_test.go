@@ -92,6 +92,8 @@ func TestArgon2idNonCollision(t *testing.T) {
 // [REF: IC §5.1]
 func TestArgon2idOutputLength(t *testing.T) {
 	out := DeriveMasterSecret(katArgon2Passphrase, katArgon2OwnerID[:], unitArgon2Time, unitArgon2Memory, unitArgon2Threads)
+	// resolve staticcheck linting error by explicitly marking out as intentionally unused
+	_ = out 
 	if len(out) != 32 {
 		t.Errorf("DeriveMasterSecret: output length = %d, want 32", len(out))
 	}
