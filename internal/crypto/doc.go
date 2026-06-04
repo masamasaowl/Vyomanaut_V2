@@ -22,6 +22,12 @@ Design notes after HKDF key derivation (Phase 2.2)
  3. _, _ = h.Write(…) everywhere. hash.Hash.Write is contractually infallible, but errcheck still flags a bare h.Write(data). The explicit double-blank avoids both the lint failure and any //nolint that would need a BUILD citation
  4. [sha256.Size]byte return type = [32]byte — identical type in Go. Uses the named constant rather than a raw literal, keeping mnd clean on non-test files. The VERIFY grep anchored to ^func matches either spelling.
 
+Design notes after Phase 2.4 — AONT Cipher:
+ 1. Package layout follows ARCH §10 Stage 1
+ 2. The two cipher paths (ChaCha20-256 / AES-256-CTR) share the internal aontEncrypt helper; self-inverse XOR means encode == decode.
+ 3. AES-256-CTR counter starts at 1 (big-endian uint128) matching ARCH §10 Stage 1; cipher.NewCTR is used in place of the manual word loop.
+ 4. Canary value = first 16 bytes of SHA-256("vyomanaut-aont-canary-v1"): 0x16 0x14 0x38 0x2e 0x7a 0x0b 0x48 0xc4 0xe2 0xc7 0x42 0x13 0x03 0x5f 0xbc 0x64
+
 Ref: ADR-019 (ChaCha20-256 / AES-256-CTR), ADR-020 (HKDF key hierarchy)
 */
 package crypto
