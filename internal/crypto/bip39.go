@@ -42,9 +42,6 @@ const (
 	// bip39EntropyBytes is the master-secret byte length (256-bit entropy).
 	bip39EntropyBytes = 32
 
-	// bip39ChecksumBits is the number of checksum bits for 256-bit entropy (= 256/32).
-	bip39ChecksumBits = 8
-
 	// bip39TotalBytes is the size of the packed encoding buffer in bytes.
 	// 256 bits entropy + 8 bits checksum = 264 bits = 33 bytes.
 	bip39TotalBytes = 33
@@ -54,6 +51,12 @@ const (
 	// that fits in one byte (10 × 24 = 240). Bytes ≥ 240 are discarded to
 	// eliminate modulo bias.
 	bip39RandCeiling = 10 * bip39MnemonicLen
+
+	// bip39BitWidth is the number of bits in a byte (used in bit manipulation).
+	bip39BitWidth = 8
+
+	// bip39BitOffset is the MSB offset within a byte.
+	bip39BitOffset = 7
 )
 
 // ── Embedded wordlist ─────────────────────────────────────────────────────────
@@ -94,8 +97,8 @@ func bip39ExtractBits(b []byte, start, count int) int {
 	result := 0
 	for i := 0; i < count; i++ {
 		bitPos := start + i
-		byteIdx := bitPos / 8
-		bitOff := 7 - (bitPos % 8) // MSB within a byte has offset 7
+		byteIdx := bitPos / bip39BitWidth
+		bitOff := bip39BitOffset - (bitPos % bip39BitWidth) // MSB within a byte has offset 7
 		result = (result << 1) | (int(b[byteIdx])>>uint(bitOff))&1
 	}
 	return result
@@ -107,8 +110,8 @@ func bip39SetBits(b []byte, start, count, value int) {
 	for i := 0; i < count; i++ {
 		if (value>>uint(count-1-i))&1 == 1 {
 			bitPos := start + i
-			byteIdx := bitPos / 8
-			bitOff := 7 - (bitPos % 8)
+			byteIdx := bitPos / bip39BitWidth
+			bitOff := bip39BitOffset - (bitPos % bip39BitWidth)
 			b[byteIdx] |= byte(1 << uint(bitOff))
 		}
 	}
