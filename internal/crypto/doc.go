@@ -28,6 +28,10 @@ Design notes after Phase 2.4 — AONT Cipher:
  3. AES-256-CTR counter starts at 1 (big-endian uint128) matching ARCH §10 Stage 1; cipher.NewCTR is used in place of the manual word loop.
  4. Canary value = first 16 bytes of SHA-256("vyomanaut-aont-canary-v1"): 0x16 0x14 0x38 0x2e 0x7a 0x0b 0x48 0xc4 0xe2 0xc7 0x42 0x13 0x03 0x5f 0xbc 0x64
 
+Design notes after Phase 2.5 — Pointer File AEAD:
+ 1. NFR-019 constant-time guarantee: chacha20poly1305.Open uses crypto/subtle internally; the 5 grep hits are from comments in chacha20poly1305.go that explicitly document this for auditors.
+ 2. ErrInvalidMnemonic pre-declared for Phase 2.6 (BIP-39), consistent with the existing errors.go in the repo.
+
 Ref: ADR-019 (ChaCha20-256 / AES-256-CTR), ADR-020 (HKDF key hierarchy)
 */
 package crypto
