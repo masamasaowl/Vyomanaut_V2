@@ -32,6 +32,11 @@ Design notes after Phase 2.5 — Pointer File AEAD:
  1. NFR-019 constant-time guarantee: chacha20poly1305.Open uses crypto/subtle internally; the 5 grep hits are from comments in chacha20poly1305.go that explicitly document this for auditors.
  2. ErrInvalidMnemonic pre-declared for Phase 2.6 (BIP-39), consistent with the existing errors.go in the repo.
 
+Design notes after Phase 2.7 — Ed25519 Signing Conventions
+ 1. SignBytes/VerifyBytes take [64]byte / [32]byte fixed-size arrays; the type system enforces sig and key lengths at compile time, removing the len(sig)==64 runtime checks IC §3.2 describes for higher-level callers.
+ 2. ErrInvalidSignature is not declared here; it belongs in the calling package (audit, p2p) per IC §3.2 "Return ErrInvalidSignature if false."
+ 3. Compile-time assertion var _ [ed25519.PublicKeySize - 32]byte creates [0]byte when the constant is 32 (valid) and a negative-size or non-zero array otherwise, (compile error), anchored by the exact string in the comment above it
+
 Ref: ADR-019 (ChaCha20-256 / AES-256-CTR), ADR-020 (HKDF key hierarchy)
 */
 package crypto
