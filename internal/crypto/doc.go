@@ -37,6 +37,6 @@ Design notes after Phase 2.7 — Ed25519 Signing Conventions
  2. ErrInvalidSignature is not declared here; it belongs in the calling package (audit, p2p) per IC §3.2 "Return ErrInvalidSignature if false."
  3. Compile-time assertion var _ [ed25519.PublicKeySize - 32]byte creates [0]byte when the constant is 32 (valid) and a negative-size or non-zero array otherwise, (compile error), anchored by the exact string in the comment above it
 
-Ref: ADR-019 (ChaCha20-256 / AES-256-CTR), ADR-020 (HKDF key hierarchy)
+[REF: ADR-019 (ChaCha20-256 / AES-256-CTR), ADR-020 (HKDF key hierarchy)]
 */
 package crypto
