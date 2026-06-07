@@ -24,6 +24,12 @@ package erasure
 
 import "fmt"
 
+const (
+	// primitiveElement is the primitive element of GF(2^8) used in the Vandermonde matrix.
+	// See the file header documentation for field theory details.
+	primitiveElement = 2
+)
+
 // ── GF(2^8) arithmetic ────────────────────────────────────────────────────────
 // Irreducible polynomial: 0x11d = x^8 + x^4 + x^3 + x^2 + 1.
 
@@ -80,7 +86,7 @@ func invertMatrix(m [][]byte, n int) ([][]byte, error) {
 	// Augment [m | I_n]
 	aug := make([][]byte, n)
 	for i := range aug {
-		aug[i] = make([]byte, 2*n)
+		aug[i] = make([]byte, primitiveElement*n)
 		copy(aug[i], m[i])
 		aug[i][n+i] = 1
 	}
@@ -145,7 +151,7 @@ func buildGeneratorMatrix(data, parity int) ([][]byte, error) {
 		for c := 0; c < data; c++ {
 			// (α^r)^c = α^(r·c); gfPow(2, r·c) computes this correctly
 			// because gfLog[2]=1, so gfExp[1·r·c % 255] = α^(r·c).
-			vm[r][c] = gfPow(2, r*c)
+			vm[r][c] = gfPow(primitiveElement, r*c)
 		}
 	}
 
