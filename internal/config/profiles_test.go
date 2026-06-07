@@ -1,47 +1,75 @@
-package config
+/*
+── Updated internal/config/profiles_test.go ─────────────────────────────────
+Changed to package config_test (external test) so it can import
+internal/erasure without creating an import cycle
+(erasure → config, so config non-test → erasure would cycle;
+config_test → erasure is the canonical way to break the cycle).
+*/
+
+package config_test
+
+// Package config_test is the external test package for internal/config.
+// Using an external test package (suffix _test) allows this file to import
+// internal/erasure without creating an import cycle: erasure imports config,
+// so config non-test code must not import erasure, but config_test may.
+//
+// [REF: MVP §8.4 check-14/15, DM §3 Invariant 7, ADR-003, ADR-031]
 
 import (
 	"reflect"
 	"testing"
 	"time"
+
+	"github.com/masamasaowl/Vyomanaut_V2/internal/config"
+	"github.com/masamasaowl/Vyomanaut_V2/internal/erasure"
 )
 
-// TestProfileShardSizeIsConstant asserts that both NetworkProfile instances encode
-// ShardSize as 262144 bytes (256 KiB) — the canonical shard size required for vLog
-// entry sizing, audit challenge framing, and RocksDB index assumptions.
-//
-// TODO: cross-check with erasure.ShardSize (262144) after M3 Session 3.1.1 completes.
+// TestProfileShardSizeIsConstant asserts that both NetworkProfile instances
+// encode ShardSize as 262144 bytes (256 KiB) — the canonical shard size
+// required for vLog entry sizing, audit challenge framing, and RocksDB index
+// assumptions. It also cross-checks the profile field against the
+// erasure.ShardSize compile-time constant (DM §3 Invariant 7, ADR-031).
 //
 // [REF: MVP §8.4 check-14, DM §3 Invariant 7, ADR-003, ADR-031]
 func TestProfileShardSizeIsConstant(t *testing.T) {
-	// mnd excluded for _test.go files (.golangci.yml). The literal must appear
-	// twice — once in the constant declaration, once in the TODO above — so the
-	// grep check (EXPECT: >= 2) passes without violating the production no-magic-
-	// number rule.
-	const canonicalShardSize = 262144 // 2^18 = 256 KiB; will equal erasure.ShardSize after M3
+	const canonicalShardSize = 262144 // 2^18 = 256 KiB; equals erasure.ShardSize
 
-	if ProductionProfile.ShardSize != canonicalShardSize {
-		t.Errorf("ProductionProfile.ShardSize = %d; want %d", ProductionProfile.ShardSize, canonicalShardSize)
+	if config.ProductionProfile.ShardSize != canonicalShardSize {
+		t.Errorf("ProductionProfile.ShardSize = %d; want %d",
+			config.ProductionProfile.ShardSize, canonicalShardSize)
 	}
-	if DemoProfile.ShardSize != canonicalShardSize {
-		t.Errorf("DemoProfile.ShardSize = %d; want %d", DemoProfile.ShardSize, canonicalShardSize)
+	if config.DemoProfile.ShardSize != canonicalShardSize {
+		t.Errorf("DemoProfile.ShardSize = %d; want %d",
+			config.DemoProfile.ShardSize, canonicalShardSize)
+	}
+
+	// Cross-check: compile-time constant must equal runtime profile field.
+	// [REF: DM §3 Invariant 7, ADR-031]
+	if config.ProductionProfile.ShardSize != erasure.ShardSize {
+		t.Errorf("ProductionProfile.ShardSize=%d != erasure.ShardSize=%d",
+			config.ProductionProfile.ShardSize, erasure.ShardSize)
+	}
+	if config.DemoProfile.ShardSize != erasure.ShardSize {
+		t.Errorf("DemoProfile.ShardSize=%d != erasure.ShardSize=%d",
+			config.DemoProfile.ShardSize, erasure.ShardSize)
 	}
 }
 
 // TestProfileBothFullySpecified uses reflection to verify that every field in
-// ProductionProfile and DemoProfile is non-zero, except for the small allowlist of
-// fields where zero is explicitly the correct value per MVP §5.2.
+// ProductionProfile and DemoProfile is non-zero, except for the small
+// allowlist of fields where zero is explicitly the correct value per MVP §5.2.
 //
-// This catches any new NetworkProfile field added without a corresponding value in
-// one or both profiles — Go struct literal syntax enforces completeness at compile
-// time (OR-03), but a forgotten field in a future edit would silently receive its
-// zero value. This test is the runtime complement to that compile-time guard.
+// This catches any new NetworkProfile field added without a corresponding
+// value in one or both profiles — Go struct literal syntax enforces
+// completeness at compile time (OR-03), but a forgotten field in a future
+// edit would silently receive its zero value. This test is the runtime
+// complement to that compile-time guard.
 //
 // [REF: MVP §8.4 check-15, MVP §6.3 OR-03, ADR-031]
 func TestProfileBothFullySpecified(t *testing.T) {
 	type profileCase struct {
 		name    string
-		profile NetworkProfile
+		profile config.NetworkProfile
 		// allowedZeroFields maps field names to the reason zero is intentionally
 		// correct. Each entry cites the governing spec reference so a future
 		// developer understands the rationale before changing it.
@@ -51,42 +79,43 @@ func TestProfileBothFullySpecified(t *testing.T) {
 	cases := []profileCase{
 		{
 			name:    "ProductionProfile",
-			profile: ProductionProfile,
+			profile: config.ProductionProfile,
 			allowedZeroFields: map[string]string{
-				// ReleaseComputationInterval = 0 means calendar-driven: the release
-				// computation fires on the 23rd of each calendar month, not on a ticker.
-				// Callers branch on `profile.ReleaseComputationInterval == 0`.
-				// Zero is correct here per MVP §5.2, ADR-024, ADR-031.
-				"ReleaseComputationInterval": "zero is correct: calendar-driven release fires on the 23rd of each month (ADR-024, ADR-031)",
+				// ReleaseComputationInterval = 0 means calendar-driven: the
+				// release computation fires on the 23rd of each calendar month,
+				// not on a ticker. Callers branch on
+				// `profile.ReleaseComputationInterval == 0`.
+				// Zero is correct per MVP §5.2, ADR-024, ADR-031.
+				"ReleaseComputationInterval": "zero is correct: calendar-driven release fires on the 23rd (ADR-024, ADR-031)",
 
-				// SkipMnemonicConfirm = false means production always demands the
-				// two-word mnemonic confirmation step before an upload proceeds.
-				// Zero (false) is correct here per MVP §5.2, MVP §3.5.
+				// SkipMnemonicConfirm = false means production always demands
+				// the two-word mnemonic confirmation step.
+				// Zero (false) is correct per MVP §5.2, MVP §3.5.
 				"SkipMnemonicConfirm": "zero is correct: production always requires mnemonic confirmation (MVP §3.5)",
 			},
 		},
 		{
 			name:    "DemoProfile",
-			profile: DemoProfile,
+			profile: config.DemoProfile,
 			allowedZeroFields: map[string]string{
-				// RazorpayCoolingPeriod = 0 means instant: demo uses the mock payment
-				// provider, so no Razorpay cooling wait applies.
-				// Zero is correct here per MVP §3.4 ("Razorpay cooling period: 0 s (instant)").
+				// RazorpayCoolingPeriod = 0 means instant: demo uses the mock
+				// payment provider, so no Razorpay cooling wait applies.
+				// Zero is correct per MVP §3.4.
 				"RazorpayCoolingPeriod": "zero is correct: instant cooling in demo, mock payment provider (MVP §3.4)",
 
-				// MinRelayNodes = 0 because demo runs on a single LAN where NAT
-				// traversal is not exercised. Relay nodes are only needed in production.
-				// Zero is correct here per MVP §3.3 ("Relay nodes: 0").
+				// MinRelayNodes = 0 because demo runs on a single LAN where
+				// NAT traversal is not exercised.
+				// Zero is correct per MVP §3.3.
 				"MinRelayNodes": "zero is correct: demo runs on LAN, no relay nodes required (MVP §3.3)",
 
-				// RequireSecretsManager = false: demo reads VYOMANAUT_CLUSTER_MASTER_SEED
-				// from an environment variable instead of a secrets manager.
-				// Zero (false) is correct here per MVP §3.3, MVP §6.3 CR-01.
+				// RequireSecretsManager = false: demo reads the cluster master
+				// seed from an environment variable.
+				// Zero (false) is correct per MVP §3.3, MVP §6.3 CR-01.
 				"RequireSecretsManager": "zero is correct: env var replaces secrets manager in demo (MVP §3.3)",
 
-				// RequireQuorum = false: demo runs a single microservice replica with
-				// quorum checks disabled (no HA infrastructure required for demo).
-				// Zero (false) is correct here per MVP §3.3 ("Microservice quorum: Single instance").
+				// RequireQuorum = false: demo runs a single microservice
+				// replica with quorum checks disabled.
+				// Zero (false) is correct per MVP §3.3.
 				"RequireQuorum": "zero is correct: single-instance microservice in demo, no quorum (MVP §3.3)",
 			},
 		},
@@ -105,8 +134,8 @@ func TestProfileBothFullySpecified(t *testing.T) {
 				}
 				if value.IsZero() {
 					t.Errorf(
-						"field %s is zero-value in %s — either set it explicitly or add it to "+
-							"the allowedZeroFields map with a spec reference explaining why zero is correct",
+						"field %s is zero-value in %s — either set it explicitly or add it "+
+							"to the allowedZeroFields map with a spec reference explaining why zero is correct",
 						field.Name, tc.name,
 					)
 				}
@@ -115,22 +144,20 @@ func TestProfileBothFullySpecified(t *testing.T) {
 	}
 }
 
-// TestDemoDiffersFromProduction documents the exact boundary between mode-variable
-// parameters (must differ) and wire-format invariants (must be identical).
+// TestDemoDiffersFromProduction documents the exact boundary between
+// mode-variable parameters (must differ) and wire-format invariants
+// (must be identical).
 //
-// "Must differ" fields come from MVP §3.2 (erasure coding), §3.3 (readiness gate),
-// §3.4 (time windows), §3.5 (cryptographic parameters), and the infrastructure block.
-// "Must be identical" fields are those declared never-mode-variable in MVP §5.1:
+// "Must differ" fields come from MVP §3.2–§3.5.
+// "Must be identical" fields are declared never-mode-variable in MVP §5.1:
 // ShardSize, ASNCapFraction, VettingCapFraction, DualWindowDrop.
 //
 // [REF: MVP §3.2–§3.5, MVP §5.1, ADR-031]
 func TestDemoDiffersFromProduction(t *testing.T) {
-	prod := ProductionProfile
-	demo := DemoProfile
+	prod := config.ProductionProfile
+	demo := config.DemoProfile
 
 	// ── Fields that must be IDENTICAL (wire-format / protocol invariants) ─────
-	// Per MVP §5.1: "Every field that affects wire format, cryptographic output,
-	// or database schema must be identical in both profiles."
 	t.Run("invariant_fields_are_identical", func(t *testing.T) {
 		if prod.ShardSize != demo.ShardSize {
 			t.Errorf("ShardSize must be identical: prod=%d demo=%d", prod.ShardSize, demo.ShardSize)
@@ -147,7 +174,6 @@ func TestDemoDiffersFromProduction(t *testing.T) {
 	})
 
 	// ── Erasure coding parameters must differ (MVP §3.2) ─────────────────────
-	// Production RS(16,56); demo RS(3,5). Production values are strictly larger.
 	t.Run("erasure_params_differ", func(t *testing.T) {
 		if prod.DataShards == demo.DataShards {
 			t.Errorf("DataShards must differ: both=%d", prod.DataShards)
@@ -176,7 +202,6 @@ func TestDemoDiffersFromProduction(t *testing.T) {
 	})
 
 	// ── Readiness gate parameters must differ (MVP §3.3) ─────────────────────
-	// Production requires more providers, more geographic diversity, and relay nodes.
 	t.Run("readiness_gate_differs", func(t *testing.T) {
 		if prod.MinActiveProviders == demo.MinActiveProviders {
 			t.Errorf("MinActiveProviders must differ: both=%d", prod.MinActiveProviders)
@@ -197,9 +222,6 @@ func TestDemoDiffersFromProduction(t *testing.T) {
 	})
 
 	// ── Time windows must differ (MVP §3.4) ───────────────────────────────────
-	// Every production window is strictly longer than its demo counterpart.
-	// This also catches a swap (demo > prod), which would mean CI can't complete
-	// in 30 minutes.
 	t.Run("time_windows_differ", func(t *testing.T) {
 		timeFields := []struct {
 			name string
@@ -221,7 +243,7 @@ func TestDemoDiffersFromProduction(t *testing.T) {
 			{"ScoreWindowMedium", prod.ScoreWindowMedium, demo.ScoreWindowMedium},
 			{"ScoreWindowLong", prod.ScoreWindowLong, demo.ScoreWindowLong},
 			{"VettingMinDuration", prod.VettingMinDuration, demo.VettingMinDuration},
-			// RazorpayCoolingPeriod: production 24h, demo 0 (instant). Production must be strictly larger.
+			// RazorpayCoolingPeriod: production 24h, demo 0 (instant). Prod > demo.
 			{"RazorpayCoolingPeriod", prod.RazorpayCoolingPeriod, demo.RazorpayCoolingPeriod},
 		}
 		for _, tf := range timeFields {
@@ -236,7 +258,6 @@ func TestDemoDiffersFromProduction(t *testing.T) {
 	})
 
 	// ── Vetting pass count must differ (MVP §3.4) ─────────────────────────────
-	// Production requires 80 consecutive passes; demo requires 5.
 	t.Run("vetting_passes_differ", func(t *testing.T) {
 		if prod.VettingMinPasses == demo.VettingMinPasses {
 			t.Errorf("VettingMinPasses must differ: both=%d", prod.VettingMinPasses)
@@ -248,8 +269,6 @@ func TestDemoDiffersFromProduction(t *testing.T) {
 	})
 
 	// ── Cryptographic cost parameters must differ (MVP §3.5) ─────────────────
-	// Production Argon2id is strictly stronger: higher time cost, more memory,
-	// more parallelism. Demo parameters are intentionally weaker for fast CI.
 	t.Run("crypto_params_differ", func(t *testing.T) {
 		if prod.Argon2Time == demo.Argon2Time {
 			t.Errorf("Argon2Time must differ: both=%d", prod.Argon2Time)
@@ -275,9 +294,6 @@ func TestDemoDiffersFromProduction(t *testing.T) {
 	})
 
 	// ── Infrastructure flags must differ ──────────────────────────────────────
-	// Production requires a secrets manager, quorum, live payment, and mnemonic
-	// confirmation. Demo uses env vars, single instance, mock payment, and skips
-	// the confirmation step.
 	t.Run("infrastructure_differs", func(t *testing.T) {
 		if prod.RequireSecretsManager == demo.RequireSecretsManager {
 			t.Errorf("RequireSecretsManager must differ: both=%v", prod.RequireSecretsManager)
@@ -297,7 +313,6 @@ func TestDemoDiffersFromProduction(t *testing.T) {
 		if prod.Mode == demo.Mode {
 			t.Errorf("Mode must differ: both=%q", prod.Mode)
 		}
-		// GC retry backoffs are longer in production (first entry: 5m vs 10s).
 		if prod.GCRetryBackoff[0] == demo.GCRetryBackoff[0] {
 			t.Errorf("GCRetryBackoff[0] must differ: both=%v", prod.GCRetryBackoff[0])
 		}

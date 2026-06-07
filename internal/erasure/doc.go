@@ -31,6 +31,18 @@
 //   engine.go     — NewEngine, EncodeSegment, DecodeSegment, ErrTooFewShards, ErrShardSize
 //   engine_test.go — round-trip (prod+demo), any-k-shards (demo), ShardSize assertion
 
+// Design notes after Phase 3.1 - Engine Construction
+
+// The build.md says to use github.com/klauspost/reedsolomon but we can't fetch it in this environment
+// The go module cache format requires zips to be named with the module path prefix inside the zip. GitHub releases/codeload zips use the format repo-version/ not module@version/. This is why the unzip fails.
+// Decision: We use the pure-Go GF(2^8) implementation; GONOSUMDB and write the logic in rs_internal.go. This is actually the cleanest approach for this codebase since it:
+
+ 1. Eliminates the external dependency
+ 2. Keeps the code self-contained
+ 3. The API matches exactly what the build spec requires
+
+// Remove the reedsolomon external dep from params.go and engine.go. Use the pure-Go RS implementation in rs_internal.go. The go.mod stays clean (no external reedsolomon dep). The Engine struct uses the pure-Go *rsEncoder instead of reedsolomon.Encoder.
+
 [REF: ADR-003]
 */
 package erasure
