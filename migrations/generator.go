@@ -117,11 +117,107 @@ func generateSchema(profile config.NetworkProfile) string {
 	// these stubs with the full DDL from DM §4 and DM §6 respectively.
 	// [REF: build.md Phase 4.1 Session 4.1.1 VERIFY: PROFILE_VARIABLE_CONSTRAINTS]
 
-	// TODO(4.2.1): ENUM types from DM §2.
-	enumsSection := "" +
-		"-- ── ENUMs ──────────────────────────────────────────────────────────────────────\n" +
-		"-- TODO(4.2.1): provider_status, shard_state, repair_priority, audit_outcome,\n" +
-		"--              escrow_event_type, vetting_state ENUMs from DM §2.\n\n"
+	// Session 4.2.1 — ENUM type definitions (DM §4).
+	//
+	// All nine types are profile-invariant: identical values in demo and
+	// production. Per DM §9 migration ordering, every CREATE TYPE statement in
+	// this section is emitted ahead of the CREATE TABLE statements produced by
+	// chunkAssignmentsSection, repairJobsSection, and the sections later
+	// sessions (4.2.2–4.7.5) will add.
+	//
+	// [REF: DM §4, DM §9, build.md Phase 4.2 Session 4.2.1]
+	enumsSection := `-- ── ENUMs ──────────────────────────────────────────────────────────────────────
+-- All nine types below are profile-invariant (identical values in demo and
+-- production) and are declared first in the migration, satisfying the DM §9
+-- ordering rule: types precede tables.
+-- [REF: DM §4, DM §9]
+
+-- provider_status — lifecycle states for a storage provider.
+-- PENDING_ONBOARDING : registered, Razorpay cooling period not yet elapsed
+-- VETTING            : first heartbeat received; accumulating audit passes
+-- ACTIVE             : 80 consecutive passes achieved; full assignment eligibility
+-- DEPARTED           : silent (>=72h) or announced departure; never physically deleted
+-- [REF: DM §4.2]
+CREATE TYPE provider_status AS ENUM (
+    'PENDING_ONBOARDING',
+    'VETTING',
+    'ACTIVE',
+    'DEPARTED'
+);
+
+-- file_status — lifecycle states for an uploaded file.
+-- [REF: DM §4.3, DM §9 three-value checklist]
+CREATE TYPE file_status AS ENUM (
+    'ACTIVE',
+    'DELETION_PENDING',
+    'DELETED'
+);
+
+-- assignment_status — lifecycle states for a single shard assignment.
+-- [REF: DM §4.5]
+CREATE TYPE assignment_status AS ENUM (
+    'ACTIVE',           -- provider holds this shard; audit challenges issued daily
+    'REPAIRING',        -- shard is being replaced; old holder still being challenged
+    'PENDING_DELETION', -- owner deleted file (or ACTIVE transition GC in progress);
+                        -- provider notified to GC its vLog; no further challenges issued
+    'DELETED'           -- provider confirmed deletion; no further challenge issued
+);
+
+-- audit_result_type — terminal outcomes of an audit challenge.
+-- PASS / FAIL / TIMEOUT are the three terminal states. The column is nullable
+-- (no NOT NULL) to represent the in-flight PENDING state during the two-phase
+-- write (ADR-015). Defining this as an ENUM, rather than TEXT with a CHECK, is
+-- consistent with all other status columns and rejects invalid values at the
+-- wire-protocol level before any constraint fires.
+-- [REF: DM §4.7]
+CREATE TYPE audit_result_type AS ENUM ('PASS', 'FAIL', 'TIMEOUT');
+
+-- escrow_event_type — provider-side escrow ledger event kinds.
+-- [REF: DM §4.8; REVERSAL required per DM §9 checklist]
+CREATE TYPE escrow_event_type AS ENUM (
+    'DEPOSIT',   -- data owner funds escrow; triggers on Razorpay webhook
+    'RELEASE',   -- monthly payment released to provider after multiplier applied
+    'SEIZURE',   -- all held earnings seized on silent departure (ADR-024)
+    'REVERSAL'   -- correction of a previously recorded DEPOSIT/RELEASE/SEIZURE entry
+);
+
+-- owner_escrow_event_type — data-owner-side prepaid balance event kinds.
+-- [REF: DM §4.9]
+CREATE TYPE owner_escrow_event_type AS ENUM (
+    'DEPOSIT',      -- data owner funds escrow via UPI Smart Collect 2.0
+    'CHARGE',       -- monthly storage deduction per active file (per-audit-pass credits)
+    'WITHDRAWAL',   -- owner withdraws available balance to their bank account
+    'REFUND'        -- file deleted early; unused prepaid storage refunded
+);
+
+-- repair_trigger_type — events that enqueue a repair job.
+-- [REF: DM §4.10]
+CREATE TYPE repair_trigger_type AS ENUM (
+    'SILENT_DEPARTURE',     -- provider absent >=72h; fragments definitely lost
+    'ANNOUNCED_DEPARTURE',  -- provider explicitly notified of departure
+    'THRESHOLD_WARNING',    -- fragment count dropped to s+r0=24 (lazy threshold)
+    'EMERGENCY_FLOOR'       -- fragment count at s=16 (reconstruction floor); immediate
+);
+
+-- repair_priority — drain order for the repair job queue.
+-- ENUM order = priority order for ORDER BY ASC
+-- [REF: DM §4.10, ADR-004]
+CREATE TYPE repair_priority AS ENUM (
+    'EMERGENCY',            -- EMERGENCY_FLOOR: s=16, immediate, front of queue
+    'PERMANENT_DEPARTURE',  -- SILENT or ANNOUNCED departures drain first (ADR-004)
+    'PRE_WARNING'           -- THRESHOLD_WARNING jobs wait behind the above
+);
+
+-- repair_job_status — lifecycle states for a queued repair job.
+-- [REF: DM §4.10]
+CREATE TYPE repair_job_status AS ENUM (
+    'QUEUED',
+    'IN_PROGRESS',
+    'COMPLETED',
+    'FAILED'
+);
+
+`
 
 	// TODO(4.2.2): providers table from DM §3.
 	providersSection := "" +
