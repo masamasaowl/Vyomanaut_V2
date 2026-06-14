@@ -344,29 +344,176 @@ CREATE TYPE repair_job_status AS ENUM (
 		"    'Storage providers. One row per verified daemon. Never physically deleted (DM §3 Invariant 3).';\n" +
 		"\n"
 
-	// TODO(4.3.3 / 4.4.x): files / pointer_files tables from DM §4.
+	// ── files — profile-invariant ──────────────────────────────────────────────────
+	// Session 4.3.3 — files table (DM §4.3, REQ §4.4 FR-019).
+	// The microservice holds only encrypted pointer ciphertext; it cannot decrypt
+	// the file contents or derive the file key (ADR-020, zero-knowledge property).
+	// [REF: build.md Phase 4.3 Session 4.3.3, DM §4.3, REQ §4.4 FR-019]
 	filesSection := "" +
-		"-- ── files / pointer_files ──────────────────────────────────────────────────────\n" +
-		"-- TODO(4.3.3): files and pointer_files tables from DM §4 (owner_id, size_bytes,\n" +
-		"--              pointer_enc_ciphertext, pointer_nonce, file_key_ciphertext).\n\n"
+		"-- ── files ──────────────────────────────────────────────────────────────────────\n" +
+		"-- [REF: DM §4.3, REQ §4.4 FR-019]\n" +
+		"CREATE TABLE files (\n" +
+		"    -- ── Identity ─────────────────────────────────────────────────────────────\n" +
+		"    file_id             UUID            PRIMARY KEY DEFAULT gen_random_uuid(),\n" +
+		"    -- UUIDv7 at application layer (ADR-013). Pseudonymous: appears in audit\n" +
+		"    -- receipts but cannot be linked to plaintext identity without master secret.\n" +
+		"\n" +
+		"    owner_id            UUID            NOT NULL REFERENCES owners(owner_id),\n" +
+		"\n" +
+		"    -- ── Pointer file storage (ADR-020) ───────────────────────────────────────\n" +
+		"    pointer_ciphertext  BYTEA           NOT NULL,\n" +
+		"    -- AEAD_CHACHA20_POLY1305 ciphertext of the pointer file struct.\n" +
+		"    -- Microservice stores blindly; cannot decrypt (ADR-020, zero-knowledge).\n" +
+		"\n" +
+		"    pointer_nonce       BYTEA           NOT NULL CHECK (octet_length(pointer_nonce) = 12),\n" +
+		"    -- 96-bit (12-byte) monotone counter nonce. RFC 8439 §2.3.\n" +
+		"\n" +
+		"    pointer_tag         BYTEA           NOT NULL CHECK (octet_length(pointer_tag) = 16),\n" +
+		"    -- 16-byte Poly1305 authentication tag. Constant-time verification (NFR-019).\n" +
+		"\n" +
+		"    -- ── File name (nullable) ─────────────────────────────────────────────────\n" +
+		"    display_name_ciphertext  BYTEA      NULL,\n" +
+		"    -- AEAD_CHACHA20_POLY1305 ciphertext of the user-provided file name.\n" +
+		"    -- NULL if owner provides no label (CLI path). Non-null for UI file list (FR-019).\n" +
+		"    -- Microservice stores blindly; cannot read the filename (ADR-020).\n" +
+		"\n" +
+		"    display_name_nonce       BYTEA      NULL CHECK (octet_length(display_name_nonce) = 12 OR display_name_nonce IS NULL),\n" +
+		"\n" +
+		"    display_name_tag         BYTEA      NULL CHECK (octet_length(display_name_tag) = 16 OR display_name_tag IS NULL),\n" +
+		"\n" +
+		"    -- ── File metadata ────────────────────────────────────────────────────────\n" +
+		"    original_size_bytes BIGINT          NOT NULL CHECK (original_size_bytes > 0),\n" +
+		"    -- Plaintext size before padding. Required to strip AONT padding after RS\n" +
+		"    -- decode and AONT decryption on retrieval (FR-008).\n" +
+		"\n" +
+		"    status              file_status     NOT NULL DEFAULT 'ACTIVE',\n" +
+		"\n" +
+		"    schema_version      SMALLINT        NOT NULL DEFAULT 1,\n" +
+		"    -- Pointer file schema version. Forward-compatible migration for V3.\n" +
+		"\n" +
+		"    -- ── Timestamps ───────────────────────────────────────────────────────────\n" +
+		"    uploaded_at         TIMESTAMPTZ     NOT NULL DEFAULT NOW()\n" +
+		");\n" +
+		"\n" +
+		"COMMENT ON TABLE files IS\n" +
+		"    'One row per uploaded file. The microservice holds only encrypted pointer '\n" +
+		"    'ciphertext and cannot read the file contents or decryption key.';\n" +
+		"COMMENT ON COLUMN files.pointer_ciphertext IS\n" +
+		"    'Blind store. Key lives in the owner''s head. Service cannot decrypt (ADR-020).';\n" +
+		"COMMENT ON COLUMN files.original_size_bytes IS\n" +
+		"    'Strip AONT padding to this length after decoding. Padding is added for '\n" +
+		"    'files smaller than one full segment (4 MB = 16 × 256 KB).';\n" +
+		"\n"
 
-	// Session 4.4.x — chunk_assignments.
-	// Profile-variable: shard_index upper bound = TotalShards-1 for this profile.
-	// [REF: DM §9 Profile rule, MVP §5.5, DM §8.23, ADR-031]
+	// ── segments — profile-invariant ───────────────────────────────────────────────
+	// Session 4.3.4 — segments table (DM §4.4).
+	// Files larger than one encoded segment (56 × 256 KB on the wire) are split
+	// into multiple independent segments processed through AONT-RS separately.
+	// [REF: build.md Phase 4.3 Session 4.3.4, DM §4.4]
+	segmentsSection := "" +
+		"-- ── segments ───────────────────────────────────────────────────────────────────\n" +
+		"-- [REF: DM §4.4]\n" +
+		"CREATE TABLE segments (\n" +
+		"    segment_id      UUID        PRIMARY KEY DEFAULT gen_random_uuid(),\n" +
+		"\n" +
+		"    file_id         UUID        NOT NULL REFERENCES files(file_id),\n" +
+		"\n" +
+		"    segment_index   INT         NOT NULL CHECK (segment_index >= 0),\n" +
+		"    -- 0-based. Segments concatenated in this order on retrieval.\n" +
+		"\n" +
+		"    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n" +
+		"\n" +
+		"    CONSTRAINT segments_unique_index UNIQUE (file_id, segment_index)\n" +
+		"    -- A file cannot have two segments at the same position.\n" +
+		");\n" +
+		"\n" +
+		"COMMENT ON TABLE segments IS\n" +
+		"    'One row per 14 MB slice of a file. Each segment produces exactly TotalShards chunks '\n" +
+		"    'via AONT-RS. Segments are independent: losing one does not affect the others.';\n" +
+		"\n"
+
+	// ── chunk_assignments — profile-variable (shard_index range) ──────────────────
+	// Session 4.3.5 — chunk_assignments table (DM §4.5, DM §3 Invariant 6).
+	// PROFILE-VARIABLE: shard_index upper bound = TotalShards-1 for this profile.
+	// CRITICAL NULL rules (DM §8.21, DM §8.22):
+	//   segment_id  NULL when is_vetting_chunk = TRUE (no real segment exists)
+	//   shard_index NULL when is_vetting_chunk = TRUE (no RS slot applies)
+	// The partial unique index MUST be a standalone CREATE UNIQUE INDEX (DM §9).
+	// [REF: build.md Phase 4.3 Session 4.3.5, DM §4.5, DM §3 Invariant 6, DM §8.21–§8.22]
 	chunkAssignmentsSection := fmt.Sprintf(""+
 		"-- ── chunk_assignments ───────────────────────────────────────────────────────────\n"+
 		"-- PROFILE-VARIABLE: shard_index upper bound = TotalShards-1 = %d for this profile.\n"+
-		"-- [REF: DM §9 Profile rule, MVP §5.5, DM §8.23, ADR-031]\n"+
-		"-- TODO(4.4.x): full chunk_assignments schema from DM §4 (file_id, provider_id,\n"+
-		"--              shard_state, assigned_at, confirmed_at, vlog_offset).\n"+
-		"CREATE TABLE IF NOT EXISTS chunk_assignments (\n"+
-		"    id          UUID    NOT NULL DEFAULT gen_random_uuid(),\n"+
-		"    shard_index INTEGER,\n"+
-		"    CONSTRAINT chunk_assignments_pkey\n"+
-		"        PRIMARY KEY (id),\n"+
-		"    CONSTRAINT chunk_assignments_shard_index_range\n"+
-		"        %s\n"+
-		");\n\n",
+		"-- [REF: DM §4.5, DM §3 Invariant 6, DM §8.21, DM §8.22, ADR-030, ADR-031]\n"+
+		"CREATE TABLE chunk_assignments (\n"+
+		"    assignment_id    UUID                PRIMARY KEY DEFAULT gen_random_uuid(),\n"+
+		"\n"+
+		"    chunk_id         BYTEA               NOT NULL CHECK (octet_length(chunk_id) = 32),\n"+
+		"    -- SHA-256(shard_data): content address of this 256 KB shard.\n"+
+		"    -- For vetting chunks: SHA-256 of a random 256 KB block (ADR-030).\n"+
+		"\n"+
+		"    is_vetting_chunk BOOLEAN             NOT NULL DEFAULT FALSE,\n"+
+		"    -- TRUE for synthetic chunks assigned during provider vetting (ADR-030).\n"+
+		"    -- Repair scheduler MUST NOT create repair_jobs for is_vetting_chunk = TRUE.\n"+
+		"\n"+
+		"    segment_id       UUID                REFERENCES segments(segment_id),\n"+
+		"    -- NULL when is_vetting_chunk = TRUE (no real file association — DM §8.21).\n"+
+		"\n"+
+		"    shard_index      SMALLINT            %s,\n"+
+		"    -- NULL when is_vetting_chunk = TRUE (no RS slot — DM §8.22).\n"+
+		"    -- Upper bound is profile-variable: TotalShards-1 (ADR-031).\n"+
+		"\n"+
+		"    provider_id      UUID                NOT NULL REFERENCES providers(provider_id),\n"+
+		"\n"+
+		"    status           assignment_status   NOT NULL DEFAULT 'ACTIVE',\n"+
+		"\n"+
+		"    created_at       TIMESTAMPTZ         NOT NULL DEFAULT NOW(),\n"+
+		"\n"+
+		"    deleted_at       TIMESTAMPTZ,\n"+
+		"    -- NULL for all non-DELETED assignments.\n"+
+		"\n"+
+		"    -- ── Constraints ──────────────────────────────────────────────────────────\n"+
+		"    CONSTRAINT chunk_assignments_segment_and_shard_null_iff_vetting CHECK (\n"+
+		"        (is_vetting_chunk = FALSE AND segment_id IS NOT NULL AND shard_index IS NOT NULL)\n"+
+		"        OR\n"+
+		"        (is_vetting_chunk = TRUE  AND segment_id IS NULL    AND shard_index IS NULL)\n"+
+		"    ),\n"+
+		"    -- Invariant 6: real chunks always reference a segment and shard;\n"+
+		"    -- synthetic chunks never do (ADR-030, DM §3 Invariant 6).\n"+
+		"\n"+
+		"    CONSTRAINT chunk_assignments_one_per_provider_per_chunk\n"+
+		"        UNIQUE (chunk_id, provider_id)\n"+
+		");\n"+
+		"\n"+
+		"-- Partial unique index: one active assignment per shard slot per segment (real chunks only).\n"+
+		"-- Synthetic chunks excluded (no shard_index, no RS constraint applies).\n"+
+		"-- MUST be standalone CREATE UNIQUE INDEX, NOT an inline constraint (DM §9).\n"+
+		"CREATE UNIQUE INDEX idx_chunk_assignments_one_active_per_shard\n"+
+		"    ON chunk_assignments (segment_id, shard_index)\n"+
+		"    WHERE is_vetting_chunk = FALSE\n"+
+		"      AND status IN ('ACTIVE', 'REPAIRING');\n"+
+		"\n"+
+		"-- Read view: challenge scheduler sees only ACTIVE assignments.\n"+
+		"CREATE VIEW active_chunk_assignments AS\n"+
+		"SELECT *\n"+
+		"FROM chunk_assignments\n"+
+		"WHERE status = 'ACTIVE';\n"+
+		"\n"+
+		"COMMENT ON TABLE chunk_assignments IS\n"+
+		"    'Routing table: which provider holds which shard of which segment. '\n"+
+		"    '20%% ASN cap enforced at INSERT time by the assignment service (ADR-014). '\n"+
+		"    'Physical deletion not performed; historical data preserved for audit reconciliation.';\n"+
+		"COMMENT ON COLUMN chunk_assignments.chunk_id IS\n"+
+		"    'SHA-256(shard_data). RocksDB lookup key on the provider daemon (ADR-023).';\n"+
+		"COMMENT ON COLUMN chunk_assignments.is_vetting_chunk IS\n"+
+		"    'TRUE for synthetic vetting chunks (ADR-030). Repair scheduler must not enqueue '\n"+
+		"    'repair jobs for these rows. Provider daemon cannot distinguish synthetic from real.';\n"+
+		"COMMENT ON COLUMN chunk_assignments.segment_id IS\n"+
+		"    'NULL for synthetic vetting chunks (is_vetting_chunk = TRUE). '\n"+
+		"    'Real shards enforced non-null by CHECK constraint (DM §8.21).';\n"+
+		"COMMENT ON COLUMN chunk_assignments.shard_index IS\n"+
+		"    'NULL for synthetic vetting chunks (no RS shard slot assigned — DM §8.22). '\n"+
+		"    'Real shards: 0 to TotalShards-1; 0..DataShards-1 are systematic, rest parity.';\n"+
+		"\n",
 		profile.TotalShards-1,
 		shardIndexCheck,
 	)
@@ -444,6 +591,7 @@ CREATE TYPE repair_job_status AS ENUM (
 		ownersSection +
 		providersSection +
 		filesSection +
+		segmentsSection +
 		chunkAssignmentsSection +
 		auditSection +
 		repairJobsSection +
