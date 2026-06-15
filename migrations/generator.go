@@ -518,48 +518,331 @@ CREATE TYPE repair_job_status AS ENUM (
 		shardIndexCheck,
 	)
 
-	// TODO(4.5.x): audit_periods / audit_receipts from DM §5.
-	auditSection := "" +
-		"-- ── audit_periods / audit_receipts ─────────────────────────────────────────────\n" +
-		"-- TODO(4.5.x): audit_periods table from DM §5 (EXCLUDE USING gist for\n" +
-		"--              non-overlapping tsrange — requires btree_gist extension).\n" +
-		"--              audit_receipts table from DM §5 (challenge_nonce BYTEA(33),\n" +
-		"--              NOT BYTEA(32) per IC §5.1 INV-5 / CI check-08).\n\n"
+	// ── audit_periods — profile-invariant ─────────────────────────────────────────
+	// Session 4.4.1 — audit_periods table (DM §4.6).
+	// PREREQUISITE: btree_gist extension (installed in extensions block above).
+	// [REF: build.md Phase 4.4 Session 4.4.1, DM §4.6, DM §9 btree_gist prerequisite]
+	auditPeriodsSection := "" +
+		"-- ── audit_periods ──────────────────────────────────────────────────────────────\n" +
+		"-- PREREQUISITE: CREATE EXTENSION IF NOT EXISTS btree_gist;\n" +
+		"-- (already installed above; required by audit_periods_no_overlap EXCLUDE constraint)\n" +
+		"-- [REF: DM §4.6]\n" +
+		"CREATE TABLE audit_periods (\n" +
+		"    id              UUID            PRIMARY KEY DEFAULT gen_random_uuid(),\n" +
+		"\n" +
+		"    provider_id     UUID            NOT NULL REFERENCES providers(provider_id),\n" +
+		"\n" +
+		"    period_start    TIMESTAMPTZ     NOT NULL,\n" +
+		"    period_end      TIMESTAMPTZ     NOT NULL,\n" +
+		"    -- Inclusive start, exclusive end. One row per calendar month per provider.\n" +
+		"\n" +
+		"    -- ── Running tallies (denormalised from audit_receipts) ────────────────────\n" +
+		"    audit_passes    INT             NOT NULL DEFAULT 0 CHECK (audit_passes >= 0),\n" +
+		"    audit_fails     INT             NOT NULL DEFAULT 0 CHECK (audit_fails >= 0),\n" +
+		"    audit_timeouts  INT             NOT NULL DEFAULT 0 CHECK (audit_timeouts >= 0),\n" +
+		"    -- Materialised tallies updated asynchronously after each receipt is countersigned.\n" +
+		"\n" +
+		"    release_computed BOOLEAN        NOT NULL DEFAULT FALSE,\n" +
+		"    -- Set TRUE once the monthly release multiplier has been computed (ADR-024).\n" +
+		"\n" +
+		"    created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),\n" +
+		"\n" +
+		"    CONSTRAINT audit_periods_no_overlap\n" +
+		"        -- PREREQUISITE: CREATE EXTENSION IF NOT EXISTS btree_gist;\n" +
+		"        EXCLUDE USING gist (\n" +
+		"            provider_id WITH =,\n" +
+		"            tstzrange(period_start, period_end, '[)') WITH &&\n" +
+		"        ),\n" +
+		"    -- Two audit periods for the same provider must not overlap.\n" +
+		"    -- Requires btree_gist. Prevents double-counting at month boundaries (ADR-016).\n" +
+		"\n" +
+		"    CONSTRAINT audit_periods_start_before_end\n" +
+		"        CHECK (period_start < period_end)\n" +
+		");\n" +
+		"\n" +
+		"COMMENT ON TABLE audit_periods IS\n" +
+		"    'One row per calendar month per provider. Denormalised tally for scoring '\n" +
+		"    'and release computation. Source of truth for the escrow release multiplier.';\n" +
+		"\n"
 
-	// Session 4.6.x — repair_jobs.
-	// Profile-variable: available_shard_count range = [DataShards, TotalShards] for this profile.
-	// [REF: DM §9 Profile rule, MVP §5.5, DM §8.23, ADR-031]
+	// ── audit_receipts — profile-invariant ─────────────────────────────────────────
+	// Session 4.4.2 — audit_receipts table (DM §4.7).
+	// INSERT only (Invariant 1). Two-phase write for PENDING → final. No DELETE ever.
+	// CRITICAL: challenge_nonce MUST be BYTEA(33), NEVER BYTEA(32) (DM §3 Invariant 5,
+	// IC §11, CI grep check-08).
+	// [REF: build.md Phase 4.4 Session 4.4.2, DM §4.7, DM §3 Invariants 1 and 5]
+	auditReceiptsSection := "" +
+		"-- ── audit_receipts ─────────────────────────────────────────────────────────────\n" +
+		"-- [REF: DM §4.7, DM §3 Invariants 1 and 5, DM §8.9–§8.15, DM §8.20]\n" +
+		"-- INSERT only (Invariant 1). The only UPDATE promotes PENDING → final state.\n" +
+		"-- No DELETE ever.\n" +
+		"CREATE TABLE audit_receipts (\n" +
+		"    -- ── Primary key ──────────────────────────────────────────────────────────\n" +
+		"    receipt_id              UUID            PRIMARY KEY DEFAULT gen_random_uuid(),\n" +
+		"\n" +
+		"    schema_version          SMALLINT        NOT NULL DEFAULT 1,\n" +
+		"\n" +
+		"    -- ── What was challenged ──────────────────────────────────────────────────\n" +
+		"    chunk_id                BYTEA           NOT NULL CHECK (octet_length(chunk_id) = 32),\n" +
+		"\n" +
+		"    file_id                 UUID            REFERENCES files(file_id),\n" +
+		"    -- NULL for synthetic vetting chunk audits (DM §8.20, ADR-030).\n" +
+		"    -- Non-null for all real shard audits.\n" +
+		"\n" +
+		"    provider_id             UUID            NOT NULL REFERENCES providers(provider_id),\n" +
+		"\n" +
+		"    -- ── Challenge parameters (ADR-017, ADR-027) ──────────────────────────────\n" +
+		"    challenge_nonce         BYTEA           NOT NULL CHECK (octet_length(challenge_nonce) = 33),\n" +
+		"    -- MUST BE 33 BYTES, NOT 32. 1-byte version || HMAC-SHA256(server_secret_vN,\n" +
+		"    -- chunk_id || server_ts). Version byte enables cross-replica validation\n" +
+		"    -- after failover (ADR-027, DM §3 Invariant 5, CI check-08).\n" +
+		"\n" +
+		"    server_challenge_ts     TIMESTAMPTZ     NOT NULL,\n" +
+		"\n" +
+		"    -- ── Provider response ────────────────────────────────────────────────────\n" +
+		"    response_hash           BYTEA           CHECK (octet_length(response_hash) = 32\n" +
+		"                                                OR response_hash IS NULL),\n" +
+		"    -- NULL for TIMEOUT (no response) or PENDING (in-flight). See DM §8.9.\n" +
+		"\n" +
+		"    response_latency_ms     INT             CHECK (response_latency_ms >= 0\n" +
+		"                                                OR response_latency_ms IS NULL),\n" +
+		"    -- NULL for TIMEOUT or PENDING. See DM §8.10.\n" +
+		"\n" +
+		"    -- ── Audit result (two-phase write, ADR-015) ──────────────────────────────\n" +
+		"    audit_result            audit_result_type,\n" +
+		"    -- NULL = PENDING (in-flight, Phase 1 complete; Phase 2 not yet executed).\n" +
+		"    -- PASS / FAIL / TIMEOUT = final result set in Phase 2.\n" +
+		"    -- NO DEFAULT. NULL is the intended initial state. (DM §9 checklist)\n" +
+		"\n" +
+		"    address_was_stale       BOOLEAN         NOT NULL DEFAULT FALSE,\n" +
+		"    -- TRUE if challenge dispatched via DHT fallback (multiaddr_stale = TRUE).\n" +
+		"    -- TIMEOUTs with this flag set do NOT reset consecutive_audit_passes (ADR-028).\n" +
+		"\n" +
+		"    -- ── Signatures (dual Ed25519, ADR-017) ───────────────────────────────────\n" +
+		"    provider_sig            BYTEA           CHECK (octet_length(provider_sig) = 64\n" +
+		"                                                OR provider_sig IS NULL),\n" +
+		"    -- NULL for TIMEOUT or PENDING. See DM §8.12.\n" +
+		"\n" +
+		"    service_sig             BYTEA           CHECK (octet_length(service_sig) = 64\n" +
+		"                                                OR service_sig IS NULL),\n" +
+		"    -- NULL during PENDING. Non-null for TIMEOUT rows (microservice signs TIMEOUT).\n" +
+		"    -- See DM §8.13.\n" +
+		"\n" +
+		"    service_countersign_ts  TIMESTAMPTZ,\n" +
+		"    -- NULL during PENDING. Set in Phase 2 alongside service_sig. See DM §8.14.\n" +
+		"\n" +
+		"    -- ── Adversarial detection (ADR-014) ─────────────────────────────────────\n" +
+		"    jit_flag                BOOLEAN         NOT NULL DEFAULT FALSE,\n" +
+		"    -- TRUE when response_latency_ms is anomalously fast (JIT retrieval, ADR-014).\n" +
+		"\n" +
+		"    -- ── Garbage collection (ADR-015) ────────────────────────────────────────\n" +
+		"    abandoned_at            TIMESTAMPTZ,\n" +
+		"    -- Set by GC on PENDING rows older than 48 hours. See DM §8.15.\n" +
+		"\n" +
+		"    -- ── Constraints ──────────────────────────────────────────────────────────\n" +
+		"    CONSTRAINT audit_receipts_nonce_unique\n" +
+		"        UNIQUE (challenge_nonce),\n" +
+		"    -- Prevents replay: a provider cannot re-submit a response to an\n" +
+		"    -- already-recorded challenge (ADR-015).\n" +
+		"\n" +
+		"    CONSTRAINT audit_receipts_response_consistency CHECK (\n" +
+		"        (audit_result IN ('PASS', 'FAIL') AND response_hash IS NOT NULL AND provider_sig IS NOT NULL)\n" +
+		"        OR\n" +
+		"        (audit_result = 'TIMEOUT' AND response_hash IS NULL AND provider_sig IS NULL)\n" +
+		"        OR\n" +
+		"        (audit_result IS NULL)\n" +
+		"    ),\n" +
+		"\n" +
+		"    CONSTRAINT audit_receipts_service_sig_consistency CHECK (\n" +
+		"        (service_sig IS NULL) = (service_countersign_ts IS NULL)\n" +
+		"    )\n" +
+		"    -- No FK to chunk_assignments: chunk_assignments may be soft-deleted while\n" +
+		"    -- audit_receipts must remain permanently (Invariant 1).\n" +
+		");\n" +
+		"\n" +
+		"-- Nightly data integrity check — must return 0:\n" +
+		"-- SELECT COUNT(*) FROM audit_receipts ar\n" +
+		"--   JOIN chunk_assignments ca ON ca.chunk_id = ar.chunk_id\n" +
+		"--     AND ca.provider_id = ar.provider_id\n" +
+		"--   WHERE ar.file_id IS NULL AND ca.is_vetting_chunk = FALSE;\n" +
+		"\n" +
+		"COMMENT ON TABLE audit_receipts IS\n" +
+		"    'Immutable audit log. Every storage proof event: PASS, FAIL, TIMEOUT, or '\n" +
+		"    'in-flight PENDING. INSERT only — the only permitted UPDATE promotes a '\n" +
+		"    'PENDING row to its final state. No DELETE ever. (ADR-015, NFR-021)';\n" +
+		"COMMENT ON COLUMN audit_receipts.challenge_nonce IS\n" +
+		"    'BYTEA(33): 1-byte version || 32-byte HMAC. NOT BYTEA(32). '\n" +
+		"    'Version byte enables cross-replica validation after failover (ADR-027).';\n" +
+		"COMMENT ON COLUMN audit_receipts.audit_result IS\n" +
+		"    'NULL = PENDING (in-flight, Phase 1 complete). '\n" +
+		"    'PASS/FAIL/TIMEOUT = final state set in Phase 2. '\n" +
+		"    'NULL is a meaningful state, not a missing value.';\n" +
+		"\n"
+
+	// ── escrow_events — profile-invariant ──────────────────────────────────────────
+	// Session 4.4.3 — escrow_events table (DM §4.8).
+	// INSERT only (Invariant 2). No UPDATE. No DELETE.
+	// CRITICAL: amount_paise MUST be BIGINT (Invariant 4). No FLOAT/NUMERIC/DECIMAL.
+	// [REF: build.md Phase 4.4 Session 4.4.3, DM §4.8, DM §3 Invariants 2 and 4, DM §8.16]
+	escrowEventsSection := "" +
+		"-- ── escrow_events ──────────────────────────────────────────────────────────────\n" +
+		"-- [REF: DM §4.8, DM §3 Invariants 2 and 4, DM §8.16]\n" +
+		"-- INSERT only (Invariant 2). No UPDATE. No DELETE.\n" +
+		"CREATE TABLE escrow_events (\n" +
+		"    event_id            UUID                PRIMARY KEY DEFAULT gen_random_uuid(),\n" +
+		"\n" +
+		"    provider_id         UUID                NOT NULL REFERENCES providers(provider_id),\n" +
+		"\n" +
+		"    event_type          escrow_event_type   NOT NULL,\n" +
+		"    -- Includes REVERSAL (DM §9 checklist, DM §7 mv_provider_escrow_balance).\n" +
+		"\n" +
+		"    amount_paise        BIGINT              NOT NULL CHECK (amount_paise > 0),\n" +
+		"    -- BIGINT ONLY. No FLOAT, NUMERIC, DECIMAL anywhere in the payment path.\n" +
+		"    -- Sign implied by event_type: DEPOSIT/REVERSAL adds; RELEASE/SEIZURE subtracts.\n" +
+		"    -- RS1 = 100 paise (ADR-016, Invariant 4, NFR-046).\n" +
+		"\n" +
+		"    audit_period_id     UUID                REFERENCES audit_periods(id),\n" +
+		"    -- NULL for DEPOSIT (triggered by owner UPI payment) and SEIZURE\n" +
+		"    -- (full balance seized at departure). Non-null for RELEASE. See DM §8.16.\n" +
+		"\n" +
+		"    idempotency_key     VARCHAR(64)         NOT NULL UNIQUE,\n" +
+		"    -- Prevents double-payment. Passed to Razorpay as X-Payout-Idempotency.\n" +
+		"    -- RELEASE:  SHA-256(provider_id || audit_period) as 64 hex chars.\n" +
+		"    -- REVERSAL: SHA-256('reversal' || original_idempotency_key).\n" +
+		"\n" +
+		"    created_at          TIMESTAMPTZ         NOT NULL DEFAULT NOW()\n" +
+		");\n" +
+		"\n" +
+		"COMMENT ON TABLE escrow_events IS\n" +
+		"    'Append-only escrow ledger. Balance = SUM(DEPOSIT) - SUM(RELEASE + SEIZURE + REVERSAL) '\n" +
+		"    'per provider_id. No UPDATE. No DELETE. All amounts in integer paise (ADR-016, Invariant 2).';\n" +
+		"COMMENT ON COLUMN escrow_events.amount_paise IS\n" +
+		"    'Integer paise ONLY. BIGINT. No FLOAT. RS1 = 100 paise (NFR-046).';\n" +
+		"\n"
+
+	// ── owner_escrow_events — profile-invariant ────────────────────────────────────
+	// Session 4.4.4 — owner_escrow_events table (DM §4.9).
+	// Required for FR-014 (balance check before upload), FR-021 (balance view),
+	// FR-059 (withdrawal). INSERT only. No UPDATE. No DELETE.
+	// [REF: build.md Phase 4.4 Session 4.4.4, DM §4.9, DM §9 checklist FR-014/FR-021/FR-059]
+	ownerEscrowEventsSection := "" +
+		"-- ── owner_escrow_events ─────────────────────────────────────────────────────────\n" +
+		"-- [REF: DM §4.9, FR-014, FR-021, FR-059]\n" +
+		"-- Required for: FR-014 (balance check before upload), FR-021 (balance view),\n" +
+		"-- FR-059 (withdrawal). INSERT only. No UPDATE. No DELETE.\n" +
+		"CREATE TABLE owner_escrow_events (\n" +
+		"    event_id            UUID                        PRIMARY KEY DEFAULT gen_random_uuid(),\n" +
+		"\n" +
+		"    owner_id            UUID                        NOT NULL REFERENCES owners(owner_id),\n" +
+		"\n" +
+		"    event_type          owner_escrow_event_type     NOT NULL,\n" +
+		"\n" +
+		"    amount_paise        BIGINT                      NOT NULL CHECK (amount_paise > 0),\n" +
+		"    -- BIGINT ONLY. No FLOAT, NUMERIC, DECIMAL. RS1 = 100 paise (Invariant 4).\n" +
+		"\n" +
+		"    file_id             UUID                        REFERENCES files(file_id),\n" +
+		"    -- Non-null for CHARGE and REFUND (links to the specific file).\n" +
+		"    -- NULL for DEPOSIT and WITHDRAWAL.\n" +
+		"\n" +
+		"    idempotency_key     VARCHAR(64)                 NOT NULL UNIQUE,\n" +
+		"    -- SHA-256(owner_id || razorpay_webhook_id) for DEPOSIT.\n" +
+		"    -- SHA-256(owner_id || file_id || billing_period) for CHARGE.\n" +
+		"\n" +
+		"    created_at          TIMESTAMPTZ                 NOT NULL DEFAULT NOW()\n" +
+		");\n" +
+		"\n" +
+		"-- Balance query (used by mv_owner_escrow_balance and FR-021 endpoint):\n" +
+		"-- SUM(DEPOSIT) - SUM(CHARGE + WITHDRAWAL) + SUM(REFUND) per owner_id\n" +
+		"\n" +
+		"COMMENT ON TABLE owner_escrow_events IS\n" +
+		"    'Append-only owner prepaid balance ledger. '\n" +
+		"    'Balance = SUM(DEPOSIT + REFUND) - SUM(CHARGE + WITHDRAWAL) per owner_id. '\n" +
+		"    'No UPDATE. No DELETE. All amounts in integer paise (Invariant 4). '\n" +
+		"    'Required for FR-014, FR-021, FR-059.';\n" +
+		"COMMENT ON COLUMN owner_escrow_events.amount_paise IS\n" +
+		"    'Integer paise ONLY. BIGINT. No FLOAT. RS1 = 100 paise (NFR-046).';\n" +
+		"\n"
+
+	// ── repair_jobs — profile-variable (available_shard_count CHECK) ───────────────
+	// Session 4.4.5 — repair_jobs table (DM §4.10).
+	// PROFILE-VARIABLE: available_shard_count CHECK bounds differ between profiles.
+	// provider_id is nullable — NULL for THRESHOLD_WARNING / EMERGENCY_FLOOR (DM §8.17).
+	// Departure-trigger deduplication is at application layer (IC §5.7).
+	// [REF: build.md Phase 4.4 Session 4.4.5, DM §4.10, DM §8.17–§8.19, IC §5.7, ADR-031]
 	repairJobsSection := fmt.Sprintf(""+
 		"-- ── repair_jobs ─────────────────────────────────────────────────────────────────\n"+
 		"-- PROFILE-VARIABLE: available_shard_count range = [%d, %d] for this profile.\n"+
-		"-- [REF: DM §9 Profile rule, MVP §5.5, DM §8.23, ADR-031]\n"+
-		"-- TODO(4.6.x): full repair_jobs schema from DM §6 (file_id, trigger_type,\n"+
-		"--              priority, missing_shards, state, created_at, promoted_at).\n"+
-		"CREATE TABLE IF NOT EXISTS repair_jobs (\n"+
-		"    id                    UUID    NOT NULL DEFAULT gen_random_uuid(),\n"+
-		"    available_shard_count INTEGER NOT NULL DEFAULT 0,\n"+
-		"    CONSTRAINT repair_jobs_pkey\n"+
-		"        PRIMARY KEY (id),\n"+
-		"    CONSTRAINT repair_jobs_shard_count_range\n"+
-		"        %s\n"+
-		");\n\n",
+		"-- [REF: DM §4.10, DM §8.17–§8.19, IC §5.7, ADR-004, ADR-031]\n"+
+		"-- Departure-trigger deduplication is at application layer (IC §5.7).\n"+
+		"CREATE TABLE repair_jobs (\n"+
+		"    job_id                  UUID                PRIMARY KEY DEFAULT gen_random_uuid(),\n"+
+		"\n"+
+		"    chunk_id                BYTEA               NOT NULL CHECK (octet_length(chunk_id) = 32),\n"+
+		"    -- Content address of the chunk needing repair.\n"+
+		"\n"+
+		"    segment_id              UUID                NOT NULL REFERENCES segments(segment_id),\n"+
+		"\n"+
+		"    provider_id             UUID                REFERENCES providers(provider_id),\n"+
+		"    -- NULL for THRESHOLD_WARNING / EMERGENCY_FLOOR triggers (DM §8.17).\n"+
+		"    -- No single departure caused the drop; count drifted below threshold.\n"+
+		"\n"+
+		"    trigger_type            repair_trigger_type NOT NULL,\n"+
+		"\n"+
+		"    priority                repair_priority     NOT NULL,\n"+
+		"\n"+
+		"    status                  repair_job_status   NOT NULL DEFAULT 'QUEUED',\n"+
+		"\n"+
+		"    available_shard_count   SMALLINT            NOT NULL\n"+
+		"                            %s,\n"+
+		"    -- PROFILE-VARIABLE bounds (generator.go, ADR-031).\n"+
+		"    -- prod: [16, 56]  demo: [3, 5]\n"+
+		"\n"+
+		"    created_at              TIMESTAMPTZ         NOT NULL DEFAULT NOW(),\n"+
+		"\n"+
+		"    started_at              TIMESTAMPTZ,\n"+
+		"    -- NULL until a repair worker picks up the job (DM §8.18).\n"+
+		"\n"+
+		"    completed_at            TIMESTAMPTZ,\n"+
+		"    -- NULL until the job reaches COMPLETED or FAILED (DM §8.19).\n"+
+		"\n"+
+		"    -- ── Constraints ──────────────────────────────────────────────────────────\n"+
+		"    CONSTRAINT repair_jobs_priority_matches_trigger CHECK (\n"+
+		"        (trigger_type = 'EMERGENCY_FLOOR' AND priority = 'EMERGENCY')\n"+
+		"        OR\n"+
+		"        (trigger_type IN ('SILENT_DEPARTURE', 'ANNOUNCED_DEPARTURE')\n"+
+		"                AND priority = 'PERMANENT_DEPARTURE')\n"+
+		"        OR\n"+
+		"        (trigger_type = 'THRESHOLD_WARNING' AND priority = 'PRE_WARNING')\n"+
+		"    ),\n"+
+		"    -- Priority derived from trigger_type; prevents drift at application layer.\n"+
+		"\n"+
+		"    CONSTRAINT repair_jobs_completed_after_started CHECK (\n"+
+		"        completed_at IS NULL OR started_at IS NOT NULL\n"+
+		"    )\n"+
+		"    -- Departure-trigger deduplication is at application layer (IC §5.7).\n"+
+		"    -- UNIQUE (chunk_id, provider_id, trigger_type) was removed; see build.md §4.4.5.\n"+
+		");\n"+
+		"\n"+
+		"-- Partial unique index for threshold deduplication (DM §5, IC §5.7).\n"+
+		"-- Prevents multiple QUEUED/IN_PROGRESS threshold jobs for the same chunk.\n"+
+		"CREATE UNIQUE INDEX idx_repair_jobs_threshold_no_dup\n"+
+		"    ON repair_jobs (chunk_id, trigger_type)\n"+
+		"    WHERE provider_id IS NULL AND status IN ('QUEUED', 'IN_PROGRESS');\n"+
+		"\n"+
+		"COMMENT ON TABLE repair_jobs IS\n"+
+		"    'Repair queue. Priority ordering: EMERGENCY first, then PERMANENT_DEPARTURE, '\n"+
+		"    'then PRE_WARNING (ADR-004, Paper 39). FIFO within each priority tier.';\n"+
+		"COMMENT ON COLUMN repair_jobs.provider_id IS\n"+
+		"    'NULL for threshold-triggered repairs (THRESHOLD_WARNING, EMERGENCY_FLOOR) '\n"+
+		"    'where no single departure caused the drop. Non-null for departure-triggered.';\n"+
+		"COMMENT ON COLUMN repair_jobs.available_shard_count IS\n"+
+		"    'Shard count at job creation. Profile-variable CHECK bounds: '\n"+
+		"    'prod=[16,56], demo=[3,5] (generated by generator.go, ADR-031).';\n"+
+		"\n",
 		profile.DataShards,
 		profile.TotalShards,
 		shardCountCheck,
 	)
-
-	// TODO(4.7.x): escrow / payment ledger from DM §7.
-	paymentSection := "" +
-		"-- ── escrow / payment ledger ─────────────────────────────────────────────────────\n" +
-		"-- TODO(4.7.x): escrow_events and ledger tables from DM §7.\n" +
-		"--              INVARIANT: all monetary amounts are INTEGER (int64 paise). No\n" +
-		"--              FLOAT, DECIMAL, or NUMERIC types permitted (IC §5.1 INV-4).\n\n"
-
-	// TODO(4.8.x): vetting_chunks from DM §8.
-	vettingSection := "" +
-		"-- ── vetting_chunks ─────────────────────────────────────────────────────────────\n" +
-		"-- TODO(4.8.x): vetting_chunks table from DM §8 (synthetic chunk lifecycle:\n" +
-		"--              generation, assignment, GC delivery, departure cleanup — ADR-030).\n\n"
 
 	// TODO(4.9.x): RSPs, indexes, triggers.
 	infraSection := "" +
@@ -593,10 +876,11 @@ CREATE TYPE repair_job_status AS ENUM (
 		filesSection +
 		segmentsSection +
 		chunkAssignmentsSection +
-		auditSection +
+		auditPeriodsSection +
+		auditReceiptsSection +
+		escrowEventsSection +
+		ownerEscrowEventsSection +
 		repairJobsSection +
-		paymentSection +
-		vettingSection +
 		infraSection +
 		viewsSection
 }
