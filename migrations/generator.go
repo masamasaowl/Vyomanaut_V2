@@ -240,13 +240,8 @@ CREATE TYPE repair_job_status AS ENUM (
 		"    'Razorpay UPI VPA for escrow deposits. NULL until provisioned by Razorpay webhook.';\n" +
 		"\n"
 
-	// ── providers — profile-invariant ──────────────────────────────────────────────
+		// ── providers — profile-invariant ──────────────────────────────────────────────
 	// Session 4.3.2 — providers table (DM §4.2, DM §8.2–§8.6).
-	// Physical deletion is prohibited (DM §3 Invariant 3).
-	// CRITICAL NULL rules (DM §8 justifications):
-	//   p95_throughput_kbps NULL — DEFAULT 0 causes division-by-zero in deadline formula
-	//   avg_rtt_ms          NULL — DEFAULT 2000 is a hard-coded guess that diverges over time
-	//   var_rtt_ms          NOT NULL DEFAULT 0 — zero variance is the correct initial assumption
 	// [REF: build.md Phase 4.3 Session 4.3.2, DM §4.2, DM §8.2–§8.6]
 	providersSection := "" +
 		"-- ── providers ──────────────────────────────────────────────────────────────────\n" +
@@ -346,8 +341,6 @@ CREATE TYPE repair_job_status AS ENUM (
 
 	// ── files — profile-invariant ──────────────────────────────────────────────────
 	// Session 4.3.3 — files table (DM §4.3, REQ §4.4 FR-019).
-	// The microservice holds only encrypted pointer ciphertext; it cannot decrypt
-	// the file contents or derive the file key (ADR-020, zero-knowledge property).
 	// [REF: build.md Phase 4.3 Session 4.3.3, DM §4.3, REQ §4.4 FR-019]
 	filesSection := "" +
 		"-- ── files ──────────────────────────────────────────────────────────────────────\n" +
@@ -407,8 +400,6 @@ CREATE TYPE repair_job_status AS ENUM (
 
 	// ── segments — profile-invariant ───────────────────────────────────────────────
 	// Session 4.3.4 — segments table (DM §4.4).
-	// Files larger than one encoded segment (56 × 256 KB on the wire) are split
-	// into multiple independent segments processed through AONT-RS separately.
 	// [REF: build.md Phase 4.3 Session 4.3.4, DM §4.4]
 	segmentsSection := "" +
 		"-- ── segments ───────────────────────────────────────────────────────────────────\n" +
@@ -431,8 +422,7 @@ CREATE TYPE repair_job_status AS ENUM (
 		"    'One row per 14 MB slice of a file. Each segment produces exactly TotalShards chunks '\n" +
 		"    'via AONT-RS. Segments are independent: losing one does not affect the others.';\n" +
 		"\n"
-
-	// ── chunk_assignments — profile-variable (shard_index range) ──────────────────
+		// ── chunk_assignments — profile-variable (shard_index range) ──────────────────
 	// Session 4.3.5 — chunk_assignments table (DM §4.5, DM §3 Invariant 6).
 	// PROFILE-VARIABLE: shard_index upper bound = TotalShards-1 for this profile.
 	// CRITICAL NULL rules (DM §8.21, DM §8.22):
@@ -520,7 +510,6 @@ CREATE TYPE repair_job_status AS ENUM (
 
 	// ── audit_periods — profile-invariant ─────────────────────────────────────────
 	// Session 4.4.1 — audit_periods table (DM §4.6).
-	// PREREQUISITE: btree_gist extension (installed in extensions block above).
 	// [REF: build.md Phase 4.4 Session 4.4.1, DM §4.6, DM §9 btree_gist prerequisite]
 	auditPeriodsSection := "" +
 		"-- ── audit_periods ──────────────────────────────────────────────────────────────\n" +
@@ -567,9 +556,7 @@ CREATE TYPE repair_job_status AS ENUM (
 
 	// ── audit_receipts — profile-invariant ─────────────────────────────────────────
 	// Session 4.4.2 — audit_receipts table (DM §4.7).
-	// INSERT only (Invariant 1). Two-phase write for PENDING → final. No DELETE ever.
-	// CRITICAL: challenge_nonce MUST be BYTEA(33), NEVER BYTEA(32) (DM §3 Invariant 5,
-	// IC §11, CI grep check-08).
+	// CRITICAL: challenge_nonce MUST be BYTEA(33), NEVER BYTEA(32) (DM §3 Invariant 5).
 	// [REF: build.md Phase 4.4 Session 4.4.2, DM §4.7, DM §3 Invariants 1 and 5]
 	auditReceiptsSection := "" +
 		"-- ── audit_receipts ─────────────────────────────────────────────────────────────\n" +
@@ -681,8 +668,6 @@ CREATE TYPE repair_job_status AS ENUM (
 
 	// ── escrow_events — profile-invariant ──────────────────────────────────────────
 	// Session 4.4.3 — escrow_events table (DM §4.8).
-	// INSERT only (Invariant 2). No UPDATE. No DELETE.
-	// CRITICAL: amount_paise MUST be BIGINT (Invariant 4). No FLOAT/NUMERIC/DECIMAL.
 	// [REF: build.md Phase 4.4 Session 4.4.3, DM §4.8, DM §3 Invariants 2 and 4, DM §8.16]
 	escrowEventsSection := "" +
 		"-- ── escrow_events ──────────────────────────────────────────────────────────────\n" +
@@ -722,9 +707,7 @@ CREATE TYPE repair_job_status AS ENUM (
 
 	// ── owner_escrow_events — profile-invariant ────────────────────────────────────
 	// Session 4.4.4 — owner_escrow_events table (DM §4.9).
-	// Required for FR-014 (balance check before upload), FR-021 (balance view),
-	// FR-059 (withdrawal). INSERT only. No UPDATE. No DELETE.
-	// [REF: build.md Phase 4.4 Session 4.4.4, DM §4.9, DM §9 checklist FR-014/FR-021/FR-059]
+	// [REF: build.md Phase 4.4 Session 4.4.4, DM §4.9]
 	ownerEscrowEventsSection := "" +
 		"-- ── owner_escrow_events ─────────────────────────────────────────────────────────\n" +
 		"-- [REF: DM §4.9, FR-014, FR-021, FR-059]\n" +
@@ -766,8 +749,6 @@ CREATE TYPE repair_job_status AS ENUM (
 	// ── repair_jobs — profile-variable (available_shard_count CHECK) ───────────────
 	// Session 4.4.5 — repair_jobs table (DM §4.10).
 	// PROFILE-VARIABLE: available_shard_count CHECK bounds differ between profiles.
-	// provider_id is nullable — NULL for THRESHOLD_WARNING / EMERGENCY_FLOOR (DM §8.17).
-	// Departure-trigger deduplication is at application layer (IC §5.7).
 	// [REF: build.md Phase 4.4 Session 4.4.5, DM §4.10, DM §8.17–§8.19, IC §5.7, ADR-031]
 	repairJobsSection := fmt.Sprintf(""+
 		"-- ── repair_jobs ─────────────────────────────────────────────────────────────────\n"+
@@ -843,15 +824,148 @@ CREATE TYPE repair_job_status AS ENUM (
 		profile.TotalShards,
 		shardCountCheck,
 	)
+	// ── Session 4.5.1 — Index Catalogue ─────────────────────────────────────────────
+	// All indexes are profile-invariant; the DDL is identical for demo and production.
+	// Two indexes were created inline with their tables (exceptions per DM §9):
+	//   idx_chunk_assignments_one_active_per_shard (Session 4.3.5)
+	//   idx_repair_jobs_threshold_no_dup           (Session 4.4.5)
+	// [REF: DM §5, build.md Phase 4.5 Session 4.5.1]
+	indexesSection := "-- ── Indexes ─────────────────────────────────────────────────────────────────────\n" +
+		"-- Profile-invariant. All CREATE INDEX statements appear after all CREATE TABLE\n" +
+		"-- statements (DM §9 ordering rule). Two exceptions created inline with their tables:\n" +
+		"--   idx_chunk_assignments_one_active_per_shard (Session 4.3.5)\n" +
+		"--   idx_repair_jobs_threshold_no_dup           (Session 4.4.5)\n" +
+		"-- [REF: DM §5, build.md Phase 4.5 Session 4.5.1]\n" +
+		"\n" +
+		"-- ── owners ─────────────────────────────────────────────────────────────────────\n" +
+		"\n" +
+		"-- Query: lookup by phone at login / OTP verification\n" +
+		"CREATE UNIQUE INDEX idx_owners_phone ON owners (phone_number);\n" +
+		"\n" +
+		"-- ── providers ───────────────────────────────────────────────────────────────────\n" +
+		"\n" +
+		"-- Query: departure detector — find providers with last_heartbeat_ts > 72h ago\n" +
+		"CREATE INDEX idx_providers_heartbeat_active ON providers (last_heartbeat_ts)\n" +
+		"    WHERE status = 'ACTIVE';\n" +
+		"\n" +
+		"-- Query: assignment service — select ACTIVE providers for ASN cap check\n" +
+		"CREATE INDEX idx_providers_asn_active ON providers (asn) WHERE status = 'ACTIVE';\n" +
+		"\n" +
+		"-- Query: readiness gate — count providers by status AND region\n" +
+		"CREATE INDEX idx_providers_status_region ON providers (status, region);\n" +
+		"\n" +
+		"-- Query: lookup by phone at registration / OTP re-verification\n" +
+		"CREATE UNIQUE INDEX idx_providers_phone ON providers (phone_number);\n" +
+		"\n" +
+		"-- ── files ───────────────────────────────────────────────────────────────────────\n" +
+		"\n" +
+		"-- Query: file list for a data owner dashboard\n" +
+		"CREATE INDEX idx_files_owner ON files (owner_id, uploaded_at DESC)\n" +
+		"    WHERE status = 'ACTIVE';\n" +
+		"\n" +
+		"-- Query: find files awaiting deletion confirmation for the GC retry loop (FR-020)\n" +
+		"CREATE INDEX idx_files_pending_deletion ON files (owner_id, uploaded_at)\n" +
+		"    WHERE status = 'DELETION_PENDING';\n" +
+		"\n" +
+		"-- ── segments ─────────────────────────────────────────────────────────────────────\n" +
+		"\n" +
+		"-- Query: fetch all segments for a file in order (upload orchestrator, retrieval)\n" +
+		"CREATE INDEX idx_segments_file ON segments (file_id, segment_index);\n" +
+		"\n" +
+		"-- ── chunk_assignments ────────────────────────────────────────────────────────────\n" +
+		"\n" +
+		"-- Query: challenge scheduler — find all active chunks for a provider\n" +
+		"CREATE INDEX idx_chunk_assignments_provider_active ON chunk_assignments (provider_id)\n" +
+		"    WHERE status = 'ACTIVE';\n" +
+		"\n" +
+		"-- Query: repair scheduler — find surviving shard holders for a segment\n" +
+		"CREATE INDEX idx_chunk_assignments_segment_active ON chunk_assignments (segment_id)\n" +
+		"    WHERE status IN ('ACTIVE', 'REPAIRING');\n" +
+		"\n" +
+		"-- Query: deletion workflow — find pending deletions per provider for GC\n" +
+		"CREATE INDEX idx_chunk_assignments_provider_pending_deletion\n" +
+		"    ON chunk_assignments (provider_id) WHERE status = 'PENDING_DELETION';\n" +
+		"\n" +
+		"-- Query: ASN cap check at assignment time — shards per segment per provider\n" +
+		"CREATE INDEX idx_chunk_assignments_segment_provider\n" +
+		"    ON chunk_assignments (segment_id, provider_id) WHERE status = 'ACTIVE';\n" +
+		"\n" +
+		"-- Query: ACTIVE transition GC — fetch synthetic chunk IDs to send to daemon\n" +
+		"CREATE INDEX idx_chunk_assignments_vetting_provider_active\n" +
+		"    ON chunk_assignments (provider_id)\n" +
+		"    WHERE is_vetting_chunk = TRUE AND status = 'ACTIVE';\n" +
+		"\n" +
+		"-- Query: departure handler — bulk soft-delete synthetic chunks on vetting departure\n" +
+		"CREATE INDEX idx_chunk_assignments_vetting_provider\n" +
+		"    ON chunk_assignments (provider_id) WHERE is_vetting_chunk = TRUE;\n" +
+		"\n" +
+		"-- ── audit_periods ────────────────────────────────────────────────────────────────\n" +
+		"\n" +
+		"-- Query: monthly release computation — get current period per provider\n" +
+		"CREATE INDEX idx_audit_periods_provider_recent\n" +
+		"    ON audit_periods (provider_id, period_start DESC);\n" +
+		"\n" +
+		"-- Query: scoring queries (three-window score: 24h, 7d, 30d)\n" +
+		"CREATE INDEX idx_audit_periods_provider_range\n" +
+		"    ON audit_periods (provider_id, period_start, period_end);\n" +
+		"\n" +
+		"-- ── audit_receipts ───────────────────────────────────────────────────────────────\n" +
+		"\n" +
+		"-- Query: three-window scoring — sum PASS/FAIL/TIMEOUT for a provider in a window\n" +
+		"CREATE INDEX idx_audit_receipts_provider_ts\n" +
+		"    ON audit_receipts (provider_id, server_challenge_ts DESC)\n" +
+		"    WHERE abandoned_at IS NULL AND audit_result IS NOT NULL;\n" +
+		"\n" +
+		"-- NOTE: UNIQUE on challenge_nonce already created as table constraint\n" +
+		"-- (audit_receipts_nonce_unique); no extra index for nonce idempotency lookups.\n" +
+		"\n" +
+		"-- Query: GC process — find PENDING rows older than 48h for abandonment\n" +
+		"CREATE INDEX idx_audit_receipts_pending_stale\n" +
+		"    ON audit_receipts (server_challenge_ts)\n" +
+		"    WHERE audit_result IS NULL AND abandoned_at IS NULL;\n" +
+		"\n" +
+		"-- Query: JIT analysis — count jit_flags per provider in a rolling 7-day window\n" +
+		"CREATE INDEX idx_audit_receipts_jit_provider\n" +
+		"    ON audit_receipts (provider_id, server_challenge_ts DESC) WHERE jit_flag = TRUE;\n" +
+		"\n" +
+		"-- Query: dispute resolution — provider retrieves their own receipts (FR-058)\n" +
+		"CREATE INDEX idx_audit_receipts_provider_file\n" +
+		"    ON audit_receipts (provider_id, file_id, server_challenge_ts DESC);\n" +
+		"\n" +
+		"-- Query: FR-058 provider dispute evidence — filter receipts by chunk_id\n" +
+		"CREATE INDEX idx_audit_receipts_provider_chunk\n" +
+		"    ON audit_receipts (provider_id, chunk_id, server_challenge_ts DESC);\n" +
+		"\n" +
+		"-- ── escrow_events ────────────────────────────────────────────────────────────────\n" +
+		"\n" +
+		"-- Query: balance computation — SUM(DEPOSIT) - SUM(RELEASE + SEIZURE) per provider\n" +
+		"CREATE INDEX idx_escrow_events_provider ON escrow_events (provider_id, event_type);\n" +
+		"\n" +
+		"-- Query: monthly release job — join with audit_periods to mark release_computed\n" +
+		"CREATE INDEX idx_escrow_events_period ON escrow_events (audit_period_id)\n" +
+		"    WHERE audit_period_id IS NOT NULL;\n" +
+		"\n" +
+		"-- ── repair_jobs ──────────────────────────────────────────────────────────────────\n" +
+		"\n" +
+		"-- Query: repair scheduler main dequeue — next queued job by priority then created_at\n" +
+		"CREATE INDEX idx_repair_jobs_queue ON repair_jobs (priority, created_at ASC)\n" +
+		"    WHERE status = 'QUEUED';\n" +
+		"\n" +
+		"-- Query: repair dashboard — current depth of each priority tier\n" +
+		"CREATE INDEX idx_repair_jobs_status_priority ON repair_jobs (status, priority);\n" +
+		"\n" +
+		"-- Query: link repair jobs to a departing provider's chunks\n" +
+		"CREATE INDEX idx_repair_jobs_provider ON repair_jobs (provider_id)\n" +
+		"    WHERE provider_id IS NOT NULL;\n" +
+		"\n" +
+		"-- (idx_repair_jobs_threshold_no_dup created inline with repair_jobs — exception)\n" +
+		"\n"
 
-	// TODO(4.9.x): RSPs, indexes, triggers.
+	// TODO(4.9.x): RSPs, triggers.
 	infraSection := "" +
 		"-- ── Row-level security policies ────────────────────────────────────────────────\n" +
 		"-- TODO(4.9.x): RSPs from IC §6 (per-provider isolation on chunk_assignments;\n" +
 		"--              microservice-role full access; client-role file-owner reads).\n\n" +
-		"-- ── Indexes ────────────────────────────────────────────────────────────────────\n" +
-		"-- TODO(4.9.x): B-tree and GiST indexes from DM §9 (covering indexes for\n" +
-		"--              audit scheduling, repair queue polling, scoring window queries).\n\n" +
 		"-- ── Triggers ───────────────────────────────────────────────────────────────────\n" +
 		"-- TODO(4.9.x): updated_at maintenance triggers from DM §9.\n\n"
 
@@ -881,6 +995,7 @@ CREATE TYPE repair_job_status AS ENUM (
 		escrowEventsSection +
 		ownerEscrowEventsSection +
 		repairJobsSection +
+		indexesSection +
 		infraSection +
 		viewsSection
 }
