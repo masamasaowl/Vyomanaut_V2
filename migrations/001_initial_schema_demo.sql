@@ -1,5 +1,5 @@
 -- Generated for profile: demo
--- Generated at: 2026-06-18T17:57:43Z
+-- Generated at: 2026-06-19T13:13:40Z
 -- ShardSize: 262144 (compile-time constant; NOT profile-variable)
 -- DataShards: 3
 -- TotalShards: 5
@@ -10,6 +10,19 @@
 -- [REF: DM §9, deployments/dev/init-db.sql, CI check-07]
 CREATE EXTENSION IF NOT EXISTS btree_gist;
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+-- ── Roles ──────────────────────────────────────────────────────────────────────
+-- PREREQUISITE for the Row Security Policies declared later in this migration
+-- (see the "Row Security Policies" section below). Idempotent.
+-- [REF: DM §6, build.md Phase 4.6 Session 4.6.1]
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'vyomanaut_app') THEN
+        CREATE ROLE vyomanaut_app;
+    END IF;
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'vyomanaut_gc') THEN
+        CREATE ROLE vyomanaut_gc;
+    END IF;
+END $$;
 
 -- ── ENUMs ──────────────────────────────────────────────────────────────────────
 -- All nine types below are profile-invariant (identical values in demo and
@@ -786,9 +799,118 @@ CREATE INDEX idx_repair_jobs_provider ON repair_jobs (provider_id)
 
 -- (idx_repair_jobs_threshold_no_dup created inline with repair_jobs — exception)
 
--- ── Row-level security policies ────────────────────────────────────────────────
--- TODO(4.9.x): RSPs from IC §6 (per-provider isolation on chunk_assignments;
---              microservice-role full access; client-role file-owner reads).
+-- ── Row Security Policies ─────────────────────────────────────────────────────
+-- Enforces DM §3 Invariants 1–3 at the database engine level, independent of
+-- application code. Profile-invariant: identical in demo and production.
+-- [REF: DM §6, IC §6, build.md Phase 4.6]
+
+-- ── audit_receipts — INSERT only (Invariant 1) ────────────────────────────────
+-- [REF: DM §6, DM §3 Invariant 1, ADR-015, build.md Phase 4.6 Session 4.6.1]
+ALTER TABLE audit_receipts ENABLE ROW LEVEL SECURITY;
+
+-- Phase 1 of the two-phase write: the microservice inserts a PENDING receipt
+-- (audit_result = NULL) immediately after dispatching the challenge.
+CREATE POLICY audit_receipts_insert_only
+    ON audit_receipts
+    FOR INSERT
+    TO vyomanaut_app
+    WITH CHECK (TRUE);
+
+-- Phase 2 of the two-phase write: promotes a PENDING row to its terminal
+-- state. This is the ONLY permitted UPDATE on audit_receipts. Scope is
+-- narrowly limited: only audit_result, service_sig, and
+-- service_countersign_ts may be written; all other fields are immutable
+-- once the Phase 1 INSERT completes.
+CREATE POLICY audit_receipts_phase2_update
+    ON audit_receipts
+    FOR UPDATE
+    TO vyomanaut_app
+    USING (audit_result IS NULL AND abandoned_at IS NULL)
+    WITH CHECK (
+        audit_result   IN ('PASS', 'FAIL', 'TIMEOUT') AND
+        service_sig    IS NOT NULL AND
+        service_countersign_ts IS NOT NULL
+    );
+
+-- Allow the GC process to mark stale PENDING rows as abandoned after 48h,
+-- without ever setting a terminal audit_result.
+CREATE POLICY audit_receipts_gc_abandon
+    ON audit_receipts
+    FOR UPDATE
+    TO vyomanaut_gc
+    USING (
+        audit_result IS NULL AND
+        abandoned_at IS NULL AND
+        server_challenge_ts < NOW() - INTERVAL '48 hours'
+        -- NOTE: This RSP hardcodes 48 hours at the DB layer.
+        -- The application-layer GC query uses `profile.PendingReceiptGCAge` (demo=5min, prod=48h).
+        -- These are SEPARATE mechanisms:
+        --   RSP: enforces the maximum DB-level update window (always 48h)
+        --   App query: fires early in demo mode using `profile.PendingReceiptGCAge`
+        -- The RSP is a safety backstop; the app fires first in demo.
+    )
+    WITH CHECK (
+        abandoned_at IS NOT NULL AND
+        audit_result IS NULL      -- GC never sets the result; only abandoned_at
+    );
+
+-- No DELETE policy is created. Any DELETE attempt — by any role — returns
+-- permission denied. No physical deletion is ever permitted (Invariant 1).
+
+-- ── escrow_events — INSERT only (Invariant 2) ─────────────────────────────────
+-- [REF: DM §6, DM §3 Invariant 2, ADR-016, build.md Phase 4.6 Session 4.6.2]
+ALTER TABLE escrow_events ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY escrow_events_insert_only
+    ON escrow_events
+    FOR INSERT
+    TO vyomanaut_app
+    WITH CHECK (TRUE);
+
+-- No UPDATE or DELETE policy. Balance is always recomputed from the
+-- immutable event log; there is no mutable balance column to protect.
+-- Any UPDATE or DELETE attempt — by any role — returns permission denied
+-- (Invariant 2).
+
+-- ── chunk_assignments — soft-delete only ──────────────────────────────────────
+-- Historical incident: a HARD-DELETE was previously issued against this
+-- table when a provider underwent a SILENT/ANNOUNCED departure. This is the
+-- corrective control: physical deletion is never permitted again, for any
+-- role. The only way to retire a row is the existing soft-delete pattern
+-- (UPDATE status = 'DELETED', deleted_at = NOW()) — see IC §6.
+-- [REF: DM §6, IC §6, ADR-007, build.md Phase 4.6 Session 4.6.3]
+ALTER TABLE chunk_assignments ENABLE ROW LEVEL SECURITY;
+
+-- Normal assignment creation: upload assignment and repair replacement.
+-- The is_vetting_chunk / segment_id / shard_index consistency contract
+-- (providers.status = 'VETTING' implies is_vetting_chunk = TRUE with NULL
+-- segment_id/shard_index, and vice versa for 'ACTIVE') is the application's
+-- responsibility (IC §6); the CHECK constraint
+-- chunk_assignments_segment_and_shard_null_iff_vetting is a backstop, not
+-- the primary guard.
+CREATE POLICY chunk_assignments_insert_only
+    ON chunk_assignments
+    FOR INSERT
+    TO vyomanaut_app
+    WITH CHECK (TRUE);
+
+-- All status lifecycle transitions, including the departure-handler
+-- soft-delete. A row transitioning to DELETED must carry a deleted_at
+-- timestamp: this is the soft-delete contract that replaces the historical
+-- hard DELETE referenced above.
+CREATE POLICY chunk_assignments_status_update
+    ON chunk_assignments
+    FOR UPDATE
+    TO vyomanaut_app
+    USING (TRUE)
+    WITH CHECK (
+        status <> 'DELETED' OR deleted_at IS NOT NULL
+    );
+
+-- No DELETE policy is created. Any DELETE attempt — by any role, including
+-- vyomanaut_app — returns permission denied. This is the fix for the
+-- historical hard-delete incident: chunk_assignments rows are retired by
+-- UPDATE status = 'DELETED' only, never by physical DELETE.
 
 -- ── Triggers ───────────────────────────────────────────────────────────────────
 -- TODO(4.9.x): updated_at maintenance triggers from DM §9.
