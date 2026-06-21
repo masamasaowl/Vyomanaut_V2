@@ -1,5 +1,5 @@
 -- Generated for profile: demo
--- Generated at: 2026-06-19T13:13:40Z
+-- Generated at: 2026-06-21T09:33:57Z
 -- ShardSize: 262144 (compile-time constant; NOT profile-variable)
 -- DataShards: 3
 -- TotalShards: 5
@@ -915,9 +915,131 @@ CREATE POLICY chunk_assignments_status_update
 -- ── Triggers ───────────────────────────────────────────────────────────────────
 -- TODO(4.9.x): updated_at maintenance triggers from DM §9.
 
--- ── Views ──────────────────────────────────────────────────────────────────────
--- IMPORTANT: mv_provider_scores is NOT here. It is dropped and recreated at
--- microservice startup from profile.ScoreWindow{Short,Medium,Long} values.
--- Hard-coding scoring windows in a migration violates DM §9 Profile rule.
--- [REF: DM §9, MVP §5.5, build.md Phase 4.1 Session 4.1.1]
--- TODO(4.10.x): any other views defined in DM §9.
+-- ── Materialised Views ────────────────────────────────────────────────────────
+-- Refreshed asynchronously by the microservice; the underlying tables are always
+-- the source of truth. Refresh is suspended when foreground DB read latency at
+-- p99 approaches 50ms (ADR-025).
+-- [REF: DM §7, DM §9, MVP §5.5, build.md Phase 4.7]
+
+-- ── mv_provider_scores — three-window reliability score per provider ──────────
+-- mv_provider_scores: DROPPED AND RECREATED AT STARTUP from NetworkProfile.ScoreWindow*
+-- Production intervals: 24h / 7d / 30d
+-- Demo intervals: 2min / 6min / 20min  (set by microservice startup, not this migration)
+--
+-- Used by: scoring package, release multiplier computation, assignment service.
+-- CRITICAL: scores_as_of must be within 60 minutes before this view is used for
+-- release multiplier computation (ADR-024) — stale scores produce wrong payments.
+-- The interval literals below ('24 hours' / '7 days' / '30 days') are PRODUCTION
+-- placeholders only: this view is an application-layer artifact that is DROPPED
+-- and RECREATED on every microservice restart from profile.ScoreWindow{Short,
+-- Medium,Long} (ADR-031, MVP §5.5). The DDL here exists so check-07's migration
+-- apply/rollback gate and any fresh-clone developer have a working view before
+-- the microservice has ever started once.
+-- [REF: DM §7, MVP §5.5, IC §6, build.md Phase 4.7 Session 4.7.1]
+CREATE MATERIALIZED VIEW mv_provider_scores AS
+SELECT
+    provider_id,
+    score_24h,
+    score_7d,
+    score_30d,
+    (
+        COALESCE(score_24h, 0) * 0.5 +
+        COALESCE(score_7d,  0) * 0.3 +
+        COALESCE(score_30d, 0) * 0.2
+    ) AS score_composite,
+    NOW() AS scores_as_of  -- consumers must check age before using for payment decisions
+FROM (
+    SELECT
+        provider_id,
+        -- SHORT WINDOW (placeholder: 24h production; overridden at startup)
+        SUM(CASE WHEN server_challenge_ts >= NOW() - INTERVAL '24 hours'
+                AND audit_result = 'PASS' THEN 1 ELSE 0 END)::FLOAT
+        / NULLIF(SUM(CASE WHEN server_challenge_ts >= NOW() - INTERVAL '24 hours'
+                          AND audit_result IS NOT NULL THEN 1 ELSE 0 END), 0)
+        AS score_24h,
+        -- MEDIUM WINDOW (placeholder: 7 days production; overridden at startup)
+        SUM(CASE WHEN server_challenge_ts >= NOW() - INTERVAL '7 days'
+                AND audit_result = 'PASS' THEN 1 ELSE 0 END)::FLOAT
+        / NULLIF(SUM(CASE WHEN server_challenge_ts >= NOW() - INTERVAL '7 days'
+                          AND audit_result IS NOT NULL THEN 1 ELSE 0 END), 0)
+        AS score_7d,
+        -- LONG WINDOW (placeholder: 30 days production; overridden at startup)
+        SUM(CASE WHEN server_challenge_ts >= NOW() - INTERVAL '30 days'
+                AND audit_result = 'PASS' THEN 1 ELSE 0 END)::FLOAT
+        / NULLIF(SUM(CASE WHEN server_challenge_ts >= NOW() - INTERVAL '30 days'
+                          AND audit_result IS NOT NULL THEN 1 ELSE 0 END), 0)
+        AS score_30d
+    FROM audit_receipts
+    WHERE abandoned_at IS NULL
+    GROUP BY provider_id
+) sub;
+
+CREATE UNIQUE INDEX ON mv_provider_scores (provider_id);
+-- Required for REFRESH MATERIALIZED VIEW CONCURRENTLY (DM §9 checklist).
+
+-- ── mv_provider_escrow_balance — escrow balance per provider ──────────────────
+-- Used by: release computation, provider dashboard endpoint.
+-- Refreshed: after each DEPOSIT, RELEASE, SEIZURE, or REVERSAL event.
+-- Balance = SUM(DEPOSIT + REVERSAL) - SUM(RELEASE + SEIZURE). REVERSAL increases
+-- balance (refund of a reversed payout) — DM §7 amendment.
+-- idempotency_key for a REVERSAL event = SHA-256('reversal' || original_idempotency_key),
+-- deterministic given the original payout's key; enforced at the application
+-- layer — no DB constraint can derive it.
+-- [REF: DM §7, DM §3 Invariant 2, build.md Phase 4.7 Session 4.7.2]
+CREATE MATERIALIZED VIEW mv_provider_escrow_balance AS
+SELECT
+    provider_id,
+    SUM(CASE WHEN event_type IN ('DEPOSIT', 'REVERSAL') THEN amount_paise ELSE 0 END)
+    -
+    SUM(CASE WHEN event_type IN ('RELEASE', 'SEIZURE') THEN amount_paise ELSE 0 END)
+    AS balance_paise
+FROM escrow_events
+GROUP BY provider_id;
+
+CREATE UNIQUE INDEX ON mv_provider_escrow_balance (provider_id);
+
+-- ── mv_owner_escrow_balance — prepaid balance per data owner ───────────────────
+-- Used by: FR-014 (balance check before upload), FR-021 (balance view), FR-059
+-- (withdrawal). Refreshed: after each DEPOSIT, CHARGE, WITHDRAWAL, or REFUND event.
+-- Balance = SUM(DEPOSIT + REFUND) - SUM(CHARGE + WITHDRAWAL), floored at zero via
+-- GREATEST(..., 0) so that event-ordering races never surface a negative balance
+-- to the owner dashboard (DM §7: "Add GREATEST(..., 0) to ... ensure no negative
+-- values exist").
+-- [REF: DM §7, FR-014, FR-021, FR-059, build.md Phase 4.7 Session 4.7.3]
+CREATE MATERIALIZED VIEW mv_owner_escrow_balance AS
+SELECT
+    owner_id,
+    GREATEST(
+        SUM(CASE WHEN event_type IN ('DEPOSIT', 'REFUND') THEN amount_paise ELSE 0 END)
+        -
+        SUM(CASE WHEN event_type IN ('CHARGE', 'WITHDRAWAL') THEN amount_paise ELSE 0 END),
+        0  -- prevents negative balance (DM §7: "Add GREATEST(..., 0)")
+    ) AS balance_paise
+FROM owner_escrow_events
+GROUP BY owner_id;
+
+CREATE UNIQUE INDEX ON mv_owner_escrow_balance (owner_id);
+
+-- ── mv_segment_shard_counts — available/active shard count per segment ────────
+-- Used by: repair trigger detector, file availability status in owner dashboard.
+-- Refreshed: after each chunk_assignment status change.
+-- available_shard_count (ACTIVE + REPAIRING) is compared against
+-- profile.DataShards/LazyRepairR0 to decide THRESHOLD_WARNING / EMERGENCY_FLOOR
+-- repair triggers; active_shard_count (ACTIVE only) is the count actually
+-- serving retrieval traffic right now. is_vetting_chunk rows are not filtered
+-- out here deliberately — a segment_id is always NULL for vetting chunks (DM
+-- §8.21), so they never join into this GROUP BY in the first place.
+-- [REF: DM §7, build.md Phase 4.7 Session 4.7.4]
+CREATE MATERIALIZED VIEW mv_segment_shard_counts AS
+SELECT
+    segment_id,
+    COUNT(*) FILTER (WHERE status IN ('ACTIVE', 'REPAIRING'))
+        AS available_shard_count,
+    COUNT(*) FILTER (WHERE status = 'ACTIVE')
+        AS active_shard_count
+FROM chunk_assignments
+GROUP BY segment_id;
+
+CREATE UNIQUE INDEX ON mv_segment_shard_counts (segment_id);
+-- Session 4.7.5: every materialised view above has its own unique index,
+-- required for REFRESH MATERIALIZED VIEW CONCURRENTLY (DM §9 checklist).
