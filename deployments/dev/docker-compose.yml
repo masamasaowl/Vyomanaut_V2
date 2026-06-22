@@ -4,6 +4,14 @@
 # REF: MVP §8.5 — dev docker-compose requirements
 # REF: architecture.md §27.5 — relay provisioning threshold
 #
+# Initial Start:
+# docker-compose -f deployments/dev/docker-compose.yml up -d postgres
+# docker-compose -f deployments/dev/docker-compose.yml exec -T postgres \
+# psql -U vyomanaut_app -d vyomanaut_dev -c "\dx" | grep btree_gist \
+# && echo PASS || echo FAIL
+# docker-compose -f deployments/dev/docker-compose.yml down -v
+
+
 # Bring up:  docker-compose -f deployments/dev/docker-compose.yml up
 # Tear down: docker-compose -f deployments/dev/docker-compose.yml down -v
 #
