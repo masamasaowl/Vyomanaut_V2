@@ -26,8 +26,7 @@ import "context"
 // Every read and write uses this exact size; no variable-length entries exist in V2.
 // This constant is intentionally larger than the raw 256 KB chunk data (262144 bytes)
 // to account for the 68-byte per-entry header and trailer fields.
-// Commented out to avoid unused value err
-// const vLogEntrySize = 262212 
+const vLogEntrySize = 262212
 
 // indexValueSize is the byte size of the RocksDB value per chunk index entry (ARCH §27.1).
 //
@@ -36,8 +35,7 @@ import "context"
 // The RocksDB key is the 32-byte chunk_id, so the total on-disk entry is
 // approximately 44 bytes (32 key + 12 value). At 50 GB declared storage the
 // entire index fits in ~8.8 MB of RocksDB block cache (ARCH §27.1).
-// Commented out to avoid unused value err
-// const indexValueSize = 12
+const indexValueSize = 12
 
 // ChunkStore is the WiscKey key-value separated chunk storage engine (ARCH §16, ADR-023).
 // The RocksDB index holds small 44-byte entries; the append-only vLog holds all
