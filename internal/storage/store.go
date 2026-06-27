@@ -1,22 +1,25 @@
 // Package storage is declared in doc.go.
-// This file defines the ChunkStore interface and the two layout constants derived
-// from ARCH §16 and ARCH §27.1.
+// This file defines the ChunkStore interface, layout constants, and NewChunkStore.
 //
 // IMPORT CONSTRAINT (IC §9): this package must NOT import internal/payment,
 // internal/scoring, or internal/repair. The storage engine is unaware of
-// network economics or topology. Only stdlib and the grocksdb binding are
-// permitted. This file imports only "context".
+// network economics or topology. Only stdlib and the grocksdb binding are permitted.
 //
 // INVARIANT (DM §3 Invariant 6, ADR-030): The daemon cannot distinguish
 // between synthetic vetting chunks and real file shards. Both use identical
 // AppendChunk / LookupChunk / DeleteChunk code paths. The is_vetting_chunk
 // flag exists only in the microservice's chunk_assignments table.
 //
-// [REF: IC §5.3, ARCH §16, ARCH §27.1, ADR-023, build.md Phase 5.1 Session 5.1.1]
+// [REF: IC §5.3, ARCH §16, ARCH §27.1, ADR-023, build.md Phase 5.1]
 
 package storage
 
-import "context"
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+)
 
 // vLogEntrySize is the fixed byte size of every vLog entry (ARCH §16, ARCH §27.1).
 //
@@ -37,11 +40,20 @@ const vLogEntrySize = 262212
 // entire index fits in ~8.8 MB of RocksDB block cache (ARCH §27.1).
 const indexValueSize = 12
 
+// chunkDataSize is the fixed byte size of the raw chunk payload stored in the vLog.
+// Equal to erasure.ShardSize = 256 KiB. Defined here separately to satisfy the
+// IC §9 import constraint (internal/storage must not import internal/erasure).
+// The cross-package identity is asserted at test time in
+// internal/erasure/engine_test.go (TestShardSizeAssertion).
+//
+// [REF: ARCH §16, ARCH §27.1, DM §3 Invariant 7, IC §9, ADR-023]
+const chunkDataSize = 262144
+
 // ChunkStore is the WiscKey key-value separated chunk storage engine (ARCH §16, ADR-023).
 // The RocksDB index holds small 44-byte entries; the append-only vLog holds all
 // 262 KB chunk data. Write amplification ≈ 1.0 at 256 KB values (ARCH §4.1, ARCH §27.1).
 //
-// Create with NewChunkStore (implemented in a later session).
+// Create with NewChunkStore.
 //
 // CONCURRENCY: Only AppendChunk and RecoverFromCrash are NOT goroutine-safe. All
 // other methods are goroutine-safe. See each method's comment for details.
@@ -139,12 +151,12 @@ type ChunkStore interface {
 	RecoverFromCrash() error
 
 	// RunGC reclaims vLog disk space from entries whose RocksDB index entry has been
-	// deleted (by DeleteChunk). Uses fallocate(FALLOC_FL_PUNCH_HOLE) on Linux to
-	// release disk blocks without compacting the vLog file. (ADR-023 §Garbage collection)
+	// deleted (by DeleteChunk). Compacts the vLog to a temporary file, then atomically
+	// renames it over the original. (ADR-023 §Garbage collection, ARCH §16)
 	//
 	// Runs in a background goroutine; ctx cancellation stops it cleanly without data loss.
 	// GC uses a separate read file handle from the writer goroutine — no coordination
-	// with AppendChunk is required.
+	// with AppendChunk is required during the scan phase.
 	//
 	// Goroutine-safe: yes.
 	RunGC(ctx context.Context) error
@@ -155,4 +167,61 @@ type ChunkStore interface {
 	//
 	// Goroutine-safe: yes (safe to call concurrently with other methods, but only once).
 	Close() error
+}
+
+// NewChunkStore opens or creates a WiscKey chunk store rooted at dataDir.
+// Creates two paths within dataDir:
+//   - index/       — RocksDB chunk index (Bloom filter + 64 MB LRU block cache)
+//   - chunks.vlog  — append-only value log
+//
+// The caller MUST call RecoverFromCrash() on the returned store and allow it to
+// complete BEFORE starting the writer goroutine (NFR-024, ARCH §16 §Crash recovery,
+// build.md Phase 5.1 Session 5.1.5).
+//
+// NewChunkStore intentionally does NOT call RecoverFromCrash — the caller (Session
+// 13.1.1 daemon wiring) must do so explicitly to preserve the startup-sequence
+// contract.
+//
+// Error semantics: returns a wrapped error if directory creation, RocksDB open, or
+// vLog open fails. Treat as fatal — the daemon must not start without its chunk store.
+//
+// [REF: IC §5.3, ARCH §16, ADR-023, build.md Phase 5.1 Session 5.1.5]
+func NewChunkStore(dataDir string) (ChunkStore, error) {
+	if err := os.MkdirAll(dataDir, 0700); err != nil {
+		return nil, fmt.Errorf("storage.NewChunkStore: create dataDir %q: %w", dataDir, err)
+	}
+
+	indexPath := filepath.Join(dataDir, "index")
+	idx, err := openRocksDBIndex(indexPath)
+	if err != nil {
+		return nil, fmt.Errorf("storage.NewChunkStore: open RocksDB index: %w", err)
+	}
+
+	vlogPath := filepath.Join(dataDir, "chunks.vlog")
+	// O_RDWR: supports both ReadAt (pread, goroutine-safe) and Write (single writer).
+	// O_APPEND: ensures writes always land at EOF even on Linux after a Seek.
+	// O_CREATE: creates the file on first daemon start.
+	vlogFile, err := os.OpenFile(vlogPath, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0600)
+	if err != nil {
+		idx.close()
+		return nil, fmt.Errorf("storage.NewChunkStore: open vLog %q: %w", vlogPath, err)
+	}
+
+	// Initialise vlogHead from the current file size. The caller must invoke
+	// the crash-recovery scan before starting the writer goroutine (NFR-024);
+	// that scan corrects vlogHead if the tail holds entries not yet in RocksDB.
+	info, err := vlogFile.Stat()
+	if err != nil {
+		_ = vlogFile.Close()
+		idx.close()
+		return nil, fmt.Errorf("storage.NewChunkStore: stat vLog: %w", err)
+	}
+
+	return &wiskeyStore{
+		index:        idx,
+		vlog:         vlogFile,
+		vlogPath:     vlogPath,
+		vlogHead:     uint64(info.Size()),
+		isRotational: isRotationalDevice(dataDir),
+	}, nil
 }

@@ -1,25 +1,25 @@
 // Package storage is declared in doc.go.
 // This file defines the wiskeyStore concrete struct that implements ChunkStore,
-// and the two core vLog I/O helpers: appendToVLog and readFromVLog.
+// the two internal vLog I/O helpers, and all six ChunkStore method implementations.
 //
 // The RocksDB index and its operations are in index.go (Session 5.1.3).
-// NewChunkStore, AppendChunk, LookupChunk, DeleteChunk, RecoverFromCrash,
-// RunGC, and Close are implemented in subsequent sessions.
 //
 // IMPORT CONSTRAINT (IC §9): no other internal/ package may be imported here.
 //
-// [REF: IC §5.3, ARCH §16, ARCH §27.1, ADR-023, build.md Phase 5.1 Session 5.1.2]
+// [REF: IC §5.3, ARCH §16, ARCH §27.1, ADR-023, build.md Phase 5.1]
 
 package storage
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
 )
 
-// vLog entry field byte offsets. Derived from vLogEntrySize = 262212 (ARCH §16, ARCH §27.1).
+// vLog entry field byte offsets (ARCH §16, ARCH §27.1).
 //
 // On-disk layout per entry:
 //
@@ -29,12 +29,11 @@ const (
 	vlogOffChunkID     = 0
 	vlogOffChunkSize   = 32
 	vlogOffChunkData   = 36
-	vlogOffContentHash = 36 + 262144 // = 262180
+	vlogOffContentHash = vlogOffChunkData + chunkDataSize // 36 + 262144 = 262180
 )
 
 // wiskeyStore is the concrete, unexported implementation of ChunkStore.
-// Callers always interact through the ChunkStore interface returned by
-// NewChunkStore (implemented in a later session).
+// Callers always interact through the ChunkStore interface returned by NewChunkStore.
 //
 // Field access rules:
 //   - index: goroutine-safe after construction (RocksDB operations are thread-safe).
@@ -63,19 +62,18 @@ type wiskeyStore struct {
 	isRotational bool
 }
 
-// appendToVLog writes one complete 262212-byte vLog entry and fsyncs to disk.
+// ── Internal vLog I/O helpers ─────────────────────────────────────────────────
+
+// appendToVLog writes one complete vLogEntrySize-byte vLog entry and fsyncs to disk.
 //
 // MUST be called only from the single designated writer goroutine (IC §5.3).
 //
 // Algorithm (ARCH §16):
 //  1. Compute content_hash = SHA-256(chunkData).
-//  2. Build a 262212-byte buffer: [chunk_id][chunk_size][chunk_data][content_hash].
+//  2. Build a vLogEntrySize-byte buffer: [chunk_id][chunk_size][chunk_data][content_hash].
 //  3. Write the complete buffer via os.File.Write.
 //  4. Call Sync() — return ErrVLogFsync on either failure; daemon must halt.
 //  5. Advance ws.vlogHead by vLogEntrySize.
-//
-// The chunk_size field is always 262144 (fixed in V2; the field is present for
-// forward-compatibility with a hypothetical variable-size V3 extension).
 //
 // Returns the byte offset where the entry begins (= the pre-write vlogHead).
 func (ws *wiskeyStore) appendToVLog(chunkID [32]byte, chunkData []byte) (offset uint64, err error) {
@@ -83,7 +81,7 @@ func (ws *wiskeyStore) appendToVLog(chunkID [32]byte, chunkData []byte) (offset 
 
 	var buf [vLogEntrySize]byte
 	copy(buf[vlogOffChunkID:], chunkID[:])
-	binary.BigEndian.PutUint32(buf[vlogOffChunkSize:], 262144)
+	binary.BigEndian.PutUint32(buf[vlogOffChunkSize:], chunkDataSize)
 	copy(buf[vlogOffChunkData:], chunkData)
 	copy(buf[vlogOffContentHash:], contentHash[:])
 
@@ -98,19 +96,19 @@ func (ws *wiskeyStore) appendToVLog(chunkID [32]byte, chunkData []byte) (offset 
 	return offset, nil
 }
 
-// readFromVLog reads the 262212-byte entry at byteOffset and verifies integrity.
+// readFromVLog reads the vLogEntrySize-byte entry at byteOffset and verifies integrity.
 //
 // Goroutine-safe: uses ReadAt (POSIX pread semantics). Multiple goroutines
 // may call readFromVLog concurrently; concurrent AppendChunk calls in the
 // writer goroutine are also safe because pread does not move the file position.
 //
 // Algorithm (ARCH §16 §Audit lookup path, steps 4–5):
-//  1. ReadAt vLogEntrySize bytes from byteOffset into a fresh buffer.
-//  2. Extract content_hash from buf[vlogOffContentHash : vlogOffContentHash+32].
-//  3. Compute SHA-256(buf[vlogOffChunkData : vlogOffChunkData+262144]).
+//  1. ReadAt vLogEntrySize bytes from byteOffset into a fixed-size buffer.
+//  2. Extract content_hash from buf[vlogOffContentHash:].
+//  3. Compute SHA-256(buf[vlogOffChunkData : vlogOffChunkData+chunkDataSize]).
 //  4. Compare byte-by-byte — return nil, ErrContentHashMismatch on any mismatch
 //     (silent disk corruption; caller must set audit status 0x02, IC §4.2).
-//  5. Return a fresh 262144-byte slice copied from the data region.
+//  5. Return a fresh chunkDataSize-byte slice copied from the data region.
 //
 // The returned slice is always freshly allocated so callers may retain it
 // after this function returns without aliasing the I/O buffer.
@@ -120,15 +118,281 @@ func (ws *wiskeyStore) readFromVLog(byteOffset uint64) ([]byte, error) {
 		return nil, fmt.Errorf("%w: ReadAt offset %d: %v", ErrVLogRead, byteOffset, err)
 	}
 
-	storedHash := buf[vlogOffContentHash : vlogOffContentHash+32]
-	computed := sha256.Sum256(buf[vlogOffChunkData : vlogOffChunkData+262144])
+	storedHash := buf[vlogOffContentHash : vlogOffContentHash+sha256.Size]
+	computed := sha256.Sum256(buf[vlogOffChunkData : vlogOffChunkData+chunkDataSize])
 	for i := range computed {
 		if computed[i] != storedHash[i] {
 			return nil, ErrContentHashMismatch
 		}
 	}
 
-	data := make([]byte, 262144)
-	copy(data, buf[vlogOffChunkData:vlogOffChunkData+262144])
+	data := make([]byte, chunkDataSize)
+	copy(data, buf[vlogOffChunkData:vlogOffChunkData+chunkDataSize])
 	return data, nil
+}
+
+// ── ChunkStore interface implementation ───────────────────────────────────────
+
+// AppendChunk writes a 256 KB chunk to the vLog and inserts the RocksDB index entry.
+//
+// *** SINGLE WRITER ONLY — NOT goroutine-safe ***
+//
+// [REF: IC §5.3, ARCH §16 §Single writer goroutine, build.md Phase 5.1 Session 5.1.4]
+func (ws *wiskeyStore) AppendChunk(chunkID [32]byte, chunkData []byte) (vlogOffset uint64, err error) {
+	if len(chunkData) != chunkDataSize {
+		panic(fmt.Sprintf(
+			"storage.AppendChunk: chunkData must be %d bytes, got %d",
+			chunkDataSize, len(chunkData)))
+	}
+
+	// Step 1: Write to vLog and fsync (ARCH §16).
+	// On error the vLog may be partially written; daemon must halt and call
+	// RecoverFromCrash on the next restart.
+	offset, err := ws.appendToVLog(chunkID, chunkData)
+	if err != nil {
+		// err is already wrapped as ErrVLogFsync by appendToVLog.
+		return 0, err
+	}
+
+	// Step 2: Insert into RocksDB index.
+	// A failure here leaves the vLog entry durable — RecoverFromCrash will
+	// re-insert the missing index entry on the next daemon restart (ARCH §16
+	// §Crash recovery).
+	if putErr := ws.index.put(chunkID, offset, chunkDataSize); putErr != nil {
+		// putErr is wrapped as ErrRocksDBInsert by index.put.
+		return 0, putErr
+	}
+
+	return offset, nil
+}
+
+// LookupChunk retrieves a chunk from the vLog by content address and verifies integrity.
+// Internal path: Bloom filter → RocksDB block cache → vLog pread → SHA-256 verify.
+//
+// Goroutine-safe: yes.
+//
+// [REF: IC §5.3, ARCH §16 §Audit lookup path, build.md Phase 5.1 Session 5.1.4]
+func (ws *wiskeyStore) LookupChunk(chunkID [32]byte) ([]byte, error) {
+	// Step 1 (ARCH §16 steps 2–3): Bloom filter + RocksDB index lookup.
+	// ErrChunkNotFound exits via the in-memory Bloom filter — no disk I/O.
+	vlogOffset, _, err := ws.index.get(chunkID)
+	if err != nil {
+		// Propagate ErrChunkNotFound or ErrVLogRead directly.
+		return nil, err
+	}
+
+	// Step 2 (ARCH §16 steps 4–5): Read vLog entry and verify SHA-256(chunk_data).
+	// readFromVLog never returns partial data on ErrContentHashMismatch.
+	data, err := ws.readFromVLog(vlogOffset)
+	if err != nil {
+		return nil, err
+	}
+
+	return data, nil
+}
+
+// DeleteChunk removes the RocksDB index entry for chunkID.
+// The vLog entry remains on disk until RunGC reclaims it.
+//
+// Goroutine-safe: yes.
+//
+// [REF: IC §5.3, ADR-023, build.md Phase 5.1 Session 5.1.5]
+func (ws *wiskeyStore) DeleteChunk(chunkID [32]byte) error {
+	return ws.index.del(chunkID)
+}
+
+// RecoverFromCrash scans the vLog from offset 0, re-inserting any RocksDB index entries
+// that are missing. Stops at the first incomplete or corrupt entry (partial tail write
+// from a pre-crash AppendChunk). Sets ws.vlogHead to the end of the last valid entry.
+//
+// MUST be called once at daemon startup BEFORE the writer goroutine starts.
+// NOT goroutine-safe.
+//
+// [REF: IC §5.3, ARCH §16 §Crash recovery, ADR-023, NFR-024,
+//
+//	build.md Phase 5.1 Session 5.1.5]
+func (ws *wiskeyStore) RecoverFromCrash() error {
+	var currentOffset uint64
+	for {
+		var buf [vLogEntrySize]byte
+		n, err := ws.vlog.ReadAt(buf[:], int64(currentOffset))
+		if n < vLogEntrySize {
+			// EOF or partial tail read — stop. The tail is incomplete.
+			break
+		}
+		if err != nil && err != io.EOF {
+			// Unexpected I/O error on a complete read — stop conservatively.
+			break
+		}
+
+		// Extract chunk_id from the entry header.
+		var chunkID [32]byte
+		copy(chunkID[:], buf[vlogOffChunkID:vlogOffChunkID+sha256.Size])
+
+		// Verify SHA-256(chunk_data) == stored content_hash.
+		// A mismatch indicates a corrupt tail entry from an incomplete write.
+		computed := sha256.Sum256(buf[vlogOffChunkData : vlogOffChunkData+chunkDataSize])
+		corrupt := false
+		for i, b := range computed {
+			if b != buf[vlogOffContentHash+i] {
+				corrupt = true
+				break
+			}
+		}
+		if corrupt {
+			// Corrupt entry — stop scan; don't re-insert beyond this point.
+			break
+		}
+
+		// Check whether the entry is already in the RocksDB index.
+		_, _, indexErr := ws.index.get(chunkID)
+		switch indexErr {
+		case nil:
+			// Entry already indexed — no action needed.
+		case ErrChunkNotFound:
+			// Entry is in vLog but absent from index (post-crash gap) — re-insert.
+			if putErr := ws.index.put(chunkID, currentOffset, chunkDataSize); putErr != nil {
+				return fmt.Errorf(
+					"storage.RecoverFromCrash: re-insert entry at vLog offset %d: %w",
+					currentOffset, putErr)
+			}
+		default:
+			// RocksDB error during recovery — abort.
+			return fmt.Errorf(
+				"storage.RecoverFromCrash: index lookup at vLog offset %d: %w",
+				currentOffset, indexErr)
+		}
+
+		currentOffset += vLogEntrySize
+	}
+
+	// Set vlogHead to the end of the last confirmed-valid entry.
+	ws.vlogHead = currentOffset
+	return nil
+}
+
+// RunGC compacts the vLog by copying live entries (those still in the RocksDB index)
+// to a temporary file, then atomically renaming it over the original vLog. RocksDB
+// offsets are updated to the new compacted positions during the scan.
+//
+// Runs in a background goroutine; ctx cancellation stops it cleanly without data loss.
+// Uses a dedicated read handle so GC reads do not interfere with ws.vlog (the write
+// handle used by AppendChunk).
+//
+// Goroutine-safe: yes.
+//
+// [REF: IC §5.3, ADR-023 §Garbage collection, ARCH §16, build.md Phase 5.1 Session 5.1.5]
+func (ws *wiskeyStore) RunGC(ctx context.Context) error {
+	// Snapshot the live set from the RocksDB index before compaction.
+	liveIDs := ws.index.allChunkIDs()
+	liveSet := make(map[[32]byte]struct{}, len(liveIDs))
+	for _, id := range liveIDs {
+		liveSet[id] = struct{}{}
+	}
+
+	// Open a dedicated read handle — separate from ws.vlog (write handle) so GC
+	// reads do not require coordination with the single writer goroutine.
+	readFile, err := os.Open(ws.vlogPath)
+	if err != nil {
+		return fmt.Errorf("storage.RunGC: open read handle: %w", err)
+	}
+	defer func() { _ = readFile.Close() }()
+
+	// Create the compacted output file. Truncate if a previous GC left an orphan.
+	tmpPath := ws.vlogPath + ".gc.tmp"
+	tmpFile, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return fmt.Errorf("storage.RunGC: create tmp vLog: %w", err)
+	}
+
+	var (
+		newHead       uint64
+		currentOffset uint64
+		gcErr         error
+	)
+
+	for {
+		// Check for cancellation between entries so the caller can stop GC cleanly.
+		select {
+		case <-ctx.Done():
+			_ = tmpFile.Close()
+			_ = os.Remove(tmpPath)
+			return ctx.Err()
+		default:
+		}
+
+		var buf [vLogEntrySize]byte
+		n, readErr := readFile.ReadAt(buf[:], int64(currentOffset))
+		if n < vLogEntrySize {
+			// EOF or partial tail — end of valid entries.
+			break
+		}
+		if readErr != nil && readErr != io.EOF {
+			// Unexpected I/O error — abort without renaming to preserve the original.
+			gcErr = fmt.Errorf("storage.RunGC: read at offset %d: %w", currentOffset, readErr)
+			break
+		}
+
+		var chunkID [32]byte
+		copy(chunkID[:], buf[vlogOffChunkID:vlogOffChunkID+sha256.Size])
+
+		if _, alive := liveSet[chunkID]; alive {
+			// Write the live entry to the compacted file.
+			if _, werr := tmpFile.Write(buf[:]); werr != nil {
+				gcErr = fmt.Errorf("storage.RunGC: write tmp at offset %d: %w", newHead, werr)
+				break
+			}
+			// Update the RocksDB index to point to the new compacted offset.
+			if putErr := ws.index.put(chunkID, newHead, chunkDataSize); putErr != nil {
+				gcErr = fmt.Errorf("storage.RunGC: update index for offset %d: %w", newHead, putErr)
+				break
+			}
+			newHead += vLogEntrySize
+		}
+
+		currentOffset += vLogEntrySize
+	}
+
+	// Fsync before rename to ensure the compacted data is durable.
+	if gcErr == nil {
+		if syncErr := tmpFile.Sync(); syncErr != nil {
+			gcErr = fmt.Errorf("storage.RunGC: sync tmp vLog: %w", syncErr)
+		}
+	}
+	if closeErr := tmpFile.Close(); closeErr != nil && gcErr == nil {
+		gcErr = fmt.Errorf("storage.RunGC: close tmp vLog: %w", closeErr)
+	}
+
+	if gcErr != nil {
+		_ = os.Remove(tmpPath)
+		return gcErr
+	}
+
+	// Atomically replace the old vLog with the compacted one.
+	if renameErr := os.Rename(tmpPath, ws.vlogPath); renameErr != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("storage.RunGC: rename tmp vLog: %w", renameErr)
+	}
+
+	// Reopen ws.vlog to point at the new compacted file.
+	newVlog, err := os.OpenFile(ws.vlogPath, os.O_RDWR|os.O_APPEND, 0600)
+	if err != nil {
+		return fmt.Errorf("storage.RunGC: reopen vLog after compaction: %w", err)
+	}
+	_ = ws.vlog.Close()
+	ws.vlog = newVlog
+	ws.vlogHead = newHead
+
+	return nil
+}
+
+// Close flushes pending RocksDB writes and closes both the RocksDB instance and
+// the vLog file handle. After Close returns, all method calls produce undefined behaviour.
+//
+// Goroutine-safe: yes (safe to call concurrently with other methods, but only once).
+//
+// [REF: IC §5.3, build.md Phase 5.1 Session 5.1.5]
+func (ws *wiskeyStore) Close() error {
+	ws.index.close()
+	return ws.vlog.Close()
 }

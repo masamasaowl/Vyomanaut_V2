@@ -7,6 +7,11 @@ Versions:
 rocksdb_version="10.10.1"
 grocksDB = v1.10.8
 
+CGO flags used:
+export CGO_CFLAGS="-I$HOME/rocksdb/include"
+export CGO_LDFLAGS="-L$HOME/rocksdb/lib -lrocksdb -lstdc++ -lm -lz -lbz2 -lsnappy -llz4 -lzstd"
+export DYLD_LIBRARY_PATH="$HOME/rocksdb/lib:$DYLD_LIBRARY_PATH"
+
 All other exported functions are goroutine-safe (read-only paths).
 Ref: ADR-023, NFR-023
 */
