@@ -12,8 +12,33 @@ on:
   pull_request:
 
 jobs:
-  ci:
+  ensure-image:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull or build CI image
+        run: |
+          docker pull ghcr.io/masamasaowl/vyomanaut-ci:rocksdb-10.10.1 2>/dev/null && exit 0
+          docker build \
+            -t ghcr.io/masamasaowl/vyomanaut-ci:rocksdb-10.10.1 \
+            -f deployments/docker/Dockerfile.ci .
+          docker push ghcr.io/masamasaowl/vyomanaut-ci:rocksdb-10.10.1
+  ci:
+    needs: ensure-image  
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
 
     container:
       image: ghcr.io/masamasaowl/vyomanaut-ci:rocksdb-10.10.1
