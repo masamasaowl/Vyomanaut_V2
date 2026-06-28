@@ -21,6 +21,11 @@ import (
 	"path/filepath"
 )
 
+const (
+	dirPerm  os.FileMode = 0700
+	filePerm os.FileMode = 0600
+)
+
 // vLogEntrySize is the fixed byte size of every vLog entry (ARCH §16, ARCH §27.1).
 //
 //	Layout: chunk_id(32) + chunk_size(4) + chunk_data(262144) + content_hash(32)
@@ -187,7 +192,7 @@ type ChunkStore interface {
 //
 // [REF: IC §5.3, ARCH §16, ADR-023, build.md Phase 5.1 Session 5.1.5]
 func NewChunkStore(dataDir string) (ChunkStore, error) {
-	if err := os.MkdirAll(dataDir, 0700); err != nil {
+	if err := os.MkdirAll(dataDir, dirPerm); err != nil {
 		return nil, fmt.Errorf("storage.NewChunkStore: create dataDir %q: %w", dataDir, err)
 	}
 
@@ -201,7 +206,7 @@ func NewChunkStore(dataDir string) (ChunkStore, error) {
 	// O_RDWR: supports both ReadAt (pread, goroutine-safe) and Write (single writer).
 	// O_APPEND: ensures writes always land at EOF even on Linux after a Seek.
 	// O_CREATE: creates the file on first daemon start.
-	vlogFile, err := os.OpenFile(vlogPath, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0600)
+	vlogFile, err := os.OpenFile(vlogPath, os.O_CREATE|os.O_RDWR|os.O_APPEND, filePerm)
 	if err != nil {
 		idx.close()
 		return nil, fmt.Errorf("storage.NewChunkStore: open vLog %q: %w", vlogPath, err)

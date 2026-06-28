@@ -25,6 +25,12 @@ import (
 	"github.com/linxGnu/grocksdb"
 )
 
+// configuration constants for RocksDB index
+const (
+	bloomBits      = 10               // bits per key for Bloom filter (~1% FP)
+	blockCacheSize = 64 * 1024 * 1024 // 64 MiB LRU block cache
+)
+
 // rocksDBIndex wraps the RocksDB instance used as the WiscKey chunk index.
 //
 // Column families:
@@ -56,8 +62,8 @@ type rocksDBIndex struct {
 func openRocksDBIndex(dbPath string) (*rocksDBIndex, error) {
 	// Column-family options: shared Bloom filter + block cache for both CFs.
 	bbto := grocksdb.NewDefaultBlockBasedTableOptions()
-	bbto.SetFilterPolicy(grocksdb.NewBloomFilter(10)) // 10 bits/key ≈ 1% FP
-	bbto.SetBlockCache(grocksdb.NewLRUCache(64 * 1024 * 1024))
+	bbto.SetFilterPolicy(grocksdb.NewBloomFilter(bloomBits)) // 10 bits/key ≈ 1% FP
+	bbto.SetBlockCache(grocksdb.NewLRUCache(blockCacheSize))
 
 	cfOpts := grocksdb.NewDefaultOptions()
 	cfOpts.SetBlockBasedTableFactory(bbto)
@@ -129,9 +135,11 @@ func (idx *rocksDBIndex) del(chunkID [32]byte) error {
 //
 // IMPORTANT: the dhtKey must be derived by internal/crypto.DeriveDHTKey before
 // calling this function. This package never computes DHT keys (IC §9, IC §12.2).
-func (idx *rocksDBIndex) putDHTKey(chunkID [32]byte, dhtKey [32]byte) error {
-	return idx.db.PutCF(idx.writeOps, idx.cfDHT, chunkID[:], dhtKey[:])
-}
+// Commented out to avoid unused func error
+// nolint:unused
+// func (idx *rocksDBIndex) putDHTKey(chunkID [32]byte, dhtKey [32]byte) error {
+// 	return idx.db.PutCF(idx.writeOps, idx.cfDHT, chunkID[:], dhtKey[:])
+// }
 
 // dhtKeyFor retrieves the cached DHT lookup key for chunkID from the "dht-keys" CF.
 // Returns ok=false when no DHT key was stored for this chunk (e.g. the chunk
@@ -140,18 +148,20 @@ func (idx *rocksDBIndex) putDHTKey(chunkID [32]byte, dhtKey [32]byte) error {
 // The heartbeat goroutine calls this during DHT republication (IC §12.2, ARCH §13).
 // It must NEVER recompute dhtKey from file_owner_key — that derivation belongs
 // exclusively in internal/crypto.
-func (idx *rocksDBIndex) dhtKeyFor(chunkID [32]byte) (dhtKey [32]byte, ok bool) {
-	sl, err := idx.db.GetCF(idx.readOps, idx.cfDHT, chunkID[:])
-	if err != nil || !sl.Exists() {
-		if sl != nil {
-			sl.Free()
-		}
-		return dhtKey, false
-	}
-	defer sl.Free()
-	copy(dhtKey[:], sl.Data())
-	return dhtKey, true
-}
+// Commented out to avoid unused func error
+// nolint:unused
+// func (idx *rocksDBIndex) dhtKeyFor(chunkID [32]byte) (dhtKey [32]byte, ok bool) {
+// 	sl, err := idx.db.GetCF(idx.readOps, idx.cfDHT, chunkID[:])
+// 	if err != nil || !sl.Exists() {
+// 		if sl != nil {
+// 			sl.Free()
+// 		}
+// 		return dhtKey, false
+// 	}
+// 	defer sl.Free()
+// 	copy(dhtKey[:], sl.Data())
+// 	return dhtKey, true
+// }
 
 // allChunkIDs returns every chunk_id present in the data index ("default" CF).
 //

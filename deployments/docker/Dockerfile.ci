@@ -1,0 +1,28 @@
+
+FROM ubuntu:24.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake git ca-certificates \
+    libsnappy-dev liblz4-dev libzstd-dev zlib1g-dev libbz2-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG ROCKSDB_VERSION=10.10.1
+RUN git clone --depth 1 --branch v${ROCKSDB_VERSION} \
+    https://github.com/facebook/rocksdb.git /tmp/rocksdb \
+    && cd /tmp/rocksdb && mkdir build && cd build \
+    && cmake .. \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DROCKSDB_BUILD_SHARED=OFF \
+    -DWITH_TESTS=OFF -DWITH_GFLAGS=OFF \
+    -DWITH_BENCHMARK_TOOLS=OFF -DWITH_TOOLS=OFF \
+    -DWITH_MD_LIBRARY=OFF -DWITH_RUNTIME_DEBUG=OFF \
+    -DWITH_SNAPPY=ON -DWITH_LZ4=ON -DWITH_ZLIB=ON \
+    -DWITH_LIBURING=OFF -DWITH_ZSTD=ON -DWITH_BZ2=OFF \
+    -DPORTABLE=1 \
+    -DCMAKE_INSTALL_PREFIX=/opt/rocksdb \
+    && cmake --build . -j$(nproc) \
+    && cmake --install . \
+    && rm -rf /tmp/rocksdb
+
+ENV CGO_CFLAGS="-I/opt/rocksdb/include"
+ENV CGO_LDFLAGS="-L/opt/rocksdb/lib -lrocksdb -lstdc++ -lm -lz -lbz2 -lsnappy -llz4 -lzstd -lpthread -ldl"

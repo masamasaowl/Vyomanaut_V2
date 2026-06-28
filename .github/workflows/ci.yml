@@ -15,6 +15,13 @@ jobs:
   ci:
     runs-on: ubuntu-latest
 
+    container:
+      image: ghcr.io/masamasaowl/vyomanaut-ci:rocksdb-10.10.1
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+
     services:
       postgres:
         image: postgres:16
@@ -38,51 +45,7 @@ jobs:
         uses: actions/setup-go@v6
         with:
           go-version: "1.26"
-
-      # ─── RocksDB 10.10.1 ─────────────────────────────────────────────────────
-      - name: Install RocksDB system dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y libsnappy-dev liblz4-dev libzstd-dev zlib1g-dev libbz2-dev
-
-      - name: Cache RocksDB 10.10.1
-        id: cache-rocksdb
-        uses: actions/cache@v4
-        with:
-          path: ~/rocksdb
-          key: rocksdb-10.10.1-${{ runner.os }}-${{ runner.arch }}
-
-      - name: Build RocksDB 10.10.1
-        if: steps.cache-rocksdb.outputs.cache-hit != 'true'
-        run: |
-          git clone --depth 1 --branch v10.10.1 https://github.com/facebook/rocksdb.git /tmp/rocksdb
-          cd /tmp/rocksdb && mkdir build && cd build
-          cmake .. \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DROCKSDB_BUILD_SHARED=OFF \
-            -DWITH_TESTS=OFF \
-            -DWITH_GFLAGS=OFF \
-            -DWITH_BENCHMARK_TOOLS=OFF \
-            -DWITH_TOOLS=OFF \
-            -DWITH_MD_LIBRARY=OFF \
-            -DWITH_RUNTIME_DEBUG=OFF \
-            -DWITH_SNAPPY=ON \
-            -DWITH_LZ4=ON \
-            -DWITH_ZLIB=ON \
-            -DWITH_LIBURING=OFF \
-            -DWITH_ZSTD=ON \
-            -DWITH_BZ2=OFF \
-            -DPORTABLE=1 \
-            -DCMAKE_INSTALL_PREFIX=$HOME/rocksdb
-          cmake --build . -j$(nproc)
-          cmake --install .
-
-      - name: Export RocksDB CGO environment
-        run: |
-          echo "CGO_CFLAGS=-I$HOME/rocksdb/include" >> $GITHUB_ENV
-          echo "CGO_LDFLAGS=-L$HOME/rocksdb/lib -lrocksdb -lstdc++ -lm -lz -lbz2 -lsnappy -llz4 -lzstd -lpthread -ldl" >> $GITHUB_ENV
-      # ─────────────────────────────────────────────────────────────────────────
-
+ 
       # ─────────────────────────────────────────────────────────────
       # check-01: Build — zero warnings, strict mode
       # REF: MVP §8.4 check 1

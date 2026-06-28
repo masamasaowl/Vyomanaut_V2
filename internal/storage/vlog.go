@@ -300,7 +300,7 @@ func (ws *wiskeyStore) RunGC(ctx context.Context) error {
 
 	// Create the compacted output file. Truncate if a previous GC left an orphan.
 	tmpPath := ws.vlogPath + ".gc.tmp"
-	tmpFile, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	tmpFile, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, filePerm)
 	if err != nil {
 		return fmt.Errorf("storage.RunGC: create tmp vLog: %w", err)
 	}
@@ -375,7 +375,7 @@ func (ws *wiskeyStore) RunGC(ctx context.Context) error {
 	}
 
 	// Reopen ws.vlog to point at the new compacted file.
-	newVlog, err := os.OpenFile(ws.vlogPath, os.O_RDWR|os.O_APPEND, 0600)
+	newVlog, err := os.OpenFile(ws.vlogPath, os.O_RDWR|os.O_APPEND, filePerm)
 	if err != nil {
 		return fmt.Errorf("storage.RunGC: reopen vLog after compaction: %w", err)
 	}
