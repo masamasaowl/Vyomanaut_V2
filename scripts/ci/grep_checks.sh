@@ -5,10 +5,10 @@
 
   check() {
     local name="$1"; local pattern="$2"; local scope="$3"
-    if grep -rn --include="*.go" --include="*.sql" \
+    if grep -rn --include="*.go" --include="*.sql" --exclude="doc.go" \
          -E "$pattern" "$REPO_ROOT/$scope" 2>/dev/null | grep -q .; then
       echo "FAIL [$name]: pattern '$pattern' found in '$scope':"
-      grep -rn --include="*.go" --include="*.sql" \
+      grep -rn --include="*.go" --include="*.sql" --exclude="doc.go" \
            -E "$pattern" "$REPO_ROOT/$scope"
       FAIL=1
     else
@@ -22,10 +22,9 @@
     "."
 
   # Check 9: no float types in payment package
-  # Note: This check deprecated, needs a redesign as the current version reads integers mentioned in comments
-  # check "NO_FLOAT_PAYMENT" \
-  #   "(float64|float32|FLOAT|DECIMAL|NUMERIC)" \
-  #   "internal/payment"
+  check "NO_FLOAT_PAYMENT" \
+    "(float64|float32|FLOAT|DECIMAL|NUMERIC)" \
+    "internal/payment"
 
   # Check 10: no references to non-existent ADRs (above ADR-031)
   # Pattern: ADR-0[3-9][2-9]|ADR-[1-9][0-9]{2,}
