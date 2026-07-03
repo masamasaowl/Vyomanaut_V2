@@ -138,12 +138,10 @@ jobs:
       # ─────────────────────────────────────────────────────────────
       # check-07: Migration apply + rollback against CI Postgres
       # Requires btree_gist. Runs prod schema → separate demo schema.
-      # Becomes hard gate after M4 completes.
       # REF: MVP §8.4 check 7, DM §migrations
       # ─────────────────────────────────────────────────────────────
       - name: check-07 — migration apply + rollback (M4 gate)
         id: check-07
-        continue-on-error: true
         env:
           PGPASSWORD: testpass
         run: |
@@ -201,24 +199,20 @@ jobs:
 
       # ─────────────────────────────────────────────────────────────
       # check-14: ShardSize compile-time constant (M1 gate)
-      # Becomes hard gate after Session 1.2.1 completes.
       # REF: MVP §8.4 check 14, INV-7, ADR-003
       # ─────────────────────────────────────────────────────────────
       - name: check-14 — TestProfileShardSizeIsConstant (M1 gate)
         id: check-14
-        continue-on-error: true
         run: |
           go test -run TestProfileShardSizeIsConstant ./internal/config/... \
             || (echo "PENDING: session 1.2.1" && exit 0)
 
       # ─────────────────────────────────────────────────────────────
       # check-15: Both NetworkProfiles fully specified (M1 gate)
-      # Becomes hard gate after Session 1.2.2 completes.
       # REF: MVP §8.4 check 15, ADR-031
       # ─────────────────────────────────────────────────────────────
       - name: check-15 — TestProfileBothFullySpecified (M1 gate)
         id: check-15
-        continue-on-error: true
         run: |
           go test -run TestProfileBothFullySpecified ./internal/config/... \
             || (echo "PENDING: session 1.2.2" && exit 0)
