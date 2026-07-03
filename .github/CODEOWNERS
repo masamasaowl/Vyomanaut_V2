@@ -12,6 +12,11 @@
 # TODO: replace placeholder handles with real ones as team grows.
 
 # ─── CI / CODEOWNERS — changes here require unanimous approval ────────────────
+
+# ─── Catch-all: everything else requires at least the project lead ────────────
+
+*                           @masamasaowl
+
 # A PR that removes a required CI check is automatically blocked.
 /.github/                   @masamasaowl @reviewer2 @reviewer1
 
@@ -44,6 +49,3 @@
 
 # ─── Docs ─────────────────────────────────────────────────────────────────────
 /docs/                      @masamasaowl
-
-# ─── Catch-all: everything else requires at least the project lead ────────────
-*                           @masamasaowl
