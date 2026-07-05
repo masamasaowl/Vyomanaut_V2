@@ -28,11 +28,11 @@ jobs:
 
       - name: Pull or build CI image
         run: |
-          docker pull ghcr.io/masamasaowl/vyomanaut-ci:rocksdb-10.10.1 2>/dev/null && exit 0
+          docker pull ghcr.io/masamasaowl/vyomanaut-ci:rocksdb-10.10.1-pgclient1 2>/dev/null && exit 0
           docker build \
-            -t ghcr.io/masamasaowl/vyomanaut-ci:rocksdb-10.10.1 \
+            -t ghcr.io/masamasaowl/vyomanaut-ci:rocksdb-10.10.1-pgclient1 \
             -f deployments/docker/Dockerfile.ci .
-          docker push ghcr.io/masamasaowl/vyomanaut-ci:rocksdb-10.10.1
+          docker push ghcr.io/masamasaowl/vyomanaut-ci:rocksdb-10.10.1-pgclient1
   ci:
     needs: ensure-image  
     runs-on: ubuntu-latest
@@ -41,7 +41,7 @@ jobs:
       packages: read
 
     container:
-      image: ghcr.io/masamasaowl/vyomanaut-ci:rocksdb-10.10.1
+      image: ghcr.io/masamasaowl/vyomanaut-ci:rocksdb-10.10.1-pgclient1
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -144,21 +144,35 @@ jobs:
         id: check-07
         env:
           PGPASSWORD: testpass
+          PGHOST: postgres
+          PGPORT: "5432"
+          PGUSER: vyomanaut_app
         run: |
-          psql -h localhost -U vyomanaut_app -d vyomanaut_test \
+          psql --version
+
+          psql -v ON_ERROR_STOP=1 -d vyomanaut_test \
             -c "CREATE EXTENSION IF NOT EXISTS btree_gist;"
+
           go run migrations/generator.go --profile=prod \
             > /tmp/001_prod.sql
-          psql -h localhost -U vyomanaut_app -d vyomanaut_test \
+
+          psql -v ON_ERROR_STOP=1 -d vyomanaut_test \
             -f /tmp/001_prod.sql
+
           go run migrations/generator.go --profile=demo \
             > /tmp/001_demo.sql
-          # Demo schema applied to a separate DB to avoid cross-contamination.
-          psql -h localhost -U vyomanaut_app \
-            -c "CREATE DATABASE vyomanaut_demo_test;"
-          psql -h localhost -U vyomanaut_app -d vyomanaut_demo_test \
+
+          # Demo schema is applied to a separate database.
+          psql -v ON_ERROR_STOP=1 -d vyomanaut_test \
+            -c "SELECT 'CREATE DATABASE vyomanaut_demo_test'
+                WHERE NOT EXISTS (
+                  SELECT FROM pg_database WHERE datname = 'vyomanaut_demo_test'
+                )\gexec"
+
+          psql -v ON_ERROR_STOP=1 -d vyomanaut_demo_test \
             -c "CREATE EXTENSION IF NOT EXISTS btree_gist;"
-          psql -h localhost -U vyomanaut_app -d vyomanaut_demo_test \
+
+          psql -v ON_ERROR_STOP=1 -d vyomanaut_demo_test \
             -f /tmp/001_demo.sql
 
       # ─────────────────────────────────────────────────────────────

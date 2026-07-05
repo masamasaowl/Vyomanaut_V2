@@ -3,6 +3,7 @@ FROM ubuntu:24.04
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential cmake git ca-certificates \
+    postgresql-client \
     libsnappy-dev liblz4-dev libzstd-dev zlib1g-dev libbz2-dev \
     && rm -rf /var/lib/apt/lists/*
 
