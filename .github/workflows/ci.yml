@@ -163,11 +163,9 @@ jobs:
             > /tmp/001_demo.sql
 
           # Demo schema is applied to a separate database.
+          # Each GitHub Actions run gets a fresh PostgreSQL service container.
           psql -v ON_ERROR_STOP=1 -d vyomanaut_test \
-            -c "SELECT 'CREATE DATABASE vyomanaut_demo_test'
-                WHERE NOT EXISTS (
-                  SELECT FROM pg_database WHERE datname = 'vyomanaut_demo_test'
-                )\gexec"
+            -c "CREATE DATABASE vyomanaut_demo_test;"
 
           psql -v ON_ERROR_STOP=1 -d vyomanaut_demo_test \
             -c "CREATE EXTENSION IF NOT EXISTS btree_gist;"
