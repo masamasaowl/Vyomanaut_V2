@@ -9,6 +9,9 @@ linters:
     - errcheck
     - exhaustive
     - mnd
+    - depguard
+    - godot
+
   settings:
     exhaustive:
     # Types added here as they are defined in subsequent milestones.
