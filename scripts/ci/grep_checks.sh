@@ -18,7 +18,7 @@
 
   # Check 8: challenge_nonce must be BYTEA(33), never BYTEA(32)
   check "NONCE_LENGTH" \
-    "challenge_nonce[[:space:]]+BYTEA\(32\)" \
+    " octet_length\(challenge_nonce\)\s*=\s*32\b" \
     "."
 
   # Check 9: no float types in payment package
