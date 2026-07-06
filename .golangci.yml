@@ -10,21 +10,78 @@ linters:
     - exhaustive
     - mnd
     - depguard
-    - godot
 
   settings:
     exhaustive:
-    # Types added here as they are defined in subsequent milestones.
-    # Format: <package_import_path>.<TypeName>
-    # M7: internal/audit.AuditResult
-    # M9: internal/repair.Priority, internal/repair.TriggerType
-    # M10: internal/payment.EscrowEventType
       default-signifies-exhaustive: false
     errcheck:
       check-type-assertions: true
     mnd:
       ignored-functions:
         - "argon2.IDKey"
+
+    depguard:
+      rules:
+        # ── crypto: stdlib + x/crypto/x/sys only, zero internal/ imports ───────
+        crypto:
+          files:
+            - "**/internal/crypto/**"
+          allow:
+            - $gostd
+            - golang.org/x/crypto
+            - golang.org/x/sys
+
+        # ── erasure: stdlib + config only (config is universally importable) ──
+        erasure:
+          files:
+            - "**/internal/erasure/**"
+          allow:
+            - $gostd
+            - github.com/masamasaowl/Vyomanaut_V2/internal/config
+
+        # ── storage: no payment, scoring, repair ────────────────────────────────
+        storage:
+          files:
+            - "**/internal/storage/**"
+          allow:
+            - $gostd
+            - github.com/linxGnu/grocksdb
+            - github.com/stretchr/testify
+            - github.com/masamasaowl/Vyomanaut_V2/internal/config
+            - github.com/masamasaowl/Vyomanaut_V2/internal/storage
+
+        # ── payment: no repair, p2p ──────────────────────────────────────────────
+        payment:
+          files:
+            - "**/internal/payment/**"
+          allow:
+            - $gostd
+            - github.com/masamasaowl/Vyomanaut_V2/internal/config
+
+        # ── scoring: no repair, payment ──────────────────────────────────────────
+        scoring:
+          files:
+            - "**/internal/scoring/**"
+          allow:
+            - $gostd
+            - github.com/masamasaowl/Vyomanaut_V2/internal/config
+
+        # ── audit: no scoring, repair, payment ───────────────────────────────────
+        audit:
+          files:
+            - "**/internal/audit/**"
+          allow:
+            - $gostd
+            - github.com/masamasaowl/Vyomanaut_V2/internal/config
+
+        # ── client/*: deny-only rule; everything else stays allowed by default ──
+        client:
+          files:
+            - "**/internal/client/**"
+          deny:
+            - pkg: "github.com/masamasaowl/Vyomanaut_V2/cmd"
+              desc: "internal/client/* must not import cmd/"
+
   exclusions:
     rules:
       - path: "_test\\.go"
