@@ -63,6 +63,9 @@ const dhtKeyLen = 32
 // responsible for threading the profile-appropriate value through DHTConfig.
 const defaultRecordTTL = 24 * time.Hour
 
+// maxGetCount is the maximum count encoded in a single GET_PROVIDERS request.
+const maxGetCount = 255
+
 // ── AddrInfo ─────────────────────────────────────────────────────────────────
 
 // AddrInfo pairs a Peer ID with the multiaddrs at which it is currently
@@ -468,8 +471,8 @@ func encodePutRequest(key [32]byte, info AddrInfo) []byte {
 func encodeGetRequest(key [32]byte, maxCount int) []byte {
 	buf := []byte{dhtMsgGetProviders}
 	buf = append(buf, key[:]...)
-	if maxCount > 255 {
-		maxCount = 255
+	if maxCount > maxGetCount {
+		maxCount = maxGetCount
 	}
 	buf = append(buf, byte(maxCount))
 	return buf
@@ -549,7 +552,7 @@ func (d *kademliaDHT) handleStream(s Stream) {
 }
 
 func (d *kademliaDHT) handlePut(s Stream) {
-	keyBuf := make([]byte, 32)
+	keyBuf := make([]byte, dhtKeyLen)
 	if _, err := streamReadFull(s, keyBuf); err != nil {
 		return
 	}
@@ -590,7 +593,7 @@ func (d *kademliaDHT) handlePut(s Stream) {
 }
 
 func (d *kademliaDHT) handleGet(s Stream) {
-	keyBuf := make([]byte, 32)
+	keyBuf := make([]byte, dhtKeyLen)
 	if _, err := streamReadFull(s, keyBuf); err != nil {
 		return
 	}
