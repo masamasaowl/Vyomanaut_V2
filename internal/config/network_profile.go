@@ -95,6 +95,7 @@ type NetworkProfile struct {
 	// ── Infrastructure ────────────────────────────────────────────────────────
 	RequireSecretsManager bool   // if false, read VYOMANAUT_CLUSTER_MASTER_SEED env var
 	RequireQuorum         bool   // if false, gossip cluster allows N=1 with quorum disabled
+	AllowLivePayments     bool   // gates Guard 2 (DEMO_MODE_REAL_PAYMENT); true only for ProductionProfile today
 	PaymentMode           string // "razorpay_live" | "razorpay_test" | "mock"
 	SkipMnemonicConfirm   bool   // if true, client skips two-word mnemonic confirmation step
 	RazorpayCoolingPeriod time.Duration

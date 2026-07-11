@@ -117,6 +117,12 @@ func TestProfileBothFullySpecified(t *testing.T) {
 				// replica with quorum checks disabled.
 				// Zero (false) is correct per MVP §3.3.
 				"RequireQuorum": "zero is correct: single-instance microservice in demo, no quorum (MVP §3.3)",
+
+				// AllowLivePayments = false: demo must never reach the live
+				// Razorpay endpoint. This is the field Guard 2
+				// (DEMO_MODE_REAL_PAYMENT) checks instead of profile.Mode.
+				// Zero is correct and load-bearing — see guards.go.
+				"AllowLivePayments": "zero is correct: demo must never use live payments; checked directly by Guard 2 (guards.go)",
 			},
 		},
 	}
@@ -303,6 +309,9 @@ func TestDemoDiffersFromProduction(t *testing.T) {
 		}
 		if prod.RequireQuorum == demo.RequireQuorum {
 			t.Errorf("RequireQuorum must differ: both=%v", prod.RequireQuorum)
+		}
+		if prod.AllowLivePayments == demo.AllowLivePayments {
+			t.Errorf("AllowLivePayments must differ: both=%v", prod.AllowLivePayments)
 		}
 		if prod.PaymentMode == demo.PaymentMode {
 			t.Errorf("PaymentMode must differ: both=%q", prod.PaymentMode)

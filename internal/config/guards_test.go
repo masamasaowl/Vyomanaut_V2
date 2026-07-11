@@ -71,3 +71,41 @@ func TestGuardRails(t *testing.T) {
 		}
 	})
 }
+
+// TestGuardRailsIgnoreModeString verifies both guards key off their typed
+// fields (RequireSecretsManager, AllowLivePayments), not profile.Mode. A
+// synthetic non-"prod"/"demo" Mode value is used to prove neither guard
+// special-cases those two literal strings.
+//
+// [REF: MVP CR-01, ARCH §9]
+func TestGuardRailsIgnoreModeString(t *testing.T) {
+	t.Run("RequireSecretsManager=true guards even when Mode != \"prod\"", func(t *testing.T) {
+		t.Setenv("VYOMANAUT_CLUSTER_MASTER_SEED", "devonlysecret00000000000000000000")
+		profile := DemoProfile
+		profile.Mode = "staging"
+		profile.RequireSecretsManager = true
+		err := ValidateStartupGuards(profile)
+		se, ok := err.(*StartupError) //nolint:errorlint // see TestGuardRails above for rationale
+		if !ok {
+			t.Fatalf("expected *StartupError even though Mode=%q, got %T: %v", profile.Mode, err, err)
+		}
+		if se.Code != "PROD_MODE_ENV_SECRET" {
+			t.Errorf("Code = %q, want \"PROD_MODE_ENV_SECRET\"", se.Code)
+		}
+	})
+
+	t.Run("AllowLivePayments=false guards even when Mode != \"demo\"", func(t *testing.T) {
+		t.Setenv("VYOMANAUT_CLUSTER_MASTER_SEED", "") // keep guard 1 clear
+		profile := ProductionProfile
+		profile.Mode = "staging"
+		profile.AllowLivePayments = false
+		err := ValidateStartupGuards(profile)
+		se, ok := err.(*StartupError) //nolint:errorlint
+		if !ok {
+			t.Fatalf("expected *StartupError even though Mode=%q, got %T: %v", profile.Mode, err, err)
+		}
+		if se.Code != "DEMO_MODE_REAL_PAYMENT" {
+			t.Errorf("Code = %q, want \"DEMO_MODE_REAL_PAYMENT\"", se.Code)
+		}
+	})
+}

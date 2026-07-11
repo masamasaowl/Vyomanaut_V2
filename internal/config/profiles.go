@@ -69,6 +69,7 @@ var ProductionProfile = NetworkProfile{
 	// ── Infrastructure ────────────────────────────────────────────────────────
 	RequireSecretsManager: true,
 	RequireQuorum:         true,
+	AllowLivePayments:     true,
 	PaymentMode:           "razorpay_live",
 	SkipMnemonicConfirm:   false,
 	RazorpayCoolingPeriod: 24 * time.Hour,
@@ -149,6 +150,7 @@ var DemoProfile = NetworkProfile{
 	// ── Infrastructure ────────────────────────────────────────────────────────
 	RequireSecretsManager: false,
 	RequireQuorum:         false,
+	AllowLivePayments:     false,
 	PaymentMode:           "mock",
 	SkipMnemonicConfirm:   true,
 	RazorpayCoolingPeriod: 0,
