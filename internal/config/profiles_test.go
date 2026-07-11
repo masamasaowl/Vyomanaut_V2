@@ -158,6 +158,9 @@ func TestDemoDiffersFromProduction(t *testing.T) {
 	demo := config.DemoProfile
 
 	// ── Fields that must be IDENTICAL (wire-format / protocol invariants) ─────
+	// NOTE: MinDistinctASNs is also identical across profiles (5 in both), but
+	// for a different reason — ASN-cap arithmetic, not wire format. It's
+	// checked separately in TestMinDistinctASNsInvariant, not here.
 	t.Run("invariant_fields_are_identical", func(t *testing.T) {
 		if prod.ShardSize != demo.ShardSize {
 			t.Errorf("ShardSize must be identical: prod=%d demo=%d", prod.ShardSize, demo.ShardSize)
@@ -321,4 +324,33 @@ func TestDemoDiffersFromProduction(t *testing.T) {
 				prod.GCRetryBackoff[0], demo.GCRetryBackoff[0])
 		}
 	})
+}
+
+// TestMinDistinctASNsInvariant documents and verifies that MinDistinctASNs is
+// identical (5) in both profiles — not because it is a wire-format constant
+// like ShardSize, but because of ASN-cap arithmetic: floor(TotalShards ×
+// ASNCapFraction) = floor(5 × 0.20) = 1 shard/ASN in demo, which requires
+// exactly 5 distinct ASNs to place DemoProfile's 5 shards at all. Setting
+// DemoProfile.MinDistinctASNs below 5 would make the ASN cap mathematically
+// unsatisfiable in demo mode — this is the exact bug the pre-ADR analysis
+// contained (it proposed MinDistinctASNs=2) before mvp.md §7.1 corrected it.
+//
+// [REF: mvp.md §7.1 "CORRECTED: ASN Cap vs MinDistinctASNs", requirements.md §5.10]
+func TestMinDistinctASNsInvariant(t *testing.T) {
+	const wantMinDistinctASNs = 5
+
+	if config.ProductionProfile.MinDistinctASNs != wantMinDistinctASNs {
+		t.Errorf("ProductionProfile.MinDistinctASNs = %d, want %d",
+			config.ProductionProfile.MinDistinctASNs, wantMinDistinctASNs)
+	}
+	if config.DemoProfile.MinDistinctASNs != wantMinDistinctASNs {
+		t.Errorf("DemoProfile.MinDistinctASNs = %d, want %d — floor(TotalShards×ASNCapFraction)=1 "+
+			"shard/ASN requires exactly 5 distinct ASNs to place 5 shards (mvp.md §7.1)",
+			config.DemoProfile.MinDistinctASNs, wantMinDistinctASNs)
+	}
+	if config.ProductionProfile.MinDistinctASNs != config.DemoProfile.MinDistinctASNs {
+		t.Errorf("MinDistinctASNs must be equal across profiles (arithmetic coincidence, "+
+			"not a wire-format invariant): prod=%d demo=%d",
+			config.ProductionProfile.MinDistinctASNs, config.DemoProfile.MinDistinctASNs)
+	}
 }
