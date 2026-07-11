@@ -37,4 +37,12 @@
     "virtual_accounts|upi/collect|collect/request" \
     "internal"
 
+  # Supplementary check (not one of the 16 numbered CI gates — add alongside them)
+  # Session 7.1.1: ChallengeNonce returns [33]byte, never [32]byte. Catches a
+  # call site that narrows the result to [32]byte at the Go level — the
+  # source-level complement to check 8's BYTEA(33) schema check.
+  check "NONCE_TRUNCATION_GO" \
+    "\[32\]byte.*ChallengeNonce\(|ChallengeNonce\([^)]*\).*\[32\]byte" \
+    "internal"
+
   exit $FAIL
