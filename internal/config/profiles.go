@@ -79,7 +79,7 @@ var ProductionProfile = NetworkProfile{
 	ReleaseComputationInterval: 0,
 
 	// ── GC retry backoff (IC §4.5) ────────────────────────────────────────────
-	GCRetryBackoff: []time.Duration{
+	GCRetryBackoff: [3]time.Duration{
 		5 * time.Minute,
 		15 * time.Minute,
 		60 * time.Minute,
@@ -160,7 +160,7 @@ var DemoProfile = NetworkProfile{
 	ReleaseComputationInterval: 2 * time.Minute,
 
 	// ── GC retry backoff (IC §4.5) ────────────────────────────────────────────
-	GCRetryBackoff: []time.Duration{
+	GCRetryBackoff: [3]time.Duration{
 		10 * time.Second,
 		30 * time.Second,
 		2 * time.Minute,

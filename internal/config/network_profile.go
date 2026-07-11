@@ -108,10 +108,14 @@ type NetworkProfile struct {
 	ReleaseComputationInterval time.Duration
 
 	// ── GC retry backoff ─────────────────────────────────────────────────────
-	// Slice of back-off durations for vetting GC delivery retries.
+	// Fixed 3-step back-off schedule for vetting GC delivery retries. An array,
+	// not a slice: both canonical profiles always declare exactly 3 steps, and
+	// arrays copy by value — this removes the last reference-type field from
+	// NetworkProfile, so a plain struct copy (profile := DemoProfile) can never
+	// alias the package-level profile's backing storage.
 	// Access via profile.GCRetryBackoff[attempt] (bounds-checked by caller).
 	// [REF: IC §4.5]
-	GCRetryBackoff []time.Duration
+	GCRetryBackoff [3]time.Duration
 
 	// ── Mode identifier ───────────────────────────────────────────────────────
 	// Printed in full at startup (MVP §6.3 OR-01). MUST NOT be used for
