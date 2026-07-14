@@ -251,3 +251,52 @@ func TestAONTDecryptedBufferZeroedOnMismatch(t *testing.T) {
 		t.Errorf("expected nil result on ErrCanaryMismatch, got %d-byte slice", len(result))
 	}
 }
+
+// TestAONTCanaryIsEncryptedNotRaw pins a structural property that
+// TestAONTCorruptionDetection's byte-sweep doesn't name directly: the canary
+// word AS STORED in an AONT package must be its ciphertext, never the
+// plaintext aontCanary bytes copied in raw.
+//
+// This exists because build.md's own Session 2.4.2 pseudocode at one point
+// described the inverse (and insecure) construction: append the canary in
+// the clear AFTER encryption, then hash only the preceding data words,
+// excluding the canary from the commitment hash. Under that construction the
+// canary check degenerates into a bare comparison against the public
+// aontCanary constant — completely decoupled from whether K or the
+// surrounding ciphertext was correctly recovered — which defeats FR-018 and
+// the entire point of AONT. The shipped code correctly does the opposite
+// (ARCH §10 Stage 1: canary appended to plaintext BEFORE encryption, hash
+// covers the full ciphertext including the encrypted canary word); this test
+// names that property explicitly so a future refactor toward the flawed
+// pseudocode fails here with a message that says exactly what went wrong,
+// rather than surfacing only as one anonymous iteration inside
+// TestAONTCorruptionDetection's byte sweep.
+//
+// [REF: ARCH §10 Stage 1, ADR-022, FR-018]
+func TestAONTCanaryIsEncryptedNotRaw(t *testing.T) {
+	segment := testSegment(4) // 4 words = 64 bytes; representative non-trivial input
+
+	for _, p := range []struct {
+		name  string
+		aesNI bool
+	}{
+		{"chacha20_path", false},
+		{"aesni_path", true},
+	} {
+		pkg, err := AONTEncodeSegment(segment, p.aesNI)
+		if err != nil {
+			t.Fatalf("%s: AONTEncodeSegment: %v", p.name, err)
+		}
+
+		numDataWords := len(segment) / aontWordSize
+		canaryWordOffset := numDataWords * aontWordSize
+		storedCanaryWord := pkg[canaryWordOffset : canaryWordOffset+aontWordSize]
+
+		if bytes.Equal(storedCanaryWord, aontCanary[:]) {
+			t.Errorf("%s: canary word in the package equals the plaintext aontCanary "+
+				"constant — it was copied in raw instead of encrypted "+
+				"(this is build.md Session 2.4.2's flawed construction, not ARCH §10 Stage 1)",
+				p.name)
+		}
+	}
+}
