@@ -268,6 +268,7 @@ func TestHKDFPanicOnBadMasterSecret(t *testing.T) {
 		})
 	}
 }
+
 // TestHKDFPanicOnBadOwnerID verifies that supplying a wrong-length ownerID
 // panics, for every function that accepts one. TestHKDFPanicOnBadMasterSecret
 // only covers the masterSecret parameter; mustLen is called on ownerID (and
