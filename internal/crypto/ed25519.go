@@ -32,6 +32,13 @@ var _ [ed25519.PublicKeySize - 32]byte //nolint:mnd // 32 is the Ed25519 public 
 // Pre-hashing with SHA-256 is mandatory — callers must never pass a pre-hashed
 // digest; this function always applies SHA-256 internally.
 //
+// NOT RFC 8032 Ed25519ph: this is Vyomanaut's own hash-then-sign composition
+// (plain Ed25519 signing over a SHA-256 digest), not the standardised
+// "Ed25519ph" prehash variant, which uses a different domain-separation
+// prefix and context/flag byte. A signature from SignBytes is not
+// wire-compatible with standard Ed25519ph tooling — only with another
+// implementation of this exact IC §3.2 composition. (M2 review §7.3)
+//
 // SIGNING_INPUT_RULE: use fixed-layout byte sequence, never JSON.
 // JSON serialisation must not be used to construct inputBytes — field ordering
 // is not guaranteed across Go versions. Use fixed-width fields in a defined
@@ -56,7 +63,9 @@ func SignBytes(privateKey ed25519.PrivateKey, inputBytes []byte) [64]byte {
 	return sig
 }
 
-// VerifyBytes verifies an Ed25519 signature produced by SignBytes.
+// VerifyBytes verifies an Ed25519 signature produced by SignBytes. See
+// SignBytes' doc comment: this is IC §3.2's own hash-then-sign composition,
+// not RFC 8032 Ed25519ph.
 // It replicates the verification procedure from IC §3.2:
 //  1. Compute SHA-256(inputBytes) using the same fixed-layout as the signer.
 //  2. Call ed25519.Verify(publicKey, sha256Digest, signature).

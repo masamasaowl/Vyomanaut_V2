@@ -40,11 +40,16 @@ const (
 	bip39MnemonicLen = 24
 
 	// bip39EntropyBytes is the master-secret byte length (256-bit entropy).
-	bip39EntropyBytes = 32
+	// Derived from masterSecretSize (hkdf.go) rather than redeclared as a
+	// separate literal — both name the same 32-byte quantity by design (the
+	// mnemonic IS the master secret; see this file's header comment), so a
+	// future change to the master secret's size only needs updating in one
+	// place. (M2 review §7.2)
+	bip39EntropyBytes = masterSecretSize
 
 	// bip39TotalBytes is the size of the packed encoding buffer in bytes.
 	// 256 bits entropy + 8 bits checksum = 264 bits = 33 bytes.
-	bip39TotalBytes = 33
+	bip39TotalBytes = bip39EntropyBytes + 1
 
 	// bip39RandCeiling is the exclusive upper bound for the rejection-sampling
 	// loop in SelectConfirmationWords: the largest multiple of bip39MnemonicLen
