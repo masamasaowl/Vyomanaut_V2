@@ -17,9 +17,9 @@ Included components:
   - Ed25519 helpers
 
 Design notes after HKDF key derivation (Phase 2.2)
- 1. HKDF is scratch-only, zero external deps using Used crypto/hmac + crypto/sha256. No golang.org/x/crypto/hkdf
- 2. Single-block expand. All five functions need exactly 32 bytes (= sha256.Size = HashLen), so the RFC 5869 Expand phase terminates after one block: T(1) = HMAC(PRK, info ∥ 0x01). If a future function needs more than 32 bytes, hkdfSHA256 must be extended to a multi-block loop
- 3. _, _ = h.Write(…) everywhere. hash.Hash.Write is contractually infallible, but errcheck still flags a bare h.Write(data). The explicit double-blank avoids both the lint failure and any //nolint that would need a BUILD citation
+ 1. [UPDATED — M2 review corrections] Originally scratch-only (crypto/hmac + crypto/sha256, zero external deps). Swapped hkdfSHA256's Extract/Expand to golang.org/x/crypto/hkdf: that module is already a direct dependency (argon2, chacha20, chacha20poly1305 elsewhere in this package), so this adds no new go.mod/go.sum entry — it only reduces hand-written crypto surface area. Verified byte-identical before switching, via independent Python HMAC/SHA-256 re-derivation of all four KATs and direct inspection of the pinned v0.53.0 hkdf.go source.
+ 2. Single-block expand. All five functions need exactly 32 bytes (= sha256.Size = HashLen), so the RFC 5869 Expand phase terminates after one block: T(1) = HMAC(PRK, "" ∥ info ∥ 0x01). If a future function needs more than 32 bytes, read more than sha256.Size bytes from the same io.Reader — x/crypto/hkdf already supports up to 255×HashLen bytes natively, so no hand-rolled multi-block loop is needed.
+ 3. _, _ = h.Write(…) still applies to DeriveDHTKey's direct hmac.New usage — that function doesn't go through hkdfSHA256 (HKDF isn't the right primitive for combining a chunk hash with a derived key; see its own doc comment).
  4. [sha256.Size]byte return type = [32]byte — identical type in Go. Uses the named constant rather than a raw literal, keeping mnd clean on non-test files. The VERIFY grep anchored to ^func matches either spelling.
 
 Design notes after Phase 2.4 — AONT Cipher:

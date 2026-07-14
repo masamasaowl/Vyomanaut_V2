@@ -268,3 +268,69 @@ func TestHKDFPanicOnBadMasterSecret(t *testing.T) {
 		})
 	}
 }
+// TestHKDFPanicOnBadOwnerID verifies that supplying a wrong-length ownerID
+// panics, for every function that accepts one. TestHKDFPanicOnBadMasterSecret
+// only covers the masterSecret parameter; mustLen is called on ownerID (and
+// fileID, see TestHKDFPanicOnBadFileID) in the same functions and this was
+// previously untested.
+//
+// [REF: IC §5.1 — "pre-condition violations panic"]
+func TestHKDFPanicOnBadOwnerID(t *testing.T) {
+	ms := katMasterSecret[:]
+	fileA := katFileIDA[:]
+	badOwner := []byte("short")
+
+	funcs := []struct {
+		name string
+		fn   func()
+	}{
+		{"DeriveFileKey", func() { DeriveFileKey(ms, badOwner, fileA) }},
+		{"DerivePointerEncKey", func() { DerivePointerEncKey(ms, badOwner, fileA) }},
+		{"DeriveKeystoreEncKey", func() { DeriveKeystoreEncKey(ms, badOwner) }},
+		{"DeriveDHTOwnerKey", func() { DeriveDHTOwnerKey(ms, badOwner, fileA) }},
+	}
+
+	for _, tc := range funcs {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r == nil {
+					t.Errorf("%s: expected panic on short ownerID, got none", tc.name)
+				}
+			}()
+			tc.fn()
+		})
+	}
+}
+
+// TestHKDFPanicOnBadFileID verifies that supplying a wrong-length fileID
+// panics, for every function that accepts one. DeriveKeystoreEncKey is
+// omitted — it takes no fileID parameter.
+//
+// [REF: IC §5.1 — "pre-condition violations panic"]
+func TestHKDFPanicOnBadFileID(t *testing.T) {
+	ms := katMasterSecret[:]
+	owner := katOwnerID[:]
+	badFile := []byte("short")
+
+	funcs := []struct {
+		name string
+		fn   func()
+	}{
+		{"DeriveFileKey", func() { DeriveFileKey(ms, owner, badFile) }},
+		{"DerivePointerEncKey", func() { DerivePointerEncKey(ms, owner, badFile) }},
+		{"DeriveDHTOwnerKey", func() { DeriveDHTOwnerKey(ms, owner, badFile) }},
+	}
+
+	for _, tc := range funcs {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r == nil {
+					t.Errorf("%s: expected panic on short fileID, got none", tc.name)
+				}
+			}()
+			tc.fn()
+		})
+	}
+}

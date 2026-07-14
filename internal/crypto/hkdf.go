@@ -12,6 +12,9 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"fmt"
+	"io"
+
+	"golang.org/x/crypto/hkdf"
 )
 
 // ── Pre-condition sizes ───────────────────────────────────────────────────────
@@ -42,28 +45,33 @@ func mustLen(b []byte, want int, fn, param string) {
 // hkdfSHA256 derives exactly sha256.Size bytes of output key material using
 // HKDF-SHA256 (RFC 5869) with the given IKM, salt, and info.
 //
+// Delegates to golang.org/x/crypto/hkdf (already vendored for argon2,
+// chacha20, and chacha20poly1305 elsewhere in this package — this adds no
+// new dependency). Verified byte-for-byte equivalent to this package's
+// previous hand-rolled Extract/Expand implementation against all four KAT
+// vectors in hkdf_test.go, and against the pinned v0.53.0 source directly,
+// before this change was made (M2 review corrections).
+//
 // Since every caller in this package needs exactly sha256.Size output bytes
-// (L = HashLen = 32), the Expand phase requires a single block:
+// (L = HashLen = 32), this always reads a single Expand block:
 //
 //	Step 1 — Extract: PRK = HMAC-SHA256(key=salt, msg=ikm)
-//	Step 2 — Expand:  T(1) = HMAC-SHA256(key=PRK, msg=info ∥ 0x01)
+//	Step 2 — Expand:  T(1) = HMAC-SHA256(key=PRK, msg="" ∥ info ∥ 0x01)
 //	Output: T(1)
 //
-// Not exported. Goroutine-safe: yes (no shared mutable state).
+// x/crypto/hkdf's Reader supports reading up to 255×HashLen = 8,160 bytes
+// before its "entropy limit reached" error fires; a 32-byte read never
+// reaches that, so the error path below is unreachable in practice and is
+// treated as an invariant violation, not a recoverable condition.
+//
+// Not exported. Goroutine-safe: yes (hkdf.New allocates fresh state per
+// call; no shared mutable state).
 func hkdfSHA256(ikm, salt, info []byte) [sha256.Size]byte {
-	// Extract: PRK = HMAC-SHA256(key=salt, msg=ikm)
-	ext := hmac.New(sha256.New, salt)
-	_, _ = ext.Write(ikm) // hash.Hash.Write is guaranteed to return a nil error
-	prk := ext.Sum(nil)
-
-	// Expand — one block: T(0)="" so the message is "" ∥ info ∥ 0x01 = info ∥ 0x01
-	exp := hmac.New(sha256.New, prk)
-	_, _ = exp.Write(info)      // hash.Hash.Write is guaranteed to return a nil error
-	_, _ = exp.Write([]byte{1}) // RFC 5869 §2.3: block counter starts at 1
-	raw := exp.Sum(nil)
-
+	r := hkdf.New(sha256.New, ikm, salt, info)
 	var out [sha256.Size]byte
-	copy(out[:], raw)
+	if _, err := io.ReadFull(r, out[:]); err != nil {
+		panic(fmt.Sprintf("crypto.hkdfSHA256: unexpected hkdf.New Read failure: %v", err))
+	}
 	return out
 }
 
