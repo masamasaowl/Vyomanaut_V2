@@ -241,3 +241,23 @@ jobs:
         run: |
           bash scripts/ci/grep_checks.sh --check=metric-names \
             || (echo "PENDING: session OBS.4.1" && exit 0)
+
+      # ─────────────────────────────────────────────────────────────
+      # check-17: GOARCH=arm64 cross-build for internal/crypto (M2 gate)
+      # check-01 only builds amd64 (ubuntu-latest), so aesni_other.go's
+      # !amd64 build tag has zero CI coverage — yet Apple Silicon (macOS
+      # 12+, arm64) is an explicitly supported provider-daemon platform
+      # (FR-022). Scoped to internal/crypto, not go build ./... —
+      # internal/storage needs CGO + librocksdb, which has no arm64
+      # toolchain in this image, so a package-wide arm64 build would fail
+      # for reasons unrelated to what this check verifies. internal/storage's
+      # analogous !linux gap (rotational_other.go) needs its own fix in a
+      # future CGO-aware image, not this one.
+      # REF: build.md Session 2.1.1 VERIFY, M2 review §6
+      # ─────────────────────────────────────────────────────────────
+      - name: check-17 — GOARCH=arm64 cross-build (internal/crypto)
+        id: check-17
+        env:
+          GOARCH: arm64
+          CGO_ENABLED: 0
+        run: go build ./internal/crypto/...
