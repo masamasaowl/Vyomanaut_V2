@@ -8,7 +8,9 @@
 // the original session design is unchanged: the keystore encryption key is
 // still derived via crypto.DeriveKeystoreEncKey(masterSecret, ownerID), and
 // the private key is still encrypted at rest with
-// crypto.EncryptPointerFile / DecryptPointerFile (AEAD_CHACHA20_POLY1305).
+// crypto.EncryptAEAD / DecryptAEAD (AEAD_CHACHA20_POLY1305) — not
+// EncryptPointerFile/DecryptPointerFile, which are reserved for the pointer-
+// file artifact specifically (M2 review §3).
 //
 // [REF: IC §3.2, IC §5.1, ARCH §13, build.md Phase 6.1 Session 6.1.3]
 
@@ -93,7 +95,7 @@ func generateAndSaveIdentity(keyPath string, encKey [32]byte) (ed25519.PrivateKe
 		return nil, "", fmt.Errorf("p2p: generate nonce: %w", err)
 	}
 
-	ciphertext, err := localcrypto.EncryptPointerFile(encKey, nonce, identityAAD, priv)
+	ciphertext, err := localcrypto.EncryptAEAD(encKey, nonce, identityAAD, priv)
 	if err != nil {
 		return nil, "", fmt.Errorf("p2p: encrypt identity: %w", err)
 	}
@@ -127,10 +129,11 @@ func loadIdentity(keyPath string, encKey [32]byte) (ed25519.PrivateKey, PeerID, 
 	copy(nonce[:], blob[:identityNonceSize])
 	ciphertext := blob[identityNonceSize:]
 
-	raw, err := localcrypto.DecryptPointerFile(encKey, nonce, identityAAD, ciphertext)
+	raw, err := localcrypto.DecryptAEAD(encKey, nonce, identityAAD, ciphertext)
 	if err != nil {
 		return nil, "", fmt.Errorf("p2p: decrypt identity: %w", err)
 	}
+
 	if len(raw) != ed25519.PrivateKeySize {
 		return nil, "", fmt.Errorf("p2p: decrypted identity has length %d, want %d",
 			len(raw), ed25519.PrivateKeySize)

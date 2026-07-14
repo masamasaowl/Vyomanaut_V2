@@ -74,6 +74,15 @@ linters:
             - $gostd
             - github.com/masamasaowl/Vyomanaut_V2/internal/config
             - github.com/masamasaowl/Vyomanaut_V2/internal/crypto
+        
+        # ── p2p: stdlib + crypto only (identity.go needs DeriveKeystoreEncKey / ──
+        # EncryptAEAD/DecryptAEAD); no payment, scoring, repair, audit
+        p2p:
+          files:
+            - "**/internal/p2p/**"
+          allow:
+            - $gostd
+            - github.com/masamasaowl/Vyomanaut_V2/internal/crypto
 
         # ── client/*: deny-only rule; everything else stays allowed by default ──
         client:
