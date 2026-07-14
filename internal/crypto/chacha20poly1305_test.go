@@ -255,3 +255,43 @@ func TestPointerFileEncryptPanicOnEmptyAAD(t *testing.T) {
 	}()
 	_, _ = EncryptPointerFile(ptKey, ptNonceA, []byte{}, ptPlaintext)
 }
+
+// TestEncryptAEADAllowsEmptyAAD verifies that, unlike EncryptPointerFile,
+// EncryptAEAD/DecryptAEAD accept an empty AAD — the non-empty-AAD
+// requirement is EncryptPointerFile's own precondition, not the generic
+// primitive's.
+func TestEncryptAEADAllowsEmptyAAD(t *testing.T) {
+	ciphertext, err := EncryptAEAD(ptKey, ptNonceA, []byte{}, ptPlaintext)
+	if err != nil {
+		t.Fatalf("EncryptAEAD with empty aad: %v", err)
+	}
+	plaintext, err := DecryptAEAD(ptKey, ptNonceA, []byte{}, ciphertext)
+	if err != nil {
+		t.Fatalf("DecryptAEAD with empty aad: %v", err)
+	}
+	if !bytes.Equal(plaintext, ptPlaintext) {
+		t.Errorf("round-trip with empty aad mismatch:\ngot  %q\nwant %q", plaintext, ptPlaintext)
+	}
+}
+
+// TestEncryptPointerFileMatchesEncryptAEAD verifies EncryptPointerFile and
+// DecryptPointerFile are genuinely thin wrappers — byte-identical output to
+// calling EncryptAEAD/DecryptAEAD directly with the same inputs. This is the
+// regression test for the M2 review's §3 finding: a caller that needs a
+// differently-named AEAD wrapper (e.g. internal/p2p/identity.go encrypting a
+// daemon identity key) can rely on EncryptAEAD directly producing identical,
+// independently-verified output, instead of repurposing the pointer-file name.
+func TestEncryptPointerFileMatchesEncryptAEAD(t *testing.T) {
+	viaWrapper, err := EncryptPointerFile(ptKey, ptNonceA, ptAAD, ptPlaintext)
+	if err != nil {
+		t.Fatalf("EncryptPointerFile: %v", err)
+	}
+	viaGeneric, err := EncryptAEAD(ptKey, ptNonceA, ptAAD, ptPlaintext)
+	if err != nil {
+		t.Fatalf("EncryptAEAD: %v", err)
+	}
+	if !bytes.Equal(viaWrapper, viaGeneric) {
+		t.Errorf("EncryptPointerFile and EncryptAEAD diverged for identical inputs:\n"+
+			"wrapper=%x\ngeneric=%x", viaWrapper, viaGeneric)
+	}
+}
