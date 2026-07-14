@@ -14,6 +14,9 @@ linters:
   settings:
     exhaustive:
       default-signifies-exhaustive: false
+      # internal/audit.AuditResult (declared Session 7.3.1) is exhaustive-checked
+      # by default — no additional per-type allowlist entry is needed. This
+      # comment closes the M7 placeholder that used to track this.
     errcheck:
       check-type-assertions: true
     mnd:
@@ -74,6 +77,8 @@ linters:
             - $gostd
             - github.com/masamasaowl/Vyomanaut_V2/internal/config
             - github.com/masamasaowl/Vyomanaut_V2/internal/crypto
+            - github.com/google/uuid
+            - github.com/lib/pq
         
         # ── p2p: stdlib + crypto only (identity.go needs DeriveKeystoreEncKey / ──
         # EncryptAEAD/DecryptAEAD); no payment, scoring, repair, audit

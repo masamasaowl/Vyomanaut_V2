@@ -1,0 +1,258 @@
+// Package audit is declared in doc.go.
+// This file implements the two-phase crash-safe audit_receipts write (ADR-015,
+// DM §4.7, DM §6, DM §3 Invariant 1): AuditResult, ReceiptFields,
+// WriteReceiptPhase1, and WriteReceiptPhase2.
+//
+// PHASE TIMING NOTE: ADR-015's original prose describes Phase 1 as happening
+// "on receipt of a provider's challenge response." ReceiptFields as declared
+// for this session — ChunkID, FileID, ProviderID, ChallengeNonce,
+// ServerChallengeTs, AddressWasStale — contains nothing that could only be
+// known AFTER a response (no ResponseHash, no ProviderSig, no
+// ResponseLatencyMs). Phase 1 as implemented here is written at CHALLENGE
+// DISPATCH time, before the provider has replied at all: every dispatched
+// challenge gets a PENDING row immediately, so the microservice's own RTO
+// timer can promote a genuinely silent provider straight to
+// audit_result = TIMEOUT in Phase 2 without needing a separate "did anything
+// ever come back" bookkeeping path. This is a clarification of ADR-015's
+// prose, not a contradiction of its guarantees — the crash-safety and
+// idempotent-retry properties ADR-015 describes hold identically either way.
+//
+// [REF: IC §5.5, DM §4.7, DM §6, DM §3 Invariant 1, FR-039, ADR-015]
+
+package audit
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// AuditResult is the terminal state of an audit receipt (IC §5.5).
+type AuditResult int
+
+const (
+	AuditPass AuditResult = iota
+	AuditFail
+	AuditTimeout
+)
+
+// auditResultToSQL converts an AuditResult to its audit_result_type ENUM
+// string (DM §4.7: 'PASS' | 'FAIL' | 'TIMEOUT'). Every declared AuditResult
+// constant is listed explicitly (not routed through the default case) so
+// this switch stays exhaustive-linted per .golangci.yml's
+// default-signifies-exhaustive: false setting.
+func auditResultToSQL(result AuditResult) (string, error) {
+	switch result {
+	case AuditPass:
+		return "PASS", nil
+	case AuditFail:
+		return "FAIL", nil
+	case AuditTimeout:
+		return "TIMEOUT", nil
+	default:
+		return "", fmt.Errorf("audit: AuditResult(%d) is not a valid terminal result", int(result))
+	}
+}
+
+// ReceiptFields carries every audit_receipts column that Phase 1 (the initial
+// INSERT) populates. Derived from DM §4.7 — excludes receipt_id and
+// schema_version (DB-generated) and audit_result/response_hash/
+// response_latency_ms/provider_sig/service_sig/service_countersign_ts
+// (all Phase-2-only, or only ever knowable once the provider has responded).
+// PROPOSED definition — IC §5.5 uses this type name without defining its
+// fields; reconcile with interface-contracts.md in a follow-up PR.
+type ReceiptFields struct {
+	ChunkID [32]byte
+	// FileID is nil for a synthetic vetting-chunk audit (DM §8.20); non-nil
+	// for every real shard audit.
+	FileID            *uuid.UUID
+	ProviderID        uuid.UUID
+	ChallengeNonce    [33]byte
+	ServerChallengeTs time.Time
+	// AddressWasStale is true if this challenge was dispatched via DHT
+	// fallback (DM §4.7 — providers.multiaddr_stale was TRUE at dispatch).
+	AddressWasStale bool
+}
+
+// validate checks the four required ReceiptFields per WriteReceiptPhase1's
+// pre-conditions. FileID is intentionally excluded (nil is a legitimate,
+// meaningful value — DM §8.20) and so is AddressWasStale (false is a
+// legitimate value, not a "missing" sentinel).
+func (f ReceiptFields) validate() error {
+	if f.ChunkID == ([32]byte{}) {
+		return fmt.Errorf("ChunkID must not be the zero value")
+	}
+	if f.ProviderID == uuid.Nil {
+		return fmt.Errorf("ProviderID must not be the zero UUID")
+	}
+	if f.ChallengeNonce == ([33]byte{}) {
+		return fmt.Errorf("ChallengeNonce must not be the zero value")
+	}
+	if f.ServerChallengeTs.IsZero() {
+		return fmt.Errorf("ServerChallengeTs must not be the zero value")
+	}
+	return nil
+}
+
+// WriteReceiptPhase1 performs the crash-safe Phase 1 INSERT to audit_receipts.
+// Inserts a PENDING row (audit_result = NULL) at challenge-dispatch time —
+// see the PHASE TIMING NOTE above. The provider's signature is not yet known
+// at this point (dispatch precedes any response), so provider_sig is left
+// NULL along with every other Phase-2-only column; see DM §8.9 for the
+// PENDING-state field semantics. (ADR-015)
+//
+// Pre-conditions:
+//   - fields.ChunkID, fields.ProviderID, fields.ChallengeNonce, fields.ServerChallengeTs
+//     are all populated (checked; returns an error before touching the
+//     database if not — no partial row is ever created for invalid fields)
+//   - the database connection is open
+//
+// Post-conditions (on nil error):
+//   - a row with audit_result = NULL exists in audit_receipts
+//   - the row is durable before this function returns: a plain
+//     INSERT ... COMMIT under PostgreSQL's default synchronous_commit = on
+//     already guarantees the WAL is flushed before COMMIT returns — no
+//     special flush call is needed. (There is no pg_wal_flush() function in
+//     PostgreSQL; do not reference one.)
+//
+// Error semantics: database errors and field-validation errors are both
+// returned; caller must not proceed to Phase 2 if Phase 1 fails.
+// Goroutine-safe: yes (uses connection pool).
+//
+// [REF: IC §5.5, DM §4.7, DM §8.9, ADR-015, FR-039]
+func WriteReceiptPhase1(ctx context.Context, db *sql.DB, fields ReceiptFields) (receiptID uuid.UUID, err error) {
+	if err := fields.validate(); err != nil {
+		return uuid.Nil, fmt.Errorf("audit.WriteReceiptPhase1: %w", err)
+	}
+
+	receiptID, err = uuid.NewV7()
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("audit.WriteReceiptPhase1: generate UUIDv7 receipt_id: %w", err)
+	}
+
+	// FileID is *uuid.UUID; a nil pointer must become a genuine nil
+	// interface{} before it reaches database/sql. Passing the (possibly nil)
+	// *uuid.UUID directly would risk a nil-pointer panic: uuid.UUID.Value()
+	// has a VALUE receiver, so Go's method-set promotion gives *uuid.UUID
+	// that same method — including on a nil pointer, where calling it
+	// dereferences nil. database/sql's nil-interface fast path only catches
+	// an untyped nil, not a typed-nil pointer wrapped in interface{}, so this
+	// conversion has to happen explicitly here.
+	var fileIDParam interface{}
+	if fields.FileID != nil {
+		fileIDParam = *fields.FileID
+	}
+
+	const insertPhase1 = `
+INSERT INTO audit_receipts (
+    receipt_id, chunk_id, file_id, provider_id,
+    challenge_nonce, server_challenge_ts, address_was_stale
+) VALUES ($1, $2, $3, $4, $5, $6, $7)`
+	// audit_result is left NULL (omitted above — Postgres has no DEFAULT for
+	// it), alongside response_hash, response_latency_ms, provider_sig,
+	// service_sig, and service_countersign_ts: this is the PENDING state
+	// DM §8.9 describes. Nothing about the provider's eventual response is
+	// knowable yet at Phase 1 dispatch time.
+	_, err = db.ExecContext(ctx, insertPhase1,
+		receiptID, fields.ChunkID[:], fileIDParam, fields.ProviderID,
+		fields.ChallengeNonce[:], fields.ServerChallengeTs, fields.AddressWasStale,
+	)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("audit.WriteReceiptPhase1: insert: %w", err)
+	}
+
+	return receiptID, nil
+}
+
+// WriteReceiptPhase2 performs the crash-safe Phase 2 UPDATE on audit_receipts.
+// Sets audit_result, service_sig, and service_countersign_ts atomically,
+// promoting a PENDING row to its terminal state.
+// (ADR-015, DM §3 Invariant 1, DM §6 row security policy)
+//
+// KNOWN GAP, confirmed against a live database, not just read from the DDL:
+// DM §4.7's audit_receipts_response_consistency CHECK constraint requires
+// response_hash IS NOT NULL AND provider_sig IS NOT NULL whenever
+// audit_result IN ('PASS', 'FAIL'). Phase 1 never sets those two columns
+// (ReceiptFields has no field for either — see the PHASE TIMING NOTE at the
+// top of this file), and THIS function's signature — exactly as specified
+// for this session — has no parameter for either one either. The practical
+// consequence: calling this function with result = AuditPass or AuditFail
+// will ALWAYS fail the CHECK constraint and return a database error; only
+// result = AuditTimeout can ever succeed (TIMEOUT's branch of the same CHECK
+// requires response_hash and provider_sig to BOTH be NULL, which is exactly
+// what Phase 1 leaves them as). This is not a bug in this function's own
+// logic — the UPDATE statement below is correct for whatever values it is
+// given — it is a data-flow gap between this signature and the schema it
+// writes to. The most likely fix, by analogy with how Session 7.2.1 resolved
+// ValidateResponse's own signature gap, is extending this signature with
+// responseHash [32]byte and providerSig [64]byte parameters once a caller
+// (Milestone 12's dispatch loop) actually has them available; flagged here
+// rather than silently worked around, since changing this signature again
+// should go through the same review this file's other signature corrections
+// have.
+//
+// Pre-conditions:
+//   - receiptID identifies an existing row
+//   - result is AuditPass, AuditFail, or AuditTimeout
+//   - len(serviceSig) == 64 — enforced by the compiler via the fixed
+//     [64]byte parameter type, so no runtime check is needed for this one.
+//
+// Post-conditions (on nil error):
+//   - the row is updated; audit_result is no longer NULL
+//
+// Error semantics:
+//   - ErrReceiptAlreadyFinal: the UPDATE affected zero rows. The WHERE
+//     clause below cannot distinguish "already promoted to a terminal
+//     state" from "abandoned by GC" from "receiptID does not exist" — all
+//     three read back as zero rows affected. IC §5.5's idempotent-retry protocol treats this as the
+//     expected outcome for a legitimate retry: the caller should treat it as
+//     success and return the row's existing service_sig rather than
+//     surfacing this as a fresh error to whatever triggered the retry.
+//     CAVEAT for that caller: DM §6 defines no SELECT policy for
+//     vyomanaut_app on audit_receipts (only INSERT and the two UPDATE
+//     policies) — confirmed against a live database, not just read from the
+//     DDL. Reading back the existing service_sig to fulfil that "return the
+//     existing countersignature" step will need either a SELECT policy
+//     added to DM §6 or a RETURNING-based read path; this function alone
+//     cannot supply it. Flagged for whoever wires the Milestone 12 dispatch
+//     loop, the first real caller of this idempotent-retry path.
+//   - other database errors: returned to caller. This includes the
+//     audit_receipts_response_consistency CHECK-constraint violation
+//     described above for AuditPass/AuditFail.
+//
+// Goroutine-safe: yes.
+//
+// [REF: IC §5.5, DM §3 Invariant 1, DM §4.7, DM §6, ADR-015]
+func WriteReceiptPhase2(ctx context.Context, db *sql.DB, receiptID uuid.UUID, result AuditResult, serviceSig [64]byte, serviceTS time.Time) error {
+	resultStr, err := auditResultToSQL(result)
+	if err != nil {
+		return fmt.Errorf("audit.WriteReceiptPhase2: %w", err)
+	}
+
+	const updatePhase2 = `
+UPDATE audit_receipts
+SET audit_result = $1, service_sig = $2, service_countersign_ts = $3
+WHERE receipt_id = $4 AND audit_result IS NULL AND abandoned_at IS NULL`
+	// The WHERE clause above must match the USING clause of the
+	// audit_receipts_phase2_update row security policy (DM §6) exactly: a
+	// mismatch would make legitimate Phase 2 updates silently affect 0 rows
+	// under row-level security instead of surfacing a clear application
+	// error — RLS enforces the same boundary independently at the database
+	// engine level, so this is defense in depth, not the only guard.
+	res, err := db.ExecContext(ctx, updatePhase2, resultStr, serviceSig[:], serviceTS, receiptID)
+	if err != nil {
+		return fmt.Errorf("audit.WriteReceiptPhase2: update: %w", err)
+	}
+
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("audit.WriteReceiptPhase2: rows affected: %w", err)
+	}
+	if rowsAffected == 0 {
+		return ErrReceiptAlreadyFinal
+	}
+	return nil
+}
