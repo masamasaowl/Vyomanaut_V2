@@ -50,6 +50,11 @@ type Engine struct {
 //  2. TotalShards == DataShards + ParityShards
 //  3. ShardSize == compile-time ShardSize constant (defence-in-depth)
 //
+// NOTE: ParityShards >= 1 is also required for a usable RS code, but that
+// floor is enforced one layer down, inside newRSEncoder (called from
+// NewEngine right after this function returns), not here. Both checks run
+// on every NewEngine call. (M3 review §5)
+//
 // [REF: IC §5.2, DM §3 Invariant 7]
 func profileConsistencyCheck(p config.NetworkProfile) error {
 	if p.DataShards < 1 {

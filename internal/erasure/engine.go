@@ -59,6 +59,11 @@ func NewEngine(profile config.NetworkProfile) (*Engine, error) {
 // Post-conditions:
 //   - returns exactly e.TotalShards byte slices, each len ShardSize
 //   - any e.DataShards of the returned slices can reconstruct aontPackage
+//   - the first e.DataShards returned slices ALIAS the caller's aontPackage
+//     buffer (re-sliced views, not copies); only the remaining
+//     e.ParityShards slices are freshly allocated. A caller that mutates or
+//     reuses/pools aontPackage after this call returns will silently
+//     corrupt the already-returned data shards. (M3 review §5)
 //
 // Error semantics: returns a descriptive error on pre-condition violation or
 // internal GF failure; treat the latter as fatal.

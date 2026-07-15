@@ -17,9 +17,9 @@
 //
 // The active profile is injected at construction time via NewEngine(profile). No package-level state exists; multiple Engine instances with different profiles may coexist safely.
 //
-// # Import Constraint (IC §9)
-//
-// This package imports zero other internal/ packages. It receives config.NetworkProfile by value at construction time only. The config package may NOT import erasure.
+# Import Constraint (IC §9)
+
+This package imports zero other internal/ packages. It receives config.NetworkProfile by value at construction time only. internal/config's PRODUCTION code may NOT import erasure (that would cycle, since erasure imports config) — but internal/config/profiles_test.go correctly imports erasure from the external `package config_test`, specifically to work around this for cross-package test assertions. internal/storage/shard_size_test.go uses the identical trick for the analogous storage↔erasure check. (M3 review §5)
 //
 // # Goroutine Safety
 //
