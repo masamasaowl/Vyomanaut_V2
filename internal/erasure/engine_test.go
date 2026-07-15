@@ -22,6 +22,7 @@ package erasure
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/masamasaowl/Vyomanaut_V2/internal/config"
@@ -233,6 +234,99 @@ func TestDecodeParityOnly(t *testing.T) {
 	}
 	if !bytes.Equal(recovered, original) {
 		t.Error("parity-assisted decode mismatch")
+	}
+}
+
+// TestDecodeAnyKShardsExhaustive enumerates all C(5,3)=10 possible 3-of-5
+// subsets for the demo profile and verifies each reconstructs the original
+// AONT package. This is the exhaustive coverage build.md Session 3.2.3 asked
+// for (as TestAnyKShardsReconstructsDemo). TestDecodeAnyKShards only
+// exercises the trivial "all DataShards present" case, which reconstruct()'s
+// allDataPresent early-return means never actually runs the matrix-
+// inversion/Gauss-Jordan path at all — see rs_internal.go. This test forces
+// every combination through real reconstruction math, including subsets
+// that require parity shards standing in for missing data shards.
+//
+// Production combinatorics (C(56,16) ≈ 1.7×10^25) remain infeasible to
+// enumerate — that's still correctly out of scope; see
+// TestEncodeDecodeRoundTripProd and TestDecodeParityOnly for the targeted
+// production coverage instead.
+//
+// [REF: build.md Phase 3.1 Session 3.2.3 — TestAnyKShardsReconstructsDemo, M3 review §2]
+func TestDecodeAnyKShardsExhaustive(t *testing.T) {
+	eng, err := NewEngine(config.DemoProfile)
+	if err != nil {
+		t.Fatalf("NewEngine(DemoProfile): %v", err)
+	}
+	if eng.TotalShards != 5 || eng.DataShards != 3 {
+		t.Fatalf("test assumes DemoProfile is RS(3,5); got DataShards=%d TotalShards=%d — "+
+			"update the hardcoded subsets below if DemoProfile's parameters ever change",
+			eng.DataShards, eng.TotalShards)
+	}
+
+	original := testAONTPackage(eng.DataShards)
+	allShards, err := eng.EncodeSegment(original)
+	if err != nil {
+		t.Fatalf("EncodeSegment: %v", err)
+	}
+
+	// All C(5,3) = 10 three-element subsets of {0,1,2,3,4} — indices to KEEP.
+	subsets := [][3]int{
+		{0, 1, 2}, {0, 1, 3}, {0, 1, 4}, {0, 2, 3}, {0, 2, 4},
+		{0, 3, 4}, {1, 2, 3}, {1, 2, 4}, {1, 3, 4}, {2, 3, 4},
+	}
+
+	for _, keep := range subsets {
+		keep := keep
+		t.Run(fmt.Sprintf("keep_%d_%d_%d", keep[0], keep[1], keep[2]), func(t *testing.T) {
+			mixed := make([][]byte, eng.TotalShards)
+			for _, idx := range keep {
+				mixed[idx] = allShards[idx]
+			}
+
+			recovered, decErr := eng.DecodeSegment(mixed)
+			if decErr != nil {
+				t.Fatalf("DecodeSegment with shards %v present: %v", keep, decErr)
+			}
+			if !bytes.Equal(recovered, original) {
+				t.Errorf("subset %v: reconstructed data does not match original", keep)
+			}
+		})
+	}
+}
+
+// TestCrossProfileIncompatibility documents and verifies that different
+// profiles produce structurally incompatible shard counts — not that
+// cross-decoding silently produces wrong data, which is impossible by
+// construction. Demo-encoded shards (5 total) fed to a production-configured
+// Engine (expects 56) must fail at DecodeSegment's len(shards) !=
+// e.TotalShards precondition, before any reconstruction math runs.
+//
+// [REF: build.md Phase 3.1 Session 3.2.3 — TestCrossProfileIncompatibility, M3 review §2]
+func TestCrossProfileIncompatibility(t *testing.T) {
+	demoEng, err := NewEngine(config.DemoProfile)
+	if err != nil {
+		t.Fatalf("NewEngine(DemoProfile): %v", err)
+	}
+	prodEng, err := NewEngine(config.ProductionProfile)
+	if err != nil {
+		t.Fatalf("NewEngine(ProductionProfile): %v", err)
+	}
+
+	demoInput := testAONTPackage(demoEng.DataShards)
+	demoShards, err := demoEng.EncodeSegment(demoInput)
+	if err != nil {
+		t.Fatalf("demoEng.EncodeSegment: %v", err)
+	}
+
+	if len(demoShards) == prodEng.TotalShards {
+		t.Fatalf("test setup invalid: DemoProfile.TotalShards (%d) == "+
+			"ProductionProfile.TotalShards (%d) — profiles no longer differ "+
+			"the way this test assumes", len(demoShards), prodEng.TotalShards)
+	}
+
+	if _, decErr := prodEng.DecodeSegment(demoShards); decErr == nil {
+		t.Fatal("cross-profile decode (5 demo shards into a 56-shard production Engine) must fail, got nil error")
 	}
 }
 
