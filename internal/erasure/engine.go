@@ -83,7 +83,7 @@ func (e *Engine) EncodeSegment(aontPackage []byte) ([][]byte, error) {
 	}
 
 	// Compute parity shards via the generator matrix.
-	e.enc.encode(shards, ShardSize)
+	e.enc.encode(shards)
 	return shards, nil
 }
 
@@ -132,7 +132,7 @@ func (e *Engine) DecodeSegment(shards [][]byte) ([]byte, error) {
 	}
 
 	// Reconstruct missing data shards from available shards.
-	if err := e.enc.reconstruct(shards, true); err != nil {
+	if err := e.enc.reconstruct(shards); err != nil {
 		return nil, fmt.Errorf("erasure.DecodeSegment: reconstruction failed: %w", err)
 	}
 

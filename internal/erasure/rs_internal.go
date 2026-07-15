@@ -98,10 +98,15 @@ func gfMulTable(factor byte) [256]byte {
 // invertMatrix computes the inverse of an n×n matrix over GF(2^8).
 // Returns an error (never panics) if the matrix is singular.
 func invertMatrix(m [][]byte, n int) ([][]byte, error) {
-	// Augment [m | I_n]
+	// Augment [m | I_n]. Width = 2n: n columns for the original matrix, n
+	// more for the identity matrix augmented alongside it — NOT
+	// primitiveElement (2) reused because it happens to also equal 2; that
+	// was a coincidental reuse of an unrelated field-generator constant.
+	// (M3 review §5)
+	const augmentedWidthFactor = 2
 	aug := make([][]byte, n)
 	for i := range aug {
-		aug[i] = make([]byte, primitiveElement*n)
+		aug[i] = make([]byte, augmentedWidthFactor*n)
 		copy(aug[i], m[i])
 		aug[i][n+i] = 1
 	}
@@ -213,9 +218,11 @@ func newRSEncoder(data, parity int) (*rsEncoder, error) {
 	return &rsEncoder{data: data, parity: parity, gen: gen}, nil
 }
 
-// encode computes parity shards[data:] from data shards[0:data].
-// Every shard must be exactly shardSize bytes.
-func (enc *rsEncoder) encode(shards [][]byte, shardSize int) {
+// encode computes parity shards[data:] from data shards[0:data]. Shard
+// length is implicit in len(shards[0]) — this used to take an unused
+// shardSize parameter, removed rather than wired up since no call site
+// ever needed a variable shard size. (M3 review §5)
+func (enc *rsEncoder) encode(shards [][]byte) {
 	for r, row := range enc.gen { // r = index into parity shards
 		ps := shards[enc.data+r]
 		for i := range ps {
@@ -232,13 +239,20 @@ func (enc *rsEncoder) encode(shards [][]byte, shardSize int) {
 			}
 		}
 	}
-	_ = shardSize
 }
 
 // reconstruct fills nil data shards from the available shards.
 // Returns ErrTooFewShards if fewer than enc.data shards are non-nil.
 // All non-nil shards must be the same length; that length is used for output.
-func (enc *rsEncoder) reconstruct(shards [][]byte, dataOnly bool) error {
+//
+// Only ever reconstructs missing DATA shards — it does not regenerate
+// missing parity shards directly. This package's repair path (ARCH §15)
+// always goes through decode-to-AONT-package followed by a full
+// EncodeSegment re-encode when it needs replacement parity shards, so a
+// direct "reconstruct parity too" mode was never actually needed; the
+// dataOnly parameter that used to exist here for this was removed rather
+// than wired up to a feature with no real caller. (M3 review §5)
+func (enc *rsEncoder) reconstruct(shards [][]byte) error {
 	total := enc.data + enc.parity
 	if len(shards) != total {
 		return fmt.Errorf("erasure: got %d shards, need %d", len(shards), total)
@@ -323,6 +337,5 @@ func (enc *rsEncoder) reconstruct(shards [][]byte, dataOnly bool) error {
 		}
 	}
 
-	_ = dataOnly
 	return nil
 }
