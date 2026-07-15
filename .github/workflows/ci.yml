@@ -116,12 +116,9 @@ jobs:
       # Becomes hard gate after Session 6.2.3 completes.
       # REF: MVP §8.4 check 5, ADR-021
       # ─────────────────────────────────────────────────────────────
-      - name: check-05 — TestDHTKeyValidatorPersists (M6 gate)
+      - name: check-05 — TestDHTKeyValidatorPersists (hard gate)
         id: check-05
-        continue-on-error: true
-        run: |
-          go test -run TestDHTKeyValidatorPersists ./internal/p2p/... \
-            || (echo "PENDING: session 6.2.3" && exit 0)
+        run: go test -run TestDHTKeyValidatorPersists ./internal/p2p/...
 
       # ─────────────────────────────────────────────────────────────
       # check-06: No float arithmetic in payment package (M10 gate)
@@ -140,7 +137,7 @@ jobs:
       # Requires btree_gist. Runs prod schema → separate demo schema.
       # REF: MVP §8.4 check 7, DM §migrations
       # ─────────────────────────────────────────────────────────────
-      - name: check-07 — migration apply + rollback (M4 gate)
+      - name: check-07 — migration apply + rollback (hard gate)
         id: check-07
         env:
           PGPASSWORD: testpass
@@ -213,21 +210,17 @@ jobs:
       # check-14: ShardSize compile-time constant (M1 gate)
       # REF: MVP §8.4 check 14, INV-7, ADR-003
       # ─────────────────────────────────────────────────────────────
-      - name: check-14 — TestProfileShardSizeIsConstant (M1 gate)
+      - name: check-14 — TestProfileShardSizeIsConstant (hard gate)
         id: check-14
-        run: |
-          go test -run TestProfileShardSizeIsConstant ./internal/config/... \
-            || (echo "PENDING: session 1.2.1" && exit 0)
+        run: go test -run TestProfileShardSizeIsConstant ./internal/config/...
 
       # ─────────────────────────────────────────────────────────────
       # check-15: Both NetworkProfiles fully specified (M1 gate)
       # REF: MVP §8.4 check 15, ADR-031
       # ─────────────────────────────────────────────────────────────
-      - name: check-15 — TestProfileBothFullySpecified (M1 gate)
+      - name: check-15 — TestProfileBothFullySpecified (hard gate)
         id: check-15
-        run: |
-          go test -run TestProfileBothFullySpecified ./internal/config/... \
-            || (echo "PENDING: session 1.2.2" && exit 0)
+        run: go test -run TestProfileBothFullySpecified ./internal/config/...
 
       # ─────────────────────────────────────────────────────────────
       # check-16: No orphan metric names (M-OBS gate)
