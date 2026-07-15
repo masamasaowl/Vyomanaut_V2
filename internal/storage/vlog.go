@@ -29,7 +29,7 @@ const (
 	vlogOffChunkID     = 0
 	vlogOffChunkSize   = 32
 	vlogOffChunkData   = 36
-	vlogOffContentHash = vlogOffChunkData + chunkDataSize // 36 + 262144 = 262180
+	vlogOffContentHash = vlogOffChunkData + ChunkDataSize // 36 + 262144 = 262180
 )
 
 // wiskeyStore is the concrete, unexported implementation of ChunkStore.
@@ -81,7 +81,7 @@ func (ws *wiskeyStore) appendToVLog(chunkID [32]byte, chunkData []byte) (offset 
 
 	var buf [vLogEntrySize]byte
 	copy(buf[vlogOffChunkID:], chunkID[:])
-	binary.BigEndian.PutUint32(buf[vlogOffChunkSize:], chunkDataSize)
+	binary.BigEndian.PutUint32(buf[vlogOffChunkSize:], ChunkDataSize)
 	copy(buf[vlogOffChunkData:], chunkData)
 	copy(buf[vlogOffContentHash:], contentHash[:])
 
@@ -105,10 +105,10 @@ func (ws *wiskeyStore) appendToVLog(chunkID [32]byte, chunkData []byte) (offset 
 // Algorithm (ARCH §16 §Audit lookup path, steps 4–5):
 //  1. ReadAt vLogEntrySize bytes from byteOffset into a fixed-size buffer.
 //  2. Extract content_hash from buf[vlogOffContentHash:].
-//  3. Compute SHA-256(buf[vlogOffChunkData : vlogOffChunkData+chunkDataSize]).
+//  3. Compute SHA-256(buf[vlogOffChunkData : vlogOffChunkData+ChunkDataSize]).
 //  4. Compare byte-by-byte — return nil, ErrContentHashMismatch on any mismatch
 //     (silent disk corruption; caller must set audit status 0x02, IC §4.2).
-//  5. Return a fresh chunkDataSize-byte slice copied from the data region.
+//  5. Return a fresh ChunkDataSize-byte slice copied from the data region.
 //
 // The returned slice is always freshly allocated so callers may retain it
 // after this function returns without aliasing the I/O buffer.
@@ -119,15 +119,15 @@ func (ws *wiskeyStore) readFromVLog(byteOffset uint64) ([]byte, error) {
 	}
 
 	storedHash := buf[vlogOffContentHash : vlogOffContentHash+sha256.Size]
-	computed := sha256.Sum256(buf[vlogOffChunkData : vlogOffChunkData+chunkDataSize])
+	computed := sha256.Sum256(buf[vlogOffChunkData : vlogOffChunkData+ChunkDataSize])
 	for i := range computed {
 		if computed[i] != storedHash[i] {
 			return nil, ErrContentHashMismatch
 		}
 	}
 
-	data := make([]byte, chunkDataSize)
-	copy(data, buf[vlogOffChunkData:vlogOffChunkData+chunkDataSize])
+	data := make([]byte, ChunkDataSize)
+	copy(data, buf[vlogOffChunkData:vlogOffChunkData+ChunkDataSize])
 	return data, nil
 }
 
@@ -139,10 +139,10 @@ func (ws *wiskeyStore) readFromVLog(byteOffset uint64) ([]byte, error) {
 //
 // [REF: IC §5.3, ARCH §16 §Single writer goroutine, build.md Phase 5.1 Session 5.1.4]
 func (ws *wiskeyStore) AppendChunk(chunkID [32]byte, chunkData []byte) (vlogOffset uint64, err error) {
-	if len(chunkData) != chunkDataSize {
+	if len(chunkData) != ChunkDataSize {
 		panic(fmt.Sprintf(
 			"storage.AppendChunk: chunkData must be %d bytes, got %d",
-			chunkDataSize, len(chunkData)))
+			ChunkDataSize, len(chunkData)))
 	}
 
 	// Step 1: Write to vLog and fsync (ARCH §16).
@@ -158,7 +158,7 @@ func (ws *wiskeyStore) AppendChunk(chunkID [32]byte, chunkData []byte) (vlogOffs
 	// A failure here leaves the vLog entry durable — RecoverFromCrash will
 	// re-insert the missing index entry on the next daemon restart (ARCH §16
 	// §Crash recovery).
-	if putErr := ws.index.put(chunkID, offset, chunkDataSize); putErr != nil {
+	if putErr := ws.index.put(chunkID, offset, ChunkDataSize); putErr != nil {
 		// putErr is wrapped as ErrRocksDBInsert by index.put.
 		return 0, putErr
 	}
@@ -231,7 +231,7 @@ func (ws *wiskeyStore) RecoverFromCrash() error {
 
 		// Verify SHA-256(chunk_data) == stored content_hash.
 		// A mismatch indicates a corrupt tail entry from an incomplete write.
-		computed := sha256.Sum256(buf[vlogOffChunkData : vlogOffChunkData+chunkDataSize])
+		computed := sha256.Sum256(buf[vlogOffChunkData : vlogOffChunkData+ChunkDataSize])
 		corrupt := false
 		for i, b := range computed {
 			if b != buf[vlogOffContentHash+i] {
@@ -251,7 +251,7 @@ func (ws *wiskeyStore) RecoverFromCrash() error {
 			// Entry already indexed — no action needed.
 		case ErrChunkNotFound:
 			// Entry is in vLog but absent from index (post-crash gap) — re-insert.
-			if putErr := ws.index.put(chunkID, currentOffset, chunkDataSize); putErr != nil {
+			if putErr := ws.index.put(chunkID, currentOffset, ChunkDataSize); putErr != nil {
 				return fmt.Errorf(
 					"storage.RecoverFromCrash: re-insert entry at vLog offset %d: %w",
 					currentOffset, putErr)
@@ -343,7 +343,7 @@ func (ws *wiskeyStore) RunGC(ctx context.Context) error {
 				break
 			}
 			// Update the RocksDB index to point to the new compacted offset.
-			if putErr := ws.index.put(chunkID, newHead, chunkDataSize); putErr != nil {
+			if putErr := ws.index.put(chunkID, newHead, ChunkDataSize); putErr != nil {
 				gcErr = fmt.Errorf("storage.RunGC: update index for offset %d: %w", newHead, putErr)
 				break
 			}

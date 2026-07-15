@@ -45,14 +45,20 @@ const vLogEntrySize = 262212
 // entire index fits in ~8.8 MB of RocksDB block cache (ARCH §27.1).
 const indexValueSize = 12
 
-// chunkDataSize is the fixed byte size of the raw chunk payload stored in the vLog.
-// Equal to erasure.ShardSize = 256 KiB. Defined here separately to satisfy the
-// IC §9 import constraint (internal/storage must not import internal/erasure).
-// The cross-package identity is asserted at test time in
-// internal/erasure/engine_test.go (TestShardSizeAssertion).
+// ChunkDataSize is the fixed byte size of the raw chunk payload stored in the vLog.
+// Equal to erasure.ShardSize = 256 KiB. Defined here separately (rather than
+// importing internal/erasure) to satisfy the IC §9 import constraint
+// (internal/storage must not import internal/erasure in production code).
+// Exported — unlike most of this package's internal layout constants —
+// specifically so the cross-package identity can be asserted from an
+// external storage_test package: see shard_size_test.go's
+// TestChunkDataSizeMatchesErasureShardSize, which mirrors the config_test
+// trick internal/config/profiles_test.go already uses for the analogous
+// config↔erasure check. (M3 review §3 — the previous version of this
+// comment claimed that test already existed; it didn't.)
 //
 // [REF: ARCH §16, ARCH §27.1, DM §3 Invariant 7, IC §9, ADR-023]
-const chunkDataSize = 262144
+const ChunkDataSize = 262144
 
 // ChunkStore is the WiscKey key-value separated chunk storage engine (ARCH §16, ADR-023).
 // The RocksDB index holds small 44-byte entries; the append-only vLog holds all
