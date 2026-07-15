@@ -78,6 +78,21 @@ func gfInv(x byte) byte {
 	return gfExp[255-int(gfLog[x])]
 }
 
+// gfMulTable precomputes a 256-entry lookup table for multiplication by a
+// fixed factor: table[x] = gfMul(factor, x). Building the table costs 256
+// gfMul calls (negligible); using it turns every subsequent multiplication
+// by this factor into a single array index instead of a double log/antilog
+// lookup with a zero-check branch — worthwhile since encode/reconstruct's
+// inner loops apply the SAME factor across an entire 256 KB shard at a time.
+// (M3 review §8.1)
+func gfMulTable(factor byte) [256]byte {
+	var table [256]byte
+	for x := 0; x < 256; x++ {
+		table[x] = gfMul(factor, byte(x))
+	}
+	return table
+}
+
 // ── Matrix operations over GF(2^8) ───────────────────────────────────────────
 
 // invertMatrix computes the inverse of an n×n matrix over GF(2^8).
@@ -210,9 +225,10 @@ func (enc *rsEncoder) encode(shards [][]byte, shardSize int) {
 			if factor == 0 {
 				continue
 			}
+			table := gfMulTable(factor)
 			ds := shards[c]
 			for i := range ps {
-				ps[i] ^= gfMul(factor, ds[i])
+				ps[i] ^= table[ds[i]]
 			}
 		}
 	}
@@ -299,9 +315,10 @@ func (enc *rsEncoder) reconstruct(shards [][]byte, dataOnly bool) error {
 			if factor == 0 {
 				continue
 			}
+			table := gfMulTable(factor)
 			srcShard := subShards[src]
 			for b := range dst {
-				dst[b] ^= gfMul(factor, srcShard[b])
+				dst[b] ^= table[srcShard[b]]
 			}
 		}
 	}

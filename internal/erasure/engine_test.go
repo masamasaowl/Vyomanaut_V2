@@ -412,3 +412,54 @@ func TestShardSizeAssertion(t *testing.T) {
 			config.DemoProfile.ShardSize, ShardSize)
 	}
 }
+
+// BenchmarkEncodeSegmentProd benchmarks EncodeSegment at production
+// parameters (DataShards=16, TotalShards=56) — the parameter set this
+// package moved from an assumed-fast SIMD library to a scalar Go
+// implementation without anyone re-checking against NFR-adjacent latency
+// budgets. Run with: go test -bench BenchmarkEncodeSegmentProd -run ^$
+// [REF: M3 review §8.3]
+func BenchmarkEncodeSegmentProd(b *testing.B) {
+	eng, err := NewEngine(config.ProductionProfile)
+	if err != nil {
+		b.Fatalf("NewEngine(ProductionProfile): %v", err)
+	}
+	input := testAONTPackage(eng.DataShards)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := eng.EncodeSegment(input); err != nil {
+			b.Fatalf("EncodeSegment: %v", err)
+		}
+	}
+}
+
+// BenchmarkDecodeSegmentProd benchmarks DecodeSegment at production
+// parameters, reconstructing half the data shards from the other half plus
+// an equal count of parity shards each iteration — forces real matrix-
+// inversion work, not the allDataPresent early-return.
+// Run with: go test -bench BenchmarkDecodeSegmentProd -run ^$
+// [REF: M3 review §8.3]
+func BenchmarkDecodeSegmentProd(b *testing.B) {
+	eng, err := NewEngine(config.ProductionProfile)
+	if err != nil {
+		b.Fatalf("NewEngine(ProductionProfile): %v", err)
+	}
+	input := testAONTPackage(eng.DataShards)
+	allShards, err := eng.EncodeSegment(input)
+	if err != nil {
+		b.Fatalf("EncodeSegment: %v", err)
+	}
+	half := eng.DataShards / 2
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		sparse := make([][]byte, eng.TotalShards)
+		copy(sparse[:half], allShards[:half])
+		copy(sparse[eng.DataShards:eng.DataShards+(eng.DataShards-half)],
+			allShards[eng.DataShards:eng.DataShards+(eng.DataShards-half)])
+
+		if _, err := eng.DecodeSegment(sparse); err != nil {
+			b.Fatalf("DecodeSegment: %v", err)
+		}
+	}
+}
