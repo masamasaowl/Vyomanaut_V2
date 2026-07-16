@@ -8,7 +8,7 @@
 // further sentinels here (e.g. ErrSecretExpired); they are never declared in
 // a separate errors file.
 //
-// [REF: IC §5.5]
+// [REF: IC §5.5, IC §8]
 
 package audit
 
@@ -27,4 +27,18 @@ var (
 	// row already has a non-NULL audit_result — idempotent retry (IC §5.5,
 	// ADR-015).
 	ErrReceiptAlreadyFinal = errors.New("audit: receipt already has a terminal result")
+
+	// ErrSecretNotFound mirrors IC §8: the requested secrets-manager path
+	// does not exist.
+	ErrSecretNotFound = errors.New("audit: secret path not found")
+
+	// ErrSecretManagerUnavailable mirrors IC §8: the secrets manager is
+	// unreachable.
+	ErrSecretManagerUnavailable = errors.New("audit: secrets manager unreachable")
+
+	// ErrSecretExpired is returned once the 5-minute cached-secret TTL has
+	// elapsed and the secrets manager remains unreachable (IC §8). The
+	// caller must back off and must not issue further challenges while this
+	// is returned.
+	ErrSecretExpired = errors.New("audit: cached secret TTL expired and manager unavailable")
 )
