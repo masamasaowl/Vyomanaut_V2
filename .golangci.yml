@@ -63,12 +63,19 @@ linters:
             - github.com/masamasaowl/Vyomanaut_V2/internal/config
 
         # ── scoring: no repair, payment ──────────────────────────────────────────
+        # google/uuid and lib/pq added (build.md Phase 8.1 Session 8.1.1): IC §5.6
+        # requires uuid.UUID in every exported scoring signature, and the
+        # package's own live-DB tests need lib/pq registered, same as audit's
+        # entry below. Neither addition touches the actual security boundary
+        # this rule protects (repair/payment separation stays denied).
         scoring:
           files:
             - "**/internal/scoring/**"
           allow:
             - $gostd
             - github.com/masamasaowl/Vyomanaut_V2/internal/config
+            - github.com/google/uuid
+            - github.com/lib/pq
 
         # ── audit: no scoring, repair, payment ───────────────────────────────────
         audit:
