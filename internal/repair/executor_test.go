@@ -1,0 +1,466 @@
+// Package repair is declared in doc.go.
+// Unit and live-database integration tests for the repair executor pipeline.
+// There is no real libp2p network in this test environment (see executor.go's
+// own header comment on the p2p substitution) — mockTransport/mockStream
+// simulate provider responses in-memory, encoding real IC §4.4.1/§4.1 wire
+// frames so the actual parsing code in executor.go is genuinely exercised,
+// not bypassed.
+//
+// Tests:
+//   - TestRepairExecutorDownloadsMinimumShards
+//   - TestRepairExecutorFallsBackOnHolderFailure
+//   - TestRepairExecutorReconstructsCorrectShardIndex
+//   - TestRepairExecutorPreRegistersBeforeUpload
+//   - TestRepairExecutorMarksCompleteOnSuccess
+//   - TestRepairExecutorMarksFailedOnExhaustedRetries
+//
+// [REF: IC §4.1, IC §4.4.1, IC §4.4.2, build.md Phase 9.2 Session 9.2.1]
+
+package repair
+
+import (
+	"bytes"
+	"context"
+	"crypto/ed25519"
+	cryptorand "crypto/rand"
+	"database/sql"
+	"encoding/binary"
+	"fmt"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/masamasaowl/Vyomanaut_V2/internal/config"
+	"github.com/masamasaowl/Vyomanaut_V2/internal/erasure"
+)
+
+// ── Mock RepairTransport / RepairStream ────────────────────────────────────────
+
+// mockStream is an in-memory RepairStream: reads come from resp (a
+// pre-built, correctly-framed response), writes go to written (captured for
+// assertions).
+type mockStream struct {
+	resp    *bytes.Reader
+	written bytes.Buffer
+	closed  bool
+}
+
+func (m *mockStream) Read(p []byte) (int, error)  { return m.resp.Read(p) }
+func (m *mockStream) Write(p []byte) (int, error) { return m.written.Write(p) }
+func (m *mockStream) Close() error                { m.closed = true; return nil }
+func (m *mockStream) SetDeadline(time.Time) error { return nil }
+
+// mockTransport dispatches NewStream calls to a caller-supplied function,
+// recording every call for assertions (e.g. "did we stop after DataShards
+// downloads", "did we never contact holder X").
+type mockTransport struct {
+	mu    sync.Mutex
+	calls []mockCall
+	fn    func(peerID, protocolID string) (RepairStream, error)
+}
+
+type mockCall struct {
+	peerID     string
+	protocolID string
+}
+
+func (m *mockTransport) NewStream(_ context.Context, peerID string, protocolID string) (RepairStream, error) {
+	m.mu.Lock()
+	m.calls = append(m.calls, mockCall{peerID, protocolID})
+	m.mu.Unlock()
+	return m.fn(peerID, protocolID)
+}
+
+func (m *mockTransport) callCount(protocolID string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, c := range m.calls {
+		if c.protocolID == protocolID {
+			n++
+		}
+	}
+	return n
+}
+
+func (m *mockTransport) contacted(peerID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, c := range m.calls {
+		if c.peerID == peerID {
+			return true
+		}
+	}
+	return false
+}
+
+// ── Wire-frame builders (mirror executor.go's own encoding, IC §4.4.1 / IC §4.1) ──
+
+func encodeRepairDownloadResponse(status byte, chunkData []byte) []byte {
+	var body []byte
+	if status == repairDownloadStatusOK {
+		body = append([]byte{status}, chunkData...)
+	} else {
+		body = []byte{status}
+	}
+	frame := make([]byte, 4+len(body))
+	binary.BigEndian.PutUint32(frame[0:4], uint32(len(body)))
+	copy(frame[4:], body)
+	return frame
+}
+
+func encodeUploadResponse(status byte) []byte {
+	body := []byte{status}
+	if status == uploadStatusOK {
+		var sig [64]byte
+		body = append(body, sig[:]...)
+	}
+	frame := make([]byte, 4+len(body))
+	binary.BigEndian.PutUint32(frame[0:4], uint32(len(body)))
+	copy(frame[4:], body)
+	return frame
+}
+
+// randShardDataStable returns deterministic ShardSize-length filler bytes
+// keyed by index, so different holders in a test serve distinguishable
+// payloads. These tests do not need RS-consistent shard content — erasure's
+// own test suite (Milestone 3) covers DecodeSegment/EncodeSegment
+// correctness; these tests exercise the executor's wire-protocol and
+// database-sequencing logic, which only needs *some* ShardSize-length bytes
+// per holder to flow through.
+func randShardDataStable(index int) []byte {
+	b := make([]byte, erasure.ShardSize)
+	for i := range b {
+		b[i] = byte(index)
+	}
+	return b
+}
+
+func genTestSigningKey(t *testing.T) ed25519.PrivateKey {
+	t.Helper()
+	_, priv, err := ed25519.GenerateKey(cryptorand.Reader)
+	if err != nil {
+		t.Fatalf("ed25519.GenerateKey: %v", err)
+	}
+	return priv
+}
+
+// ── downloadShards-level tests (exercise the unexported helper directly) ──────
+
+func TestRepairExecutorDownloadsMinimumShards(t *testing.T) {
+	profile := config.DemoProfile // DataShards=3
+	signingKey := genTestSigningKey(t)
+	chunkID := randChunkID()
+
+	transport := &mockTransport{
+		fn: func(peerID, protocolID string) (RepairStream, error) {
+			return &mockStream{resp: bytes.NewReader(encodeRepairDownloadResponse(repairDownloadStatusOK, randShardDataStable(0)))}, nil
+		},
+	}
+
+	// Offer 5 holders; only the first profile.DataShards (3) should ever be contacted.
+	holders := []SurvivingHolder{
+		{ProviderID: uuid.New(), PeerID: "peer-0", ShardIndex: 0},
+		{ProviderID: uuid.New(), PeerID: "peer-1", ShardIndex: 1},
+		{ProviderID: uuid.New(), PeerID: "peer-2", ShardIndex: 2},
+		{ProviderID: uuid.New(), PeerID: "peer-3", ShardIndex: 3},
+		{ProviderID: uuid.New(), PeerID: "peer-4", ShardIndex: 4},
+	}
+
+	shards, err := downloadShards(context.Background(), transport, profile, signingKey, "microservice-peer", chunkID, holders)
+	if err != nil {
+		t.Fatalf("downloadShards: %v", err)
+	}
+	if got := transport.callCount(repairDownloadProtocolID); got != profile.DataShards {
+		t.Errorf("repair-download stream opened %d times, want exactly %d (profile.DataShards)", got, profile.DataShards)
+	}
+	if transport.contacted("peer-3") || transport.contacted("peer-4") {
+		t.Error("downloadShards contacted holders beyond profile.DataShards — did not stop early")
+	}
+	for i := 0; i < profile.DataShards; i++ {
+		if shards[i] == nil {
+			t.Errorf("shards[%d] is nil, want a downloaded shard", i)
+		}
+	}
+}
+
+func TestRepairExecutorFallsBackOnHolderFailure(t *testing.T) {
+	profile := config.DemoProfile // DataShards=3
+	signingKey := genTestSigningKey(t)
+	chunkID := randChunkID()
+
+	transport := &mockTransport{
+		fn: func(peerID, protocolID string) (RepairStream, error) {
+			if peerID == "peer-bad" {
+				return &mockStream{resp: bytes.NewReader(encodeRepairDownloadResponse(repairDownloadStatusNotFound, nil))}, nil
+			}
+			return &mockStream{resp: bytes.NewReader(encodeRepairDownloadResponse(repairDownloadStatusOK, randShardDataStable(1)))}, nil
+		},
+	}
+
+	// peer-bad (offered first) fails; downloadShards must fall back to the
+	// remaining candidates rather than aborting.
+	holders := []SurvivingHolder{
+		{ProviderID: uuid.New(), PeerID: "peer-bad", ShardIndex: 0},
+		{ProviderID: uuid.New(), PeerID: "peer-ok-1", ShardIndex: 1},
+		{ProviderID: uuid.New(), PeerID: "peer-ok-2", ShardIndex: 2},
+		{ProviderID: uuid.New(), PeerID: "peer-ok-3", ShardIndex: 3},
+	}
+
+	shards, err := downloadShards(context.Background(), transport, profile, signingKey, "microservice-peer", chunkID, holders)
+	if err != nil {
+		t.Fatalf("downloadShards: %v (must fall back to the next candidate, not abort)", err)
+	}
+	collected := 0
+	for _, s := range shards {
+		if s != nil {
+			collected++
+		}
+	}
+	if collected != profile.DataShards {
+		t.Errorf("collected %d shards, want %d", collected, profile.DataShards)
+	}
+	if shards[0] != nil {
+		t.Error("shards[0] is non-nil, but peer-bad (holder for index 0) returned NOT_FOUND")
+	}
+}
+
+// ── Full-pipeline tests (real erasure coding via config.DemoProfile) ──────────
+
+// setupFullPipelineFixture builds a real AONT package, encodes it with a real
+// erasure.Engine, and returns everything needed to drive ExecuteRepairJob end
+// to end with one shard (missingIndex) deliberately withheld from
+// survivingHolders, simulating that shard's holder having departed.
+func setupFullPipelineFixture(t *testing.T, db *sql.DB, missingIndex int) (
+	profile config.NetworkProfile, engine *erasure.Engine, job *RepairJob, holders []SurvivingHolder,
+) {
+	t.Helper()
+	profile = config.DemoProfile // DataShards=3, TotalShards=5 — small AONT package, fast test
+
+	eng, err := erasure.NewEngine(profile)
+	if err != nil {
+		t.Fatalf("erasure.NewEngine: %v", err)
+	}
+	engine = eng
+
+	segmentID := insertTestSegmentChain(t, db)
+
+	holders = make([]SurvivingHolder, 0, profile.TotalShards-1)
+	for i := 0; i < profile.TotalShards; i++ {
+		if i == missingIndex {
+			continue
+		}
+		holderProviderID := insertTestProvider(t, db, testProviderSpec{})
+		holders = append(holders, SurvivingHolder{
+			ProviderID: holderProviderID,
+			PeerID:     "peer-" + holderProviderID.String(),
+			ShardIndex: i,
+		})
+	}
+
+	// Enqueue and dequeue a real repair job so job.JobID has started_at set
+	// (MarkJobComplete's CHECK constraint requires this — Session 9.1.3).
+	// repair_jobs.provider_id has a foreign key to providers, so the
+	// "departed" provider must be a real row, not just a fresh random UUID.
+	// drainQueue first: repair_jobs accumulates across this whole test
+	// binary and other test files' relative execution order is not
+	// guaranteed, so without this, DequeueNextJob below could return an
+	// unrelated stale job instead of the one this fixture just enqueued.
+	drainQueue(t, db)
+	departedProviderID := insertTestProvider(t, db, testProviderSpec{status: "DEPARTED"})
+	chunkID := randChunkID()
+	if err := EnqueueJob(context.Background(), db, profile, chunkID, segmentID, &departedProviderID,
+		TriggerSilentDeparture, profile.TotalShards-1); err != nil {
+		t.Fatalf("EnqueueJob: %v", err)
+	}
+	dequeued, err := DequeueNextJob(context.Background(), db)
+	if err != nil {
+		t.Fatalf("DequeueNextJob: %v", err)
+	}
+	if dequeued == nil || dequeued.ChunkID != chunkID {
+		t.Fatalf("DequeueNextJob did not return the freshly-enqueued job (queue contention from another test?)")
+	}
+	job = dequeued
+	return
+}
+
+func TestRepairExecutorReconstructsCorrectShardIndex(t *testing.T) {
+	db := openTestDB(t)
+	verify := openVerifyDB(t)
+	exclude := allActiveProviderIDs(t, verify)
+
+	const missingIndex = 3
+	profile, engine, job, holders := setupFullPipelineFixture(t, db, missingIndex)
+
+	shardsByPeer := map[string][]byte{}
+	for _, h := range holders {
+		shardsByPeer[h.PeerID] = randShardDataStable(h.ShardIndex)
+	}
+
+	var uploadStream *mockStream
+	transport := &mockTransport{
+		fn: func(peerID, protocolID string) (RepairStream, error) {
+			switch protocolID {
+			case repairDownloadProtocolID:
+				return &mockStream{resp: bytes.NewReader(encodeRepairDownloadResponse(repairDownloadStatusOK, shardsByPeer[peerID]))}, nil
+			case chunkUploadProtocolID:
+				uploadStream = &mockStream{resp: bytes.NewReader(encodeUploadResponse(uploadStatusOK))}
+				return uploadStream, nil
+			default:
+				return nil, fmt.Errorf("unexpected protocol %q", protocolID)
+			}
+		},
+	}
+
+	signingKey := genTestSigningKey(t)
+	if err := ExecuteRepairJob(context.Background(), db, profile, transport, engine, signingKey, "microservice-peer",
+		job, holders, exclude); err != nil {
+		t.Fatalf("ExecuteRepairJob: %v", err)
+	}
+
+	if uploadStream == nil {
+		t.Fatal("upload stream was never opened")
+	}
+	written := uploadStream.written.Bytes()
+	if len(written) < 40 {
+		t.Fatalf("captured upload frame too short: %d bytes", len(written))
+	}
+	var uploadedChunkID [32]byte
+	copy(uploadedChunkID[:], written[4:36])
+	uploadedIndex := binary.BigEndian.Uint32(written[36:40])
+
+	if int(uploadedIndex) != missingIndex {
+		t.Errorf("uploaded shard_index = %d, want %d (the missing index)", uploadedIndex, missingIndex)
+	}
+	if uploadedChunkID != job.ChunkID {
+		t.Errorf("uploaded chunk_id = %x, want job.ChunkID = %x (RS re-encoding is deterministic; repair re-creates the same chunk)",
+			uploadedChunkID, job.ChunkID)
+	}
+}
+
+func TestRepairExecutorPreRegistersBeforeUpload(t *testing.T) {
+	db := openTestDB(t)
+	verify := openVerifyDB(t)
+	exclude := allActiveProviderIDs(t, verify)
+
+	const missingIndex = 1
+	profile, engine, job, holders := setupFullPipelineFixture(t, db, missingIndex)
+
+	shardsByPeer := map[string][]byte{}
+	for _, h := range holders {
+		shardsByPeer[h.PeerID] = randShardDataStable(h.ShardIndex)
+	}
+
+	var sawRepairingBeforeUpload bool
+	transport := &mockTransport{
+		fn: func(peerID, protocolID string) (RepairStream, error) {
+			switch protocolID {
+			case repairDownloadProtocolID:
+				return &mockStream{resp: bytes.NewReader(encodeRepairDownloadResponse(repairDownloadStatusOK, shardsByPeer[peerID]))}, nil
+			case chunkUploadProtocolID:
+				// At the moment the upload stream opens, the chunk_assignments
+				// row for job.ChunkID must already exist with status='REPAIRING'.
+				var status string
+				if err := verify.QueryRow(`SELECT status FROM chunk_assignments WHERE chunk_id = $1`, job.ChunkID[:]).
+					Scan(&status); err == nil && status == "REPAIRING" {
+					sawRepairingBeforeUpload = true
+				}
+				return &mockStream{resp: bytes.NewReader(encodeUploadResponse(uploadStatusOK))}, nil
+			default:
+				return nil, fmt.Errorf("unexpected protocol %q", protocolID)
+			}
+		},
+	}
+
+	signingKey := genTestSigningKey(t)
+	if err := ExecuteRepairJob(context.Background(), db, profile, transport, engine, signingKey, "microservice-peer",
+		job, holders, exclude); err != nil {
+		t.Fatalf("ExecuteRepairJob: %v", err)
+	}
+	if !sawRepairingBeforeUpload {
+		t.Error("chunk_assignments row was not REPAIRING at the moment the upload stream opened — " +
+			"pre-registration did not happen before upload (IC §4.4.2)")
+	}
+}
+
+func TestRepairExecutorMarksCompleteOnSuccess(t *testing.T) {
+	db := openTestDB(t)
+	verify := openVerifyDB(t)
+	exclude := allActiveProviderIDs(t, verify)
+
+	const missingIndex = 2
+	profile, engine, job, holders := setupFullPipelineFixture(t, db, missingIndex)
+	shardsByPeer := map[string][]byte{}
+	for _, h := range holders {
+		shardsByPeer[h.PeerID] = randShardDataStable(h.ShardIndex)
+	}
+	transport := &mockTransport{
+		fn: func(peerID, protocolID string) (RepairStream, error) {
+			if protocolID == repairDownloadProtocolID {
+				return &mockStream{resp: bytes.NewReader(encodeRepairDownloadResponse(repairDownloadStatusOK, shardsByPeer[peerID]))}, nil
+			}
+			return &mockStream{resp: bytes.NewReader(encodeUploadResponse(uploadStatusOK))}, nil
+		},
+	}
+
+	signingKey := genTestSigningKey(t)
+	if err := ExecuteRepairJob(context.Background(), db, profile, transport, engine, signingKey, "microservice-peer",
+		job, holders, exclude); err != nil {
+		t.Fatalf("ExecuteRepairJob: %v", err)
+	}
+
+	var status string
+	var completedAt sql.NullTime
+	if err := verify.QueryRow(`SELECT status, completed_at FROM repair_jobs WHERE job_id = $1`, job.JobID).
+		Scan(&status, &completedAt); err != nil {
+		t.Fatalf("query repair_jobs: %v", err)
+	}
+	if status != "COMPLETED" {
+		t.Errorf("repair_jobs.status = %q, want COMPLETED", status)
+	}
+	if !completedAt.Valid {
+		t.Error("completed_at is NULL, want set")
+	}
+
+	var assignmentStatus string
+	if err := verify.QueryRow(`SELECT status FROM chunk_assignments WHERE chunk_id = $1`, job.ChunkID[:]).
+		Scan(&assignmentStatus); err != nil {
+		t.Fatalf("query chunk_assignments: %v", err)
+	}
+	if assignmentStatus != "ACTIVE" {
+		t.Errorf("chunk_assignments.status = %q, want ACTIVE (REPAIRING -> ACTIVE on confirmation)", assignmentStatus)
+	}
+}
+
+func TestRepairExecutorMarksFailedOnExhaustedRetries(t *testing.T) {
+	db := openTestDB(t)
+	verify := openVerifyDB(t)
+	exclude := allActiveProviderIDs(t, verify)
+
+	const missingIndex = 0
+	profile, engine, job, holders := setupFullPipelineFixture(t, db, missingIndex)
+
+	// Every holder fails (NOT_FOUND) — downloadShards can never collect
+	// enough shards, so ExecuteRepairJob must fail fast and mark the job FAILED.
+	transport := &mockTransport{
+		fn: func(peerID, protocolID string) (RepairStream, error) {
+			return &mockStream{resp: bytes.NewReader(encodeRepairDownloadResponse(repairDownloadStatusNotFound, nil))}, nil
+		},
+	}
+
+	signingKey := genTestSigningKey(t)
+	err := ExecuteRepairJob(context.Background(), db, profile, transport, engine, signingKey, "microservice-peer",
+		job, holders, exclude)
+	if err == nil {
+		t.Fatal("ExecuteRepairJob succeeded despite every holder failing, want an error")
+	}
+
+	var status string
+	if err := verify.QueryRow(`SELECT status FROM repair_jobs WHERE job_id = $1`, job.JobID).Scan(&status); err != nil {
+		t.Fatalf("query repair_jobs: %v", err)
+	}
+	if status != "FAILED" {
+		t.Errorf("repair_jobs.status = %q, want FAILED", status)
+	}
+}
