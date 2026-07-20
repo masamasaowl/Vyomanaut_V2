@@ -229,6 +229,18 @@ CREATE TYPE repair_job_status AS ENUM (
     'FAILED'
 );
 
+-- otp_purpose — which registration/login flow an OTP code gates.
+-- [Added, build.md Milestone 11 Phase 11.4] No table for OTP codes existed
+-- anywhere in the schema prior to this milestone, despite FR-001 requiring
+-- phone-number OTP verification and OAS's OtpSendRequest.purpose already
+-- specifying this exact three-value enum.
+-- [REF: FR-001, OAS OtpSendRequest.purpose, build.md Phase 11.4]
+CREATE TYPE otp_purpose AS ENUM (
+    'OWNER_REGISTER',
+    'PROVIDER_REGISTER',
+    'LOGIN'
+);
+
 `
 
 	// ── owners — profile-invariant ──────────────────────────────────────────────────
@@ -343,6 +355,23 @@ CREATE TYPE repair_job_status AS ENUM (
 		"    -- ── Escrow freeze (ADR-024) ──────────────────────────────────────────────\n" +
 		"    frozen                  BOOLEAN         NOT NULL DEFAULT FALSE,\n" +
 		"\n" +
+		"    -- ── Token refresh rate limiting (build.md Milestone 11 Phase 11.4) ─────────\n" +
+		"    last_token_refresh_at   TIMESTAMPTZ,\n" +
+		"    -- NULL until the first successful POST /api/v1/provider/token/refresh.\n" +
+		"    -- Enforces \"one successful refresh per 30 minutes per provider_id\" (OAS).\n" +
+		"\n" +
+		"    -- ── Promised downtime (build.md Milestone 11 Phase 11.6) ───────────────────\n" +
+		"    promised_return_at      TIMESTAMPTZ,\n" +
+		"    -- NULL means no downtime window is currently open (ADR-007's \"promised\n" +
+		"    -- downtime\" exit state). Set by POST /api/v1/provider/downtime; a second\n" +
+		"    -- call while non-null is rejected with 409 DOWNTIME_ALREADY_ACTIVE. Cleared\n" +
+		"    -- on the next successful heartbeat (the provider checked back in). If the\n" +
+		"    -- promised timestamp passes with no heartbeat, the departure detector\n" +
+		"    -- (Milestone 9) treats this identically to a silent departure.\n" +
+		"\n" +
+		"    downtime_reason         VARCHAR(200),\n" +
+		"    -- Optional human-readable reason supplied with the downtime announcement.\n" +
+		"\n" +
 		"    -- ── Timestamps ───────────────────────────────────────────────────────────\n" +
 		"    created_at              TIMESTAMPTZ     NOT NULL DEFAULT NOW(),\n" +
 		"\n" +
@@ -360,6 +389,148 @@ CREATE TYPE repair_job_status AS ENUM (
 		"\n" +
 		"COMMENT ON TABLE providers IS\n" +
 		"    'Storage providers. One row per verified daemon. Never physically deleted (DM §3 Invariant 3).';\n" +
+		"\n"
+
+	// ── otp_codes — profile-invariant ────────────────────────────────────────────
+	// [Added, build.md Milestone 11 Phase 11.4] Not FK'd to owners/providers:
+	// an OTP for OWNER_REGISTER or PROVIDER_REGISTER necessarily exists
+	// before any row in either table does (the OTP gates registration
+	// itself). code_hash only — the plaintext 6-digit code is never
+	// persisted, mirroring challenge_nonce's own "never the raw secret"
+	// convention elsewhere in this schema.
+	// [REF: FR-001, OAS OtpSendRequest/OtpSendResponse/OtpVerifyRequest,
+	// build.md Phase 11.4]
+	otpCodesSection := "" +
+		"-- ── otp_codes ──────────────────────────────────────────────────────────────────\n" +
+		"-- [REF: FR-001, OAS OtpSendRequest/OtpSendResponse/OtpVerifyRequest]\n" +
+		"CREATE TABLE otp_codes (\n" +
+		"    id              UUID            PRIMARY KEY DEFAULT gen_random_uuid(),\n" +
+		"\n" +
+		"    phone_number    VARCHAR(15)     NOT NULL,\n" +
+		"    -- E.164 format. Not a foreign key: no owners/providers row may exist yet.\n" +
+		"\n" +
+		"    purpose         otp_purpose     NOT NULL,\n" +
+		"\n" +
+		"    code_hash       BYTEA           NOT NULL CHECK (octet_length(code_hash) = 32),\n" +
+		"    -- SHA-256 of the 6-digit code. The plaintext code is never stored.\n" +
+		"\n" +
+		"    expires_at      TIMESTAMPTZ     NOT NULL,\n" +
+		"    -- NOW() + 10 minutes at insert time (OAS OtpSendResponse.expires_at).\n" +
+		"\n" +
+		"    consumed_at     TIMESTAMPTZ,\n" +
+		"    -- NULL until a successful verify. Sending a second OTP for the same\n" +
+		"    -- phone_number/purpose does not consume or delete an earlier row --\n" +
+		"    -- only the most recent unconsumed, unexpired one is checked at verify\n" +
+		"    -- time. Prevents replaying an already-used code.\n" +
+		"\n" +
+		"    created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW()\n" +
+		");\n" +
+		"\n" +
+		"CREATE INDEX ON otp_codes (phone_number, purpose, created_at DESC);\n" +
+		"-- Supports both the rate-limit check (COUNT WHERE created_at > NOW() - interval)\n" +
+		"-- and the verify lookup (most recent unconsumed, unexpired code for this\n" +
+		"-- phone_number + purpose).\n" +
+		"\n" +
+		"COMMENT ON TABLE otp_codes IS\n" +
+		"    'Ephemeral OTP codes for registration and login (FR-001). Not FK''d to '\n" +
+		"    'owners/providers -- an OTP can exist before the entity it gates does. '\n" +
+		"    'code_hash only; plaintext is never persisted.';\n" +
+		"\n"
+
+	// ── pending_registrations — profile-invariant ────────────────────────────────
+	// [Added, build.md Milestone 11 Phase 11.5] A registration token's `sub`
+	// claim is UUIDv5(namespace, phone_number) -- deterministic, but NOT
+	// invertible: given only that UUID, there is no way to recover the
+	// original phone_number (see api.RegistrationSubjectForPhone's own
+	// comment). OAS's OwnerRegisterRequest/ProviderRegisterRequest schemas
+	// have no phone_number field at all, so the register handler cannot
+	// simply be told it. This table is the bridge: written once, at OTP
+	// verify time, when a registration token is issued; read once and
+	// deleted by whichever register endpoint redeems it.
+	// [REF: OAS OwnerRegisterRequest, ProviderRegisterRequest,
+	// build.md Phase 11.4/11.5]
+	pendingRegistrationsSection := "" +
+		"-- ── pending_registrations ───────────────────────────────────────────────────────\n" +
+		"-- [REF: build.md Phase 11.4/11.5 -- bridges a registration token's opaque\n" +
+		"-- subject UUID back to the phone number it was issued for]\n" +
+		"CREATE TABLE pending_registrations (\n" +
+		"    subject         UUID            PRIMARY KEY,\n" +
+		"    -- The registration JWT's `sub` claim: UUIDv5(namespace, phone_number).\n" +
+		"    -- Not a foreign key -- no owners/providers row exists yet.\n" +
+		"\n" +
+		"    phone_number    VARCHAR(15)     NOT NULL,\n" +
+		"\n" +
+		"    expires_at      TIMESTAMPTZ     NOT NULL,\n" +
+		"    -- Matches the registration token's own TTL (1 hour). A row past this\n" +
+		"    -- point is stale; the register endpoint treats it as not found.\n" +
+		"\n" +
+		"    created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW()\n" +
+		");\n" +
+		"\n" +
+		"COMMENT ON TABLE pending_registrations IS\n" +
+		"    'Bridges a registration JWT''s opaque sub claim back to the phone number '\n" +
+		"    'it was issued for. One row per pending registration; deleted on redemption.';\n" +
+		"\n"
+
+	// ── upload_assignments / upload_assignment_shards — profile-invariant ───────
+	// [Added, build.md Milestone 11 Phase 11.7] POST /api/v1/upload/assign must
+	// be idempotent on file_id (OAS: "repeated calls... return the same
+	// assignments"), which requires persisting the selected providers
+	// somewhere. It cannot persist into chunk_assignments: that table's
+	// chunk_id is NOT NULL and content-addressed (SHA-256 of the actual shard
+	// bytes, ADR-022), but at assignment time the client has not yet
+	// performed AONT-RS encoding (FR-007 — encoding is client-side, before
+	// any provider ever sees the data), so no chunk_id exists to write. These
+	// two tables record the PLAN (which providers were selected for which
+	// segment/shard) rather than a CONFIRMED assignment.
+	//
+	// [Flagged scope boundary] Promoting a plan row into a real
+	// chunk_assignments row (once a provider actually confirms receipt of a
+	// shard with its real content-addressed chunk_id) requires a
+	// provider-to-microservice acknowledgment protocol that does not exist
+	// anywhere in scope through Milestone 11. Until that protocol is built (a
+	// later milestone), owner_escrow/file-list availability queries against a
+	// freshly-assigned file will correctly show zero shards, since no
+	// chunk_assignments row exists yet — an accurate reflection of what this
+	// system can actually confirm today, not a bug.
+	// [REF: OAS UploadAssignRequest/Response, FR-007, FR-009, FR-010, FR-060,
+	// ADR-014, ADR-022, build.md Phase 11.7 Session 11.7.1]
+	uploadAssignmentsSection := "" +
+		"-- ── upload_assignments / upload_assignment_shards ───────────────────────────────\n" +
+		"-- [REF: OAS UploadAssignRequest/Response, FR-009, FR-060, build.md Phase 11.7]\n" +
+		"CREATE TABLE upload_assignments (\n" +
+		"    file_id              UUID            PRIMARY KEY,\n" +
+		"    -- Client-generated UUIDv7 (OAS: 'Client-generated UUIDv7 for this file').\n" +
+		"\n" +
+		"    owner_id             UUID            NOT NULL REFERENCES owners(owner_id),\n" +
+		"    num_segments         INT             NOT NULL CHECK (num_segments BETWEEN 1 AND 10000),\n" +
+		"    original_size_bytes  BIGINT          NOT NULL CHECK (original_size_bytes > 0),\n" +
+		"    monthly_cost_paise   BIGINT          NOT NULL CHECK (monthly_cost_paise >= 0),\n" +
+		"    created_at           TIMESTAMPTZ     NOT NULL DEFAULT NOW()\n" +
+		");\n" +
+		"\n" +
+		"COMMENT ON TABLE upload_assignments IS\n" +
+		"    'The provider-selection PLAN for one file upload, persisted for '\n" +
+		"    'POST /api/v1/upload/assign''s idempotency requirement. Not yet a '\n" +
+		"    'confirmed chunk_assignments row -- see this table''s own build.md note.';\n" +
+		"\n" +
+		"CREATE TABLE upload_assignment_shards (\n" +
+		"    file_id         UUID        NOT NULL REFERENCES upload_assignments(file_id),\n" +
+		"    segment_index   INT         NOT NULL,\n" +
+		"    segment_id      UUID        NOT NULL,\n" +
+		"    -- Microservice-assigned; becomes the real segments.segment_id once a\n" +
+		"    -- future provider-acknowledgment protocol confirms actual receipt.\n" +
+		"\n" +
+		"    shard_index     SMALLINT    NOT NULL,\n" +
+		"    provider_id     UUID        NOT NULL REFERENCES providers(provider_id),\n" +
+		"\n" +
+		"    PRIMARY KEY (file_id, segment_index, shard_index)\n" +
+		");\n" +
+		"\n" +
+		"CREATE INDEX ON upload_assignment_shards (segment_id);\n" +
+		"-- Supports the ASN-cap check during assignment: how many of THIS\n" +
+		"-- segment's shards, selected so far, belong to ASN X (queried against\n" +
+		"-- this table directly, since chunk_assignments has no rows yet).\n" +
 		"\n"
 
 	// ── files — profile-invariant ──────────────────────────────────────────────────
@@ -816,9 +987,19 @@ CREATE TYPE repair_job_status AS ENUM (
 		"        (trigger_type IN ('SILENT_DEPARTURE', 'ANNOUNCED_DEPARTURE')\n"+
 		"                AND priority = 'PERMANENT_DEPARTURE')\n"+
 		"        OR\n"+
-		"        (trigger_type = 'THRESHOLD_WARNING' AND priority = 'PRE_WARNING')\n"+
+		"        (trigger_type = 'THRESHOLD_WARNING' AND priority IN ('PRE_WARNING', 'PERMANENT_DEPARTURE'))\n"+
 		"    ),\n"+
 		"    -- Priority derived from trigger_type; prevents drift at application layer.\n"+
+		"    -- THRESHOLD_WARNING is the one trigger_type with two legal priority\n"+
+		"    -- values: PRE_WARNING at creation, promoted to PERMANENT_DEPARTURE by\n"+
+		"    -- PromoteStalePreWarningJobs once RepairPromotionTimeout elapses\n"+
+		"    -- unserviced (FR-043, IC §5.7, build.md Phase 9.2 Session 9.2.2). Fixed\n"+
+		"    -- here from the original single-value pairing, which made that\n"+
+		"    -- promotion — an explicit functional requirement — impossible to\n"+
+		"    -- satisfy: no UPDATE could ever set priority = PERMANENT_DEPARTURE on a\n"+
+		"    -- row whose trigger_type stays THRESHOLD_WARNING without violating this\n"+
+		"    -- very constraint. EMERGENCY_FLOOR and SILENT/ANNOUNCED_DEPARTURE are\n"+
+		"    -- unaffected: only threshold-triggered jobs are ever promoted.\n"+
 		"\n"+
 		"    CONSTRAINT repair_jobs_completed_after_started CHECK (\n"+
 		"        completed_at IS NULL OR started_at IS NOT NULL\n"+
@@ -1265,6 +1446,9 @@ CREATE UNIQUE INDEX ON mv_segment_shard_counts (segment_id);
 		enumsSection +
 		ownersSection +
 		providersSection +
+		otpCodesSection +
+		pendingRegistrationsSection +
+		uploadAssignmentsSection +
 		filesSection +
 		segmentsSection +
 		chunkAssignmentsSection +
