@@ -1,5 +1,5 @@
 -- Generated for profile: prod
--- Generated at: 2026-06-21T09:33:42Z
+-- Generated at: 2026-07-20T12:57:03Z
 -- ShardSize: 262144 (compile-time constant; NOT profile-variable)
 -- DataShards: 16
 -- TotalShards: 56
@@ -115,6 +115,18 @@ CREATE TYPE repair_job_status AS ENUM (
     'FAILED'
 );
 
+-- otp_purpose — which registration/login flow an OTP code gates.
+-- [Added, build.md Milestone 11 Phase 11.4] No table for OTP codes existed
+-- anywhere in the schema prior to this milestone, despite FR-001 requiring
+-- phone-number OTP verification and OAS's OtpSendRequest.purpose already
+-- specifying this exact three-value enum.
+-- [REF: FR-001, OAS OtpSendRequest.purpose, build.md Phase 11.4]
+CREATE TYPE otp_purpose AS ENUM (
+    'OWNER_REGISTER',
+    'PROVIDER_REGISTER',
+    'LOGIN'
+);
+
 -- ── owners ─────────────────────────────────────────────────────────────────────
 -- [REF: DM §4.1, DM §8.1]
 CREATE TABLE owners (
@@ -218,6 +230,23 @@ CREATE TABLE providers (
     -- ── Escrow freeze (ADR-024) ──────────────────────────────────────────────
     frozen                  BOOLEAN         NOT NULL DEFAULT FALSE,
 
+    -- ── Token refresh rate limiting (build.md Milestone 11 Phase 11.4) ─────────
+    last_token_refresh_at   TIMESTAMPTZ,
+    -- NULL until the first successful POST /api/v1/provider/token/refresh.
+    -- Enforces "one successful refresh per 30 minutes per provider_id" (OAS).
+
+    -- ── Promised downtime (build.md Milestone 11 Phase 11.6) ───────────────────
+    promised_return_at      TIMESTAMPTZ,
+    -- NULL means no downtime window is currently open (ADR-007's "promised
+    -- downtime" exit state). Set by POST /api/v1/provider/downtime; a second
+    -- call while non-null is rejected with 409 DOWNTIME_ALREADY_ACTIVE. Cleared
+    -- on the next successful heartbeat (the provider checked back in). If the
+    -- promised timestamp passes with no heartbeat, the departure detector
+    -- (Milestone 9) treats this identically to a silent departure.
+
+    downtime_reason         VARCHAR(200),
+    -- Optional human-readable reason supplied with the downtime announcement.
+
     -- ── Timestamps ───────────────────────────────────────────────────────────
     created_at              TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
 
@@ -235,6 +264,62 @@ CREATE TABLE providers (
 
 COMMENT ON TABLE providers IS
     'Storage providers. One row per verified daemon. Never physically deleted (DM §3 Invariant 3).';
+
+-- ── otp_codes ──────────────────────────────────────────────────────────────────
+-- [REF: FR-001, OAS OtpSendRequest/OtpSendResponse/OtpVerifyRequest]
+CREATE TABLE otp_codes (
+    id              UUID            PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    phone_number    VARCHAR(15)     NOT NULL,
+    -- E.164 format. Not a foreign key: no owners/providers row may exist yet.
+
+    purpose         otp_purpose     NOT NULL,
+
+    code_hash       BYTEA           NOT NULL CHECK (octet_length(code_hash) = 32),
+    -- SHA-256 of the 6-digit code. The plaintext code is never stored.
+
+    expires_at      TIMESTAMPTZ     NOT NULL,
+    -- NOW() + 10 minutes at insert time (OAS OtpSendResponse.expires_at).
+
+    consumed_at     TIMESTAMPTZ,
+    -- NULL until a successful verify. Sending a second OTP for the same
+    -- phone_number/purpose does not consume or delete an earlier row --
+    -- only the most recent unconsumed, unexpired one is checked at verify
+    -- time. Prevents replaying an already-used code.
+
+    created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX ON otp_codes (phone_number, purpose, created_at DESC);
+-- Supports both the rate-limit check (COUNT WHERE created_at > NOW() - interval)
+-- and the verify lookup (most recent unconsumed, unexpired code for this
+-- phone_number + purpose).
+
+COMMENT ON TABLE otp_codes IS
+    'Ephemeral OTP codes for registration and login (FR-001). Not FK''d to '
+    'owners/providers -- an OTP can exist before the entity it gates does. '
+    'code_hash only; plaintext is never persisted.';
+
+-- ── pending_registrations ───────────────────────────────────────────────────────
+-- [REF: build.md Phase 11.4/11.5 -- bridges a registration token's opaque
+-- subject UUID back to the phone number it was issued for]
+CREATE TABLE pending_registrations (
+    subject         UUID            PRIMARY KEY,
+    -- The registration JWT's `sub` claim: UUIDv5(namespace, phone_number).
+    -- Not a foreign key -- no owners/providers row exists yet.
+
+    phone_number    VARCHAR(15)     NOT NULL,
+
+    expires_at      TIMESTAMPTZ     NOT NULL,
+    -- Matches the registration token's own TTL (1 hour). A row past this
+    -- point is stale; the register endpoint treats it as not found.
+
+    created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW()
+);
+
+COMMENT ON TABLE pending_registrations IS
+    'Bridges a registration JWT''s opaque sub claim back to the phone number '
+    'it was issued for. One row per pending registration; deleted on redemption.';
 
 -- ── files ──────────────────────────────────────────────────────────────────────
 -- [REF: DM §4.3, REQ §4.4 FR-019]
@@ -642,9 +727,19 @@ CREATE TABLE repair_jobs (
         (trigger_type IN ('SILENT_DEPARTURE', 'ANNOUNCED_DEPARTURE')
                 AND priority = 'PERMANENT_DEPARTURE')
         OR
-        (trigger_type = 'THRESHOLD_WARNING' AND priority = 'PRE_WARNING')
+        (trigger_type = 'THRESHOLD_WARNING' AND priority IN ('PRE_WARNING', 'PERMANENT_DEPARTURE'))
     ),
     -- Priority derived from trigger_type; prevents drift at application layer.
+    -- THRESHOLD_WARNING is the one trigger_type with two legal priority
+    -- values: PRE_WARNING at creation, promoted to PERMANENT_DEPARTURE by
+    -- PromoteStalePreWarningJobs once RepairPromotionTimeout elapses
+    -- unserviced (FR-043, IC §5.7, build.md Phase 9.2 Session 9.2.2). Fixed
+    -- here from the original single-value pairing, which made that
+    -- promotion — an explicit functional requirement — impossible to
+    -- satisfy: no UPDATE could ever set priority = PERMANENT_DEPARTURE on a
+    -- row whose trigger_type stays THRESHOLD_WARNING without violating this
+    -- very constraint. EMERGENCY_FLOOR and SILENT/ANNOUNCED_DEPARTURE are
+    -- unaffected: only threshold-triggered jobs are ever promoted.
 
     CONSTRAINT repair_jobs_completed_after_started CHECK (
         completed_at IS NULL OR started_at IS NOT NULL

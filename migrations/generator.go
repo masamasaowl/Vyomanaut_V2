@@ -472,67 +472,6 @@ CREATE TYPE otp_purpose AS ENUM (
 		"    'it was issued for. One row per pending registration; deleted on redemption.';\n" +
 		"\n"
 
-	// ── upload_assignments / upload_assignment_shards — profile-invariant ───────
-	// [Added, build.md Milestone 11 Phase 11.7] POST /api/v1/upload/assign must
-	// be idempotent on file_id (OAS: "repeated calls... return the same
-	// assignments"), which requires persisting the selected providers
-	// somewhere. It cannot persist into chunk_assignments: that table's
-	// chunk_id is NOT NULL and content-addressed (SHA-256 of the actual shard
-	// bytes, ADR-022), but at assignment time the client has not yet
-	// performed AONT-RS encoding (FR-007 — encoding is client-side, before
-	// any provider ever sees the data), so no chunk_id exists to write. These
-	// two tables record the PLAN (which providers were selected for which
-	// segment/shard) rather than a CONFIRMED assignment.
-	//
-	// [Flagged scope boundary] Promoting a plan row into a real
-	// chunk_assignments row (once a provider actually confirms receipt of a
-	// shard with its real content-addressed chunk_id) requires a
-	// provider-to-microservice acknowledgment protocol that does not exist
-	// anywhere in scope through Milestone 11. Until that protocol is built (a
-	// later milestone), owner_escrow/file-list availability queries against a
-	// freshly-assigned file will correctly show zero shards, since no
-	// chunk_assignments row exists yet — an accurate reflection of what this
-	// system can actually confirm today, not a bug.
-	// [REF: OAS UploadAssignRequest/Response, FR-007, FR-009, FR-010, FR-060,
-	// ADR-014, ADR-022, build.md Phase 11.7 Session 11.7.1]
-	uploadAssignmentsSection := "" +
-		"-- ── upload_assignments / upload_assignment_shards ───────────────────────────────\n" +
-		"-- [REF: OAS UploadAssignRequest/Response, FR-009, FR-060, build.md Phase 11.7]\n" +
-		"CREATE TABLE upload_assignments (\n" +
-		"    file_id              UUID            PRIMARY KEY,\n" +
-		"    -- Client-generated UUIDv7 (OAS: 'Client-generated UUIDv7 for this file').\n" +
-		"\n" +
-		"    owner_id             UUID            NOT NULL REFERENCES owners(owner_id),\n" +
-		"    num_segments         INT             NOT NULL CHECK (num_segments BETWEEN 1 AND 10000),\n" +
-		"    original_size_bytes  BIGINT          NOT NULL CHECK (original_size_bytes > 0),\n" +
-		"    monthly_cost_paise   BIGINT          NOT NULL CHECK (monthly_cost_paise >= 0),\n" +
-		"    created_at           TIMESTAMPTZ     NOT NULL DEFAULT NOW()\n" +
-		");\n" +
-		"\n" +
-		"COMMENT ON TABLE upload_assignments IS\n" +
-		"    'The provider-selection PLAN for one file upload, persisted for '\n" +
-		"    'POST /api/v1/upload/assign''s idempotency requirement. Not yet a '\n" +
-		"    'confirmed chunk_assignments row -- see this table''s own build.md note.';\n" +
-		"\n" +
-		"CREATE TABLE upload_assignment_shards (\n" +
-		"    file_id         UUID        NOT NULL REFERENCES upload_assignments(file_id),\n" +
-		"    segment_index   INT         NOT NULL,\n" +
-		"    segment_id      UUID        NOT NULL,\n" +
-		"    -- Microservice-assigned; becomes the real segments.segment_id once a\n" +
-		"    -- future provider-acknowledgment protocol confirms actual receipt.\n" +
-		"\n" +
-		"    shard_index     SMALLINT    NOT NULL,\n" +
-		"    provider_id     UUID        NOT NULL REFERENCES providers(provider_id),\n" +
-		"\n" +
-		"    PRIMARY KEY (file_id, segment_index, shard_index)\n" +
-		");\n" +
-		"\n" +
-		"CREATE INDEX ON upload_assignment_shards (segment_id);\n" +
-		"-- Supports the ASN-cap check during assignment: how many of THIS\n" +
-		"-- segment's shards, selected so far, belong to ASN X (queried against\n" +
-		"-- this table directly, since chunk_assignments has no rows yet).\n" +
-		"\n"
-
 	// ── files — profile-invariant ──────────────────────────────────────────────────
 	// Session 4.3.3 — files table (DM §4.3, REQ §4.4 FR-019).
 	// [REF: build.md Phase 4.3 Session 4.3.3, DM §4.3, REQ §4.4 FR-019]
@@ -1448,7 +1387,6 @@ CREATE UNIQUE INDEX ON mv_segment_shard_counts (segment_id);
 		providersSection +
 		otpCodesSection +
 		pendingRegistrationsSection +
-		uploadAssignmentsSection +
 		filesSection +
 		segmentsSection +
 		chunkAssignmentsSection +
