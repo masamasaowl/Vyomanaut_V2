@@ -49,9 +49,9 @@ psql_check "btree_gist_installed" \
 
 # challenge_nonce is BYTEA with octet_length = 33, never 32 (DM §3 Invariant 5).
 psql_check "challenge_nonce_33_bytes" \
-  "SELECT COUNT(*) FROM information_schema.check_constraints
-   WHERE constraint_name LIKE '%challenge_nonce%'
-   AND check_clause LIKE '%33%'" \
+  "SELECT COUNT(*) FROM pg_constraint
+   WHERE conrelid = 'audit_receipts'::regclass AND contype = 'c'
+   AND pg_get_constraintdef(oid) LIKE '%octet_length(challenge_nonce) = 33%'" \
   "1"
 
 # No FLOAT/DOUBLE PRECISION columns in escrow_events (Invariant 4, NFR-046).
