@@ -585,3 +585,29 @@ func runFullVettingSequence(t *testing.T, db *sql.DB, verify *sql.DB, profile co
 		t.Errorf("status = %q, want ACTIVE after %d full passes", status, profile.VettingMinPasses)
 	}
 }
+
+// TestProviderScoreBasisPoints verifies the scale-and-round conversion added
+// for internal/payment (build.md Milestone 10) — a pure unit test, no
+// database needed.
+func TestProviderScoreBasisPoints(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		score  ProviderScore
+		want30 int64
+		want7  int64
+	}{
+		{"exact", ProviderScore{Score30d: 0.95, Score7d: 0.80}, 9500, 8000},
+		{"rounds up", ProviderScore{Score30d: 0.94999, Score7d: 0.65001}, 9500, 6500},
+		{"zero", ProviderScore{Score30d: 0, Score7d: 0}, 0, 0},
+		{"one", ProviderScore{Score30d: 1.0, Score7d: 1.0}, 10000, 10000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.score.Score30dBasisPoints(); got != tc.want30 {
+				t.Errorf("Score30dBasisPoints() = %d, want %d", got, tc.want30)
+			}
+			if got := tc.score.Score7dBasisPoints(); got != tc.want7 {
+				t.Errorf("Score7dBasisPoints() = %d, want %d", got, tc.want7)
+			}
+		})
+	}
+}

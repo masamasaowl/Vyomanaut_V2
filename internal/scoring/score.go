@@ -11,6 +11,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/google/uuid"
@@ -151,4 +152,39 @@ func nullFloatOrZero(nf sql.NullFloat64) float64 {
 		return 0
 	}
 	return nf.Float64
+}
+
+// Score30dBasisPoints and Score7dBasisPoints scale their corresponding score
+// to basis points (10000 = 1.00, 9500 = 0.95, ...), rounded to the nearest
+// integer.
+//
+// [Decision, build.md Milestone 10] internal/payment's release computation
+// (Phase 10.4) needs Score30d/Score7d to apply FR-049's release-multiplier
+// table, but IC §5.8/IC §11 place an absolute, no-exceptions ban on any
+// fractional-point numeric type appearing anywhere in internal/payment/ —
+// enforced by TWO independent mechanisms (a go/ast-based test and a grep
+// scan over internal/payment/*.go and *.sql) that make no exception for
+// merely reading a value of that type from another package. Since
+// ProviderScore's window-score fields are that same type by construction
+// (Session 8.1.1, predating and unrelated to Milestone 10's ban), there is
+// no way for internal/payment to consume Score30d/Score7d directly without
+// violating its own package's rule the moment it holds or compares such a
+// value — even without ever spelling out the type's name in payment's own
+// source.
+//
+// These two methods are the fix: the one unavoidable scale-and-round
+// operation happens HERE, once, inside internal/scoring's own domain where
+// that numeric type is already used freely and is entirely unrestricted.
+// internal/payment calls these instead of touching Score30d/Score7d
+// directly, and from that point on works ONLY with plain integers —
+// resolving the conflict without weakening either package's own rule.
+// basisPointsScale converts a [0,1] score ratio to basis points (10000 = 1.00).
+const basisPointsScale = 10000
+
+func (p ProviderScore) Score30dBasisPoints() int64 {
+	return int64(math.Round(p.Score30d * basisPointsScale))
+}
+
+func (p ProviderScore) Score7dBasisPoints() int64 {
+	return int64(math.Round(p.Score7d * basisPointsScale))
 }
