@@ -1,5 +1,5 @@
 -- Generated for profile: prod
--- Generated at: 2026-07-22T12:50:47Z
+-- Generated at: 2026-07-22T17:01:22Z
 -- ShardSize: 262144 (compile-time constant; NOT profile-variable)
 -- DataShards: 16
 -- TotalShards: 56
@@ -11,16 +11,44 @@
 CREATE EXTENSION IF NOT EXISTS btree_gist;
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
--- ── Roles ──────────────────────────────────────────────────────────────────────
--- PREREQUISITE for the Row Security Policies declared later in this migration
--- (see the "Row Security Policies" section below). Idempotent.
--- [REF: DM §6, build.md Phase 4.6 Session 4.6.1]
+-- ── Roles (ADR-032) ─────────────────────────────────────────────────────────────
+-- Role model — three identities with distinct privilege levels:
+--   vyomanaut_migrator : OWNS this schema, runs migrations, refreshes materialised
+--                        views. Provisioned by the ENVIRONMENT (bootstrap
+--                        POSTGRES_USER in dev/CI; DBA-provisioned in prod) — it is
+--                        NOT created here, because a migration cannot create the
+--                        very role that is running it. MUST hold BYPASSRLS (or be
+--                        SUPERUSER) so maintenance and MV refresh can read the
+--                        FORCE-RLS tables below.
+--   vyomanaut_app      : the microservice request-path role. LOGIN, NOSUPERUSER,
+--                        NOBYPASSRLS — fully subject to the Row Security Policies.
+--   vyomanaut_gc       : the garbage-collector role. LOGIN, NOSUPERUSER, NOBYPASSRLS.
+-- Passwords are set by the deployment (ALTER ROLE ... PASSWORD from a secrets
+-- store) — NEVER in this migration. Idempotent: guarded by pg_roles checks, and
+-- the defensive ALTERs below re-assert the security-critical attributes even if a
+-- role pre-exists from an older migration.
+-- [REF: ADR-032, DM §6]
 DO $$ BEGIN
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'vyomanaut_app') THEN
-        CREATE ROLE vyomanaut_app;
+        CREATE ROLE vyomanaut_app LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
     END IF;
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'vyomanaut_gc') THEN
-        CREATE ROLE vyomanaut_gc;
+        CREATE ROLE vyomanaut_gc LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+    END IF;
+END $$;
+-- Defensive assertion: abort the migration if either service role was provisioned
+-- with RLS-bypassing power. This is READ-ONLY (any role, including a non-superuser
+-- migrator, can execute it) and guarantees the append-only policies below cannot be
+-- silently defeated by a mis-provisioned role. We assert rather than ALTER because
+-- clearing the SUPERUSER attribute itself requires superuser — an assertion keeps
+-- the migration runnable by a least-privilege migrator while still failing loudly.
+DO $$ BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_roles
+        WHERE rolname IN ('vyomanaut_app', 'vyomanaut_gc')
+          AND (rolsuper OR rolbypassrls)
+    ) THEN
+        RAISE EXCEPTION 'ADR-032 violation: vyomanaut_app and vyomanaut_gc must be NOSUPERUSER and NOBYPASSRLS (they are subject to the FORCE-RLS append-only policies)';
     END IF;
 END $$;
 
@@ -113,18 +141,6 @@ CREATE TYPE repair_job_status AS ENUM (
     'IN_PROGRESS',
     'COMPLETED',
     'FAILED'
-);
-
--- otp_purpose — which registration/login flow an OTP code gates.
--- [Added, build.md Milestone 11 Phase 11.4] No table for OTP codes existed
--- anywhere in the schema prior to this milestone, despite FR-001 requiring
--- phone-number OTP verification and OAS's OtpSendRequest.purpose already
--- specifying this exact three-value enum.
--- [REF: FR-001, OAS OtpSendRequest.purpose, build.md Phase 11.4]
-CREATE TYPE otp_purpose AS ENUM (
-    'OWNER_REGISTER',
-    'PROVIDER_REGISTER',
-    'LOGIN'
 );
 
 -- ── owners ─────────────────────────────────────────────────────────────────────
@@ -230,11 +246,6 @@ CREATE TABLE providers (
     -- ── Escrow freeze (ADR-024) ──────────────────────────────────────────────
     frozen                  BOOLEAN         NOT NULL DEFAULT FALSE,
 
-    -- ── Token refresh rate limiting (build.md Milestone 11 Phase 11.4) ─────────
-    last_token_refresh_at   TIMESTAMPTZ,
-    -- NULL until the first successful POST /api/v1/provider/token/refresh.
-    -- Enforces "one successful refresh per 30 minutes per provider_id" (OAS).
-
     -- ── Timestamps ───────────────────────────────────────────────────────────
     created_at              TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
 
@@ -252,62 +263,6 @@ CREATE TABLE providers (
 
 COMMENT ON TABLE providers IS
     'Storage providers. One row per verified daemon. Never physically deleted (DM §3 Invariant 3).';
-
--- ── otp_codes ──────────────────────────────────────────────────────────────────
--- [REF: FR-001, OAS OtpSendRequest/OtpSendResponse/OtpVerifyRequest]
-CREATE TABLE otp_codes (
-    id              UUID            PRIMARY KEY DEFAULT gen_random_uuid(),
-
-    phone_number    VARCHAR(15)     NOT NULL,
-    -- E.164 format. Not a foreign key: no owners/providers row may exist yet.
-
-    purpose         otp_purpose     NOT NULL,
-
-    code_hash       BYTEA           NOT NULL CHECK (octet_length(code_hash) = 32),
-    -- SHA-256 of the 6-digit code. The plaintext code is never stored.
-
-    expires_at      TIMESTAMPTZ     NOT NULL,
-    -- NOW() + 10 minutes at insert time (OAS OtpSendResponse.expires_at).
-
-    consumed_at     TIMESTAMPTZ,
-    -- NULL until a successful verify. Sending a second OTP for the same
-    -- phone_number/purpose does not consume or delete an earlier row --
-    -- only the most recent unconsumed, unexpired one is checked at verify
-    -- time. Prevents replaying an already-used code.
-
-    created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX ON otp_codes (phone_number, purpose, created_at DESC);
--- Supports both the rate-limit check (COUNT WHERE created_at > NOW() - interval)
--- and the verify lookup (most recent unconsumed, unexpired code for this
--- phone_number + purpose).
-
-COMMENT ON TABLE otp_codes IS
-    'Ephemeral OTP codes for registration and login (FR-001). Not FK''d to '
-    'owners/providers -- an OTP can exist before the entity it gates does. '
-    'code_hash only; plaintext is never persisted.';
-
--- ── pending_registrations ───────────────────────────────────────────────────────
--- [REF: build.md Phase 11.4/11.5 -- bridges a registration token's opaque
--- subject UUID back to the phone number it was issued for]
-CREATE TABLE pending_registrations (
-    subject         UUID            PRIMARY KEY,
-    -- The registration JWT's `sub` claim: UUIDv5(namespace, phone_number).
-    -- Not a foreign key -- no owners/providers row exists yet.
-
-    phone_number    VARCHAR(15)     NOT NULL,
-
-    expires_at      TIMESTAMPTZ     NOT NULL,
-    -- Matches the registration token's own TTL (1 hour). A row past this
-    -- point is stale; the register endpoint treats it as not found.
-
-    created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW()
-);
-
-COMMENT ON TABLE pending_registrations IS
-    'Bridges a registration JWT''s opaque sub claim back to the phone number '
-    'it was issued for. One row per pending registration; deleted on redemption.';
 
 -- ── files ──────────────────────────────────────────────────────────────────────
 -- [REF: DM §4.3, REQ §4.4 FR-019]
@@ -503,7 +458,11 @@ COMMENT ON TABLE audit_periods IS
 -- No DELETE ever.
 CREATE TABLE audit_receipts (
     -- ── Primary key ──────────────────────────────────────────────────────────
-    receipt_id              UUID            PRIMARY KEY DEFAULT gen_random_uuid(),
+    -- Partitioned by RANGE (server_challenge_ts) — see PARTITION BY clause and
+    -- ADR-033. Postgres requires the partition key in every UNIQUE/PK constraint,
+    -- so the primary key is the composite (receipt_id, server_challenge_ts),
+    -- declared in the constraints block below (not inline here).
+    receipt_id              UUID            NOT NULL DEFAULT gen_random_uuid(),
 
     schema_version          SMALLINT        NOT NULL DEFAULT 1,
 
@@ -565,10 +524,18 @@ CREATE TABLE audit_receipts (
     -- Set by GC on PENDING rows older than 48 hours. See DM §8.15.
 
     -- ── Constraints ──────────────────────────────────────────────────────────
+    CONSTRAINT audit_receipts_pkey
+        PRIMARY KEY (receipt_id, server_challenge_ts),
+    -- Composite PK: partition key (server_challenge_ts) MUST be part of the PK on
+    -- a partitioned table (ADR-033). receipt_id remains globally unique in practice
+    -- (gen_random_uuid); the ts is appended only to satisfy the partition rule.
+
     CONSTRAINT audit_receipts_nonce_unique
-        UNIQUE (challenge_nonce),
-    -- Prevents replay: a provider cannot re-submit a response to an
-    -- already-recorded challenge (ADR-015).
+        UNIQUE (challenge_nonce, server_challenge_ts),
+    -- LOCAL (per-partition) uniqueness. GLOBAL nonce uniqueness — the actual replay
+    -- guarantee (DM §3 Invariant 5) — is enforced by the non-partitioned
+    -- audit_receipt_nonces guard table below, which a partitioned table cannot
+    -- enforce on challenge_nonce alone (ADR-033).
 
     CONSTRAINT audit_receipts_response_consistency CHECK (
         (audit_result IN ('PASS', 'FAIL') AND response_hash IS NOT NULL AND provider_sig IS NOT NULL)
@@ -583,7 +550,62 @@ CREATE TABLE audit_receipts (
     )
     -- No FK to chunk_assignments: chunk_assignments may be soft-deleted while
     -- audit_receipts must remain permanently (Invariant 1).
+) PARTITION BY RANGE (server_challenge_ts);
+-- ADR-033: monthly RANGE partitioning. This is the mechanism that lets the
+-- append-only audit log be archived without a DML DELETE — old months are
+-- DETACHed (DDL), never row-deleted (which Invariant 1 forbids). Satisfies the
+-- DM §9 "partition from day one" mandate and the ADR-015 "periodic archival"
+-- trade-off (architecture.md §25).
+
+-- DEFAULT partition: at V2 scale (architecture.md §26: hundreds of providers, far
+-- below the audit ceiling) all rows land here and the table "just works". When
+-- volume grows, create monthly partitions AHEAD of time with
+-- vyomanaut_create_audit_receipts_partition() below, then DETACH old months to
+-- cold storage. Emitting a DEFAULT partition (rather than a NOW()-based monthly
+-- partition) keeps this migration deterministic. (ADR-033)
+CREATE TABLE audit_receipts_default PARTITION OF audit_receipts DEFAULT;
+
+-- ── audit_receipt_nonces — GLOBAL nonce-uniqueness guard (Invariant 5) ─────────
+-- A partitioned table cannot enforce global uniqueness on challenge_nonce alone
+-- (the unique key must include the partition key). This small, non-partitioned
+-- table holds the global replay-protection guarantee: the microservice INSERTs the
+-- nonce here in the SAME TRANSACTION as the receipt (IC §6, ADR-033). A duplicate
+-- nonce raises a PK violation and aborts the audit write — the replay is rejected.
+-- Retention is bounded: rows older than the challenge-validity / secret-rotation
+-- window may be pruned by the migrator, keeping this index small even at V3 scale
+-- (capacity.md). Pruning here is safe — an expired nonce can never be replayed.
+CREATE TABLE audit_receipt_nonces (
+    challenge_nonce      BYTEA        PRIMARY KEY CHECK (octet_length(challenge_nonce) = 33),
+    server_challenge_ts  TIMESTAMPTZ  NOT NULL
 );
+COMMENT ON TABLE audit_receipt_nonces IS
+    'Global replay-protection guard for audit_receipts (DM §3 Invariant 5, ADR-033). '
+    'One row per challenge_nonce, written in the same txn as the receipt. Prunable by '
+    'server_challenge_ts once the challenge-validity window has passed.';
+
+-- ── Partition maintenance (ADR-033) ───────────────────────────────────────────
+-- Deterministic DDL helper: creates the monthly partition covering p_month. A
+-- scheduled maintenance job calls this for next month BEFORE its rows arrive, e.g.
+--   SELECT vyomanaut_create_audit_receipts_partition((date_trunc('month', now()) + interval '1 month')::date);
+-- Archival (once a month is closed and exported to cold storage):
+--   ALTER TABLE audit_receipts DETACH PARTITION audit_receipts_2026_01;  -- DDL, not DELETE
+-- We deliberately do NOT depend on pg_partman: it is a non-trusted extension and
+-- architecture.md §25.1 forbids re-introducing a rejected dependency without an ADR.
+CREATE OR REPLACE FUNCTION vyomanaut_create_audit_receipts_partition(p_month DATE)
+    RETURNS void
+    LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_start DATE := date_trunc('month', p_month)::date;
+    v_end   DATE := (date_trunc('month', p_month) + INTERVAL '1 month')::date;
+    v_name  TEXT := format('audit_receipts_%s', to_char(v_start, 'YYYY_MM'));
+BEGIN
+    EXECUTE format(
+        'CREATE TABLE IF NOT EXISTS %I PARTITION OF audit_receipts FOR VALUES FROM (%L) TO (%L)',
+        v_name, v_start, v_end
+    );
+END;
+$$;
 
 -- Nightly data integrity check — must return 0:
 -- SELECT COUNT(*) FROM audit_receipts ar
@@ -715,19 +737,9 @@ CREATE TABLE repair_jobs (
         (trigger_type IN ('SILENT_DEPARTURE', 'ANNOUNCED_DEPARTURE')
                 AND priority = 'PERMANENT_DEPARTURE')
         OR
-        (trigger_type = 'THRESHOLD_WARNING' AND priority IN ('PRE_WARNING', 'PERMANENT_DEPARTURE'))
+        (trigger_type = 'THRESHOLD_WARNING' AND priority = 'PRE_WARNING')
     ),
     -- Priority derived from trigger_type; prevents drift at application layer.
-    -- THRESHOLD_WARNING is the one trigger_type with two legal priority
-    -- values: PRE_WARNING at creation, promoted to PERMANENT_DEPARTURE by
-    -- PromoteStalePreWarningJobs once RepairPromotionTimeout elapses
-    -- unserviced (FR-043, IC §5.7, build.md Phase 9.2 Session 9.2.2). Fixed
-    -- here from the original single-value pairing, which made that
-    -- promotion — an explicit functional requirement — impossible to
-    -- satisfy: no UPDATE could ever set priority = PERMANENT_DEPARTURE on a
-    -- row whose trigger_type stays THRESHOLD_WARNING without violating this
-    -- very constraint. EMERGENCY_FLOOR and SILENT/ANNOUNCED_DEPARTURE are
-    -- unaffected: only threshold-triggered jobs are ever promoted.
 
     CONSTRAINT repair_jobs_completed_after_started CHECK (
         completed_at IS NULL OR started_at IS NOT NULL
@@ -888,8 +900,20 @@ CREATE INDEX idx_repair_jobs_provider ON repair_jobs (provider_id)
 -- [REF: DM §6, IC §6, build.md Phase 4.6]
 
 -- ── audit_receipts — INSERT only (Invariant 1) ────────────────────────────────
--- [REF: DM §6, DM §3 Invariant 1, ADR-015, build.md Phase 4.6 Session 4.6.1]
+-- [REF: DM §6, DM §3 Invariant 1, ADR-015, ADR-032, build.md Phase 4.6 Session 4.6.1]
 ALTER TABLE audit_receipts ENABLE ROW LEVEL SECURITY;
+-- FORCE so the policies apply even to a role that OWNS the table. Without this,
+-- an owner (or superuser) silently bypasses append-only enforcement (ADR-032).
+ALTER TABLE audit_receipts FORCE  ROW LEVEL SECURITY;
+
+-- SELECT: the request path must read receipts (own-receipt lookups, and the row
+-- read that the two-phase UPDATE's WHERE clause performs under FORCE RLS — without
+-- a SELECT policy that UPDATE silently matches zero rows). (ADR-032)
+CREATE POLICY audit_receipts_app_select
+    ON audit_receipts
+    FOR SELECT
+    TO vyomanaut_app
+    USING (TRUE);
 
 -- Phase 1 of the two-phase write: the microservice inserts a PENDING receipt
 -- (audit_result = NULL) immediately after dispatching the challenge.
@@ -937,12 +961,30 @@ CREATE POLICY audit_receipts_gc_abandon
         audit_result IS NULL      -- GC never sets the result; only abandoned_at
     );
 
+-- SELECT for the GC role: the abandon UPDATE's USING/WHERE clause must be able to
+-- read the stale PENDING rows it targets under FORCE RLS. (ADR-032)
+CREATE POLICY audit_receipts_gc_select
+    ON audit_receipts
+    FOR SELECT
+    TO vyomanaut_gc
+    USING (TRUE);
+
 -- No DELETE policy is created. Any DELETE attempt — by any role — returns
 -- permission denied. No physical deletion is ever permitted (Invariant 1).
 
 -- ── escrow_events — INSERT only (Invariant 2) ─────────────────────────────────
--- [REF: DM §6, DM §3 Invariant 2, ADR-016, build.md Phase 4.6 Session 4.6.2]
+-- [REF: DM §6, DM §3 Invariant 2, ADR-016, ADR-032, build.md Phase 4.6 Session 4.6.2]
 ALTER TABLE escrow_events ENABLE ROW LEVEL SECURITY;
+-- FORCE so append-only holds even for a table owner (ADR-032).
+ALTER TABLE escrow_events FORCE  ROW LEVEL SECURITY;
+
+-- SELECT: the request path reads the ledger for idempotency-key checks and any
+-- direct balance queries that do not go through the materialised view. (ADR-032)
+CREATE POLICY escrow_events_app_select
+    ON escrow_events
+    FOR SELECT
+    TO vyomanaut_app
+    USING (TRUE);
 
 CREATE POLICY escrow_events_insert_only
     ON escrow_events
@@ -961,8 +1003,19 @@ CREATE POLICY escrow_events_insert_only
 -- corrective control: physical deletion is never permitted again, for any
 -- role. The only way to retire a row is the existing soft-delete pattern
 -- (UPDATE status = 'DELETED', deleted_at = NOW()) — see IC §6.
--- [REF: DM §6, IC §6, ADR-007, build.md Phase 4.6 Session 4.6.3]
+-- [REF: DM §6, IC §6, ADR-007, ADR-032, build.md Phase 4.6 Session 4.6.3]
 ALTER TABLE chunk_assignments ENABLE ROW LEVEL SECURITY;
+-- FORCE so soft-delete-only holds even for a table owner (ADR-032).
+ALTER TABLE chunk_assignments FORCE  ROW LEVEL SECURITY;
+
+-- SELECT: the request path reads assignments constantly (assignment lookups,
+-- repair scheduling, dashboard) and the status UPDATE's WHERE clause must read
+-- the target row under FORCE RLS. (ADR-032)
+CREATE POLICY chunk_assignments_app_select
+    ON chunk_assignments
+    FOR SELECT
+    TO vyomanaut_app
+    USING (TRUE);
 
 -- Normal assignment creation: upload assignment and repair replacement.
 -- The is_vetting_chunk / segment_id / shard_index consistency contract
@@ -994,6 +1047,27 @@ CREATE POLICY chunk_assignments_status_update
 -- vyomanaut_app — returns permission denied. This is the fix for the
 -- historical hard-delete incident: chunk_assignments rows are retired by
 -- UPDATE status = 'DELETED' only, never by physical DELETE.
+
+-- ── audit_receipt_nonces — INSERT only, replay-guard integrity ─────────────────
+-- The app writes nonces here (never deletes); the migrator prunes expired nonces
+-- out-of-band (BYPASSRLS). FORCE + insert-only means a compromised app credential
+-- cannot delete guard rows to enable a replay. (ADR-033, DM §3 Invariant 5)
+ALTER TABLE audit_receipt_nonces ENABLE ROW LEVEL SECURITY;
+ALTER TABLE audit_receipt_nonces FORCE  ROW LEVEL SECURITY;
+
+CREATE POLICY audit_receipt_nonces_app_select
+    ON audit_receipt_nonces
+    FOR SELECT
+    TO vyomanaut_app
+    USING (TRUE);
+
+CREATE POLICY audit_receipt_nonces_insert_only
+    ON audit_receipt_nonces
+    FOR INSERT
+    TO vyomanaut_app
+    WITH CHECK (TRUE);
+
+-- No UPDATE or DELETE policy. A nonce, once recorded, is immutable for the app.
 
 -- ── Triggers ───────────────────────────────────────────────────────────────────
 -- TODO(4.9.x): updated_at maintenance triggers from DM §9.
@@ -1126,3 +1200,39 @@ GROUP BY segment_id;
 CREATE UNIQUE INDEX ON mv_segment_shard_counts (segment_id);
 -- Session 4.7.5: every materialised view above has its own unique index,
 -- required for REFRESH MATERIALIZED VIEW CONCURRENTLY (DM §9 checklist).
+-- ── Grants ────────────────────────────────────────────────────────────────────
+-- Least-privilege table grants for the non-owning service roles (ADR-032).
+-- No DELETE is granted anywhere.
+
+-- audit_receipts: INSERT (phase 1) + UPDATE (phase 2) + SELECT (read + FORCE-RLS
+-- WHERE evaluation). Row scope is further constrained by the policies above.
+GRANT SELECT, INSERT, UPDATE ON audit_receipts TO vyomanaut_app;
+GRANT SELECT, UPDATE          ON audit_receipts TO vyomanaut_gc;
+
+-- escrow_events: append-only ledger — INSERT + SELECT only.
+GRANT SELECT, INSERT ON escrow_events TO vyomanaut_app;
+
+-- audit_receipt_nonces: global replay guard — INSERT + SELECT only (ADR-033).
+GRANT SELECT, INSERT ON audit_receipt_nonces TO vyomanaut_app;
+
+-- chunk_assignments: INSERT + UPDATE (status/soft-delete) + SELECT.
+GRANT SELECT, INSERT, UPDATE ON chunk_assignments TO vyomanaut_app;
+
+-- Non-RLS mutable operational tables the request path reads and writes. No DELETE.
+GRANT SELECT, INSERT, UPDATE ON owners        TO vyomanaut_app;
+GRANT SELECT, INSERT, UPDATE ON providers     TO vyomanaut_app;
+GRANT SELECT, INSERT, UPDATE ON files         TO vyomanaut_app;
+GRANT SELECT, INSERT, UPDATE ON audit_periods TO vyomanaut_app;
+GRANT SELECT, INSERT, UPDATE ON repair_jobs   TO vyomanaut_app;
+
+-- Append-only / write-once tables: INSERT + SELECT only.
+GRANT SELECT, INSERT ON segments            TO vyomanaut_app;
+GRANT SELECT, INSERT ON owner_escrow_events TO vyomanaut_app;
+
+-- Read-only derived objects for dashboards and scheduling.
+GRANT SELECT ON active_chunk_assignments TO vyomanaut_app;
+GRANT SELECT ON mv_provider_scores         TO vyomanaut_app;
+GRANT SELECT ON mv_provider_escrow_balance TO vyomanaut_app;
+GRANT SELECT ON mv_owner_escrow_balance    TO vyomanaut_app;
+GRANT SELECT ON mv_segment_shard_counts    TO vyomanaut_app;
+

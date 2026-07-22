@@ -155,7 +155,7 @@ func generateSchema(profile config.NetworkProfile) string {
 		"        WHERE rolname IN ('vyomanaut_app', 'vyomanaut_gc')\n" +
 		"          AND (rolsuper OR rolbypassrls)\n" +
 		"    ) THEN\n" +
-		"        RAISE EXCEPTION 'ADR-032 violation: vyomanaut_app and vyomanaut_gc must be "+
+		"        RAISE EXCEPTION 'ADR-032 violation: vyomanaut_app and vyomanaut_gc must be " +
 		"NOSUPERUSER and NOBYPASSRLS (they are subject to the FORCE-RLS append-only policies)';\n" +
 		"    END IF;\n" +
 		"END $$;\n" +
@@ -760,7 +760,7 @@ CREATE TYPE repair_job_status AS ENUM (
 		"    v_name  TEXT := format('audit_receipts_%s', to_char(v_start, 'YYYY_MM'));\n" +
 		"BEGIN\n" +
 		"    EXECUTE format(\n" +
-		"        'CREATE TABLE IF NOT EXISTS %I PARTITION OF audit_receipts "+
+		"        'CREATE TABLE IF NOT EXISTS %I PARTITION OF audit_receipts " +
 		"FOR VALUES FROM (%L) TO (%L)',\n" +
 		"        v_name, v_start, v_end\n" +
 		"    );\n" +

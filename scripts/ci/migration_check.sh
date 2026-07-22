@@ -48,6 +48,9 @@ psql_check "btree_gist_installed" \
   "1"
 
 # challenge_nonce is BYTEA with octet_length = 33, never 32 (DM §3 Invariant 5).
+# Use pg_catalog (visible to every role) rather than information_schema.check_constraints,
+# which is OWNER-FILTERED: a non-owner runner sees zero rows and this critical check
+# would falsely FAIL. (ADR-032 remediation R1)
 psql_check "challenge_nonce_33_bytes" \
   "SELECT COUNT(*) FROM pg_constraint
    WHERE conrelid = 'audit_receipts'::regclass AND contype = 'c'
@@ -195,5 +198,54 @@ if [ -f migrations/001_initial_schema.sql ] && [ -f migrations/001_initial_schem
     FAIL=1
   fi
 fi
+
+# ── ADR-032 role-model checks ──────────────────────────────────────────────────
+# The three append-only / soft-delete tables must have FORCE ROW LEVEL SECURITY,
+# so the policies apply even to a table owner. relforcerowsecurity is in pg_class
+# (visible to every role).
+psql_check "force_rls_audit_receipts" \
+  "SELECT COUNT(*) FROM pg_class WHERE relname='audit_receipts' AND relforcerowsecurity" "1"
+psql_check "force_rls_escrow_events" \
+  "SELECT COUNT(*) FROM pg_class WHERE relname='escrow_events' AND relforcerowsecurity" "1"
+psql_check "force_rls_chunk_assignments" \
+  "SELECT COUNT(*) FROM pg_class WHERE relname='chunk_assignments' AND relforcerowsecurity" "1"
+
+# The service roles must never be able to bypass RLS.
+psql_check "app_gc_no_bypassrls" \
+  "SELECT COUNT(*) FROM pg_roles
+   WHERE rolname IN ('vyomanaut_app','vyomanaut_gc') AND (rolsuper OR rolbypassrls)" "0"
+
+# Each FORCE-RLS table must expose a SELECT policy for vyomanaut_app, without which
+# the app cannot read rows or run its two-phase / soft-delete UPDATEs.
+psql_check "app_select_policies_present" \
+  "SELECT COUNT(*) FROM pg_policies
+   WHERE tablename IN ('audit_receipts','escrow_events','chunk_assignments')
+   AND cmd='SELECT' AND 'vyomanaut_app' = ANY(roles)" "3"
+
+# ── ADR-033 partitioning checks ────────────────────────────────────────────────
+# audit_receipts must be a partitioned table (relkind 'p'), partitioned from day one
+# (DM §9). relkind is in pg_class (visible to every role).
+psql_check "audit_receipts_partitioned" \
+  "SELECT COUNT(*) FROM pg_class WHERE relname='audit_receipts' AND relkind='p'" "1"
+
+# It must be partitioned by RANGE (strategy 'r') on server_challenge_ts.
+psql_check "audit_receipts_range_partitioned" \
+  "SELECT COUNT(*) FROM pg_partitioned_table pt JOIN pg_class c ON c.oid=pt.partrelid
+   WHERE c.relname='audit_receipts' AND pt.partstrat='r'" "1"
+
+# A DEFAULT partition must exist so inserts never fail at V2 volume.
+psql_check "audit_receipts_default_partition" \
+  "SELECT COUNT(*) FROM pg_class WHERE relname='audit_receipts_default'" "1"
+
+# Global nonce-uniqueness guard table must exist with challenge_nonce as its PK
+# (the actual replay-protection guarantee — DM §3 Invariant 5).
+psql_check "nonce_guard_table_pk" \
+  "SELECT COUNT(*) FROM pg_constraint
+   WHERE conrelid='audit_receipt_nonces'::regclass AND contype='p'
+   AND pg_get_constraintdef(oid) LIKE '%challenge_nonce%'" "1"
+
+# The partition-maintenance helper must be present.
+psql_check "partition_maintenance_fn" \
+  "SELECT COUNT(*) FROM pg_proc WHERE proname='vyomanaut_create_audit_receipts_partition'" "1"
 
 exit $FAIL
