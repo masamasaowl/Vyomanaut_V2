@@ -145,27 +145,6 @@ linters:
             - github.com/google/uuid
             - github.com/lib/pq
 
-        # ── api: the one package permitted to import audit/scoring/repair/payment ──
-        # (build.md Milestone 11 header: "internal/api is the one place
-        # permitted to call into internal/audit, internal/scoring,
-        # internal/repair, and internal/payment on the microservice's
-        # behalf"). No deny list — this package's whole purpose is wiring
-        # the other four together behind HTTP handlers.
-        api:
-          files:
-            - "**/internal/api/**"
-          allow:
-            - $gostd
-            - github.com/masamasaowl/Vyomanaut_V2/internal/config
-            - github.com/masamasaowl/Vyomanaut_V2/internal/crypto
-            - github.com/masamasaowl/Vyomanaut_V2/internal/audit
-            - github.com/masamasaowl/Vyomanaut_V2/internal/scoring
-            - github.com/masamasaowl/Vyomanaut_V2/internal/repair
-            - github.com/masamasaowl/Vyomanaut_V2/internal/payment
-            - github.com/masamasaowl/Vyomanaut_V2/internal/erasure
-            - github.com/google/uuid
-            - github.com/lib/pq
-
         # ── client/*: deny-only rule; everything else stays allowed by default ──
         client:
           files:
