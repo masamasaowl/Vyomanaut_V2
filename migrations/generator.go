@@ -360,18 +360,6 @@ CREATE TYPE otp_purpose AS ENUM (
 		"    -- NULL until the first successful POST /api/v1/provider/token/refresh.\n" +
 		"    -- Enforces \"one successful refresh per 30 minutes per provider_id\" (OAS).\n" +
 		"\n" +
-		"    -- ── Promised downtime (build.md Milestone 11 Phase 11.6) ───────────────────\n" +
-		"    promised_return_at      TIMESTAMPTZ,\n" +
-		"    -- NULL means no downtime window is currently open (ADR-007's \"promised\n" +
-		"    -- downtime\" exit state). Set by POST /api/v1/provider/downtime; a second\n" +
-		"    -- call while non-null is rejected with 409 DOWNTIME_ALREADY_ACTIVE. Cleared\n" +
-		"    -- on the next successful heartbeat (the provider checked back in). If the\n" +
-		"    -- promised timestamp passes with no heartbeat, the departure detector\n" +
-		"    -- (Milestone 9) treats this identically to a silent departure.\n" +
-		"\n" +
-		"    downtime_reason         VARCHAR(200),\n" +
-		"    -- Optional human-readable reason supplied with the downtime announcement.\n" +
-		"\n" +
 		"    -- ── Timestamps ───────────────────────────────────────────────────────────\n" +
 		"    created_at              TIMESTAMPTZ     NOT NULL DEFAULT NOW(),\n" +
 		"\n" +

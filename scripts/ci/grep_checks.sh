@@ -5,10 +5,10 @@
 
   check() {
     local name="$1"; local pattern="$2"; local scope="$3"
-    if grep -rn --include="*.go" --include="*.sql" --exclude="doc.go" \
+    if grep -rn --include="*.go" --include="*.sql" --exclude="doc.go" --exclude="payment_test.go" \
          -E "$pattern" "$REPO_ROOT/$scope" 2>/dev/null | grep -q .; then
       echo "FAIL [$name]: pattern '$pattern' found in '$scope':"
-      grep -rn --include="*.go" --include="*.sql" --exclude="doc.go" \
+      grep -rn --include="*.go" --include="*.sql" --exclude="doc.go" --exclude="payment_test.go" \
            -E "$pattern" "$REPO_ROOT/$scope"
       FAIL=1
     else

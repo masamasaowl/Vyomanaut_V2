@@ -1,5 +1,5 @@
 -- Generated for profile: demo
--- Generated at: 2026-07-20T17:30:24Z
+-- Generated at: 2026-07-22T12:51:05Z
 -- ShardSize: 262144 (compile-time constant; NOT profile-variable)
 -- DataShards: 3
 -- TotalShards: 5
@@ -234,18 +234,6 @@ CREATE TABLE providers (
     last_token_refresh_at   TIMESTAMPTZ,
     -- NULL until the first successful POST /api/v1/provider/token/refresh.
     -- Enforces "one successful refresh per 30 minutes per provider_id" (OAS).
-
-    -- ── Promised downtime (build.md Milestone 11 Phase 11.6) ───────────────────
-    promised_return_at      TIMESTAMPTZ,
-    -- NULL means no downtime window is currently open (ADR-007's "promised
-    -- downtime" exit state). Set by POST /api/v1/provider/downtime; a second
-    -- call while non-null is rejected with 409 DOWNTIME_ALREADY_ACTIVE. Cleared
-    -- on the next successful heartbeat (the provider checked back in). If the
-    -- promised timestamp passes with no heartbeat, the departure detector
-    -- (Milestone 9) treats this identically to a silent departure.
-
-    downtime_reason         VARCHAR(200),
-    -- Optional human-readable reason supplied with the downtime announcement.
 
     -- ── Timestamps ───────────────────────────────────────────────────────────
     created_at              TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
