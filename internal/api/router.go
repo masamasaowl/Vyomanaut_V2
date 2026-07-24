@@ -25,6 +25,9 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"net/http"
+
+	"github.com/masamasaowl/Vyomanaut_V2/internal/config"
+	"github.com/masamasaowl/Vyomanaut_V2/internal/payment"
 )
 
 // adminAPIKeyMinHexLen is the minimum X-Admin-API-Key header length: OAS's
@@ -86,6 +89,10 @@ type RouterConfig struct {
 	OtpSender OtpSender // NoopOtpSender{} until real SMS delivery exists
 
 	Readiness *ReadinessEvaluator
+
+	Profile         config.NetworkProfile // Phase 11.5+
+	PaymentProvider payment.PaymentProvider
+	InFlightUploads InFlightUploadChecker // NoInFlightUploadChecker{} until Phase 11.7's tracking exists
 }
 
 // NewRouter builds the full HTTP routing tree from cfg.
@@ -100,6 +107,22 @@ func NewRouter(cfg RouterConfig) *http.ServeMux {
 	otpHandler := NewOtpHandler(cfg.DB, cfg.OtpSender)
 	otpVerifyHandler := NewOtpVerifyHandler(otpHandler, cfg.JWTPrivateKey)
 	tokenRefreshHandler := NewProviderTokenRefreshHandler(cfg.DB, cfg.JWTPublicKey, cfg.JWTPrivateKey)
+	ownerRegisterHandler := NewOwnerRegisterHandler(cfg.DB, cfg.JWTPrivateKey)
+	var ownerDepositHandler *OwnerDepositHandler
+	if cfg.PaymentProvider != nil {
+		ownerDepositHandler = NewOwnerDepositHandler(cfg.PaymentProvider)
+	}
+	ownerBalanceHandler := NewOwnerBalanceHandler(cfg.DB, cfg.Profile)
+	ownerFileListHandler := NewOwnerFileListHandler(cfg.DB, cfg.Profile)
+	ownerEscrowHistoryHandler := NewOwnerEscrowHistoryHandler(cfg.DB, cfg.Profile)
+	var ownerWithdrawHandler *OwnerWithdrawHandler
+	if cfg.PaymentProvider != nil {
+		inFlight := cfg.InFlightUploads
+		if inFlight == nil {
+			inFlight = NoInFlightUploadChecker{}
+		}
+		ownerWithdrawHandler = NewOwnerWithdrawHandler(cfg.DB, cfg.Profile, cfg.PaymentProvider, inFlight)
+	}
 
 	// ── Public routes: no auth middleware ──────────────────────────────────
 	mux.HandleFunc("GET /.well-known/jwks.json", HandleJWKS(cfg.JWTPublicKey, cfg.JWTKeyID)) // getJwks
@@ -114,12 +137,20 @@ func NewRouter(cfg RouterConfig) *http.ServeMux {
 	// verify hands a new entity. Every other BearerAuth route requires the
 	// specific role it names, which also means a registration token is
 	// correctly rejected everywhere except the two register endpoints.
-	mux.Handle("POST /api/v1/owner/register", bearerAny(http.HandlerFunc(stub501)))          // registerOwner
-	mux.Handle("POST /api/v1/owner/deposit", owner(stub501))                                 // initiateDeposit
-	mux.Handle("GET /api/v1/owner/{owner_id}/balance", owner(stub501))                       // getOwnerBalance
-	mux.Handle("GET /api/v1/owner/{owner_id}/files", owner(stub501))                         // listOwnerFiles
-	mux.Handle("GET /api/v1/owner/{owner_id}/escrow", owner(stub501))                        // getOwnerEscrowHistory
-	mux.Handle("POST /api/v1/owner/withdraw", owner(stub501))                                // withdrawOwnerEscrow
+	mux.Handle("POST /api/v1/owner/register", bearerAny(http.HandlerFunc(ownerRegisterHandler.HandleRegister))) // registerOwner
+	if ownerDepositHandler != nil {
+		mux.Handle("POST /api/v1/owner/deposit", owner(ownerDepositHandler.HandleDeposit)) // initiateDeposit
+	} else {
+		mux.Handle("POST /api/v1/owner/deposit", owner(stub501))
+	}
+	mux.Handle("GET /api/v1/owner/{owner_id}/balance", owner(ownerBalanceHandler.HandleBalance))            // getOwnerBalance
+	mux.Handle("GET /api/v1/owner/{owner_id}/files", owner(ownerFileListHandler.HandleFiles))               // listOwnerFiles
+	mux.Handle("GET /api/v1/owner/{owner_id}/escrow", owner(ownerEscrowHistoryHandler.HandleEscrowHistory)) // getOwnerEscrowHistory
+	if ownerWithdrawHandler != nil {
+		mux.Handle("POST /api/v1/owner/withdraw", owner(ownerWithdrawHandler.HandleWithdraw)) // withdrawOwnerEscrow
+	} else {
+		mux.Handle("POST /api/v1/owner/withdraw", owner(stub501))
+	}
 	mux.Handle("POST /api/v1/provider/register", bearerAny(http.HandlerFunc(stub501)))       // registerProvider
 	mux.Handle("POST /api/v1/provider/heartbeat", provider(stub501))                         // providerHeartbeat
 	mux.HandleFunc("POST /api/v1/provider/token/refresh", tokenRefreshHandler.HandleRefresh) // refreshProviderToken — its own two-factor auth, not bearerAuthRole
