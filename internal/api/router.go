@@ -1,0 +1,157 @@
+// Package api is declared in doc.go.
+// This file establishes the HTTP routing tree: every operation in OAS's
+// paths (verified against its exact operationId), wired with the correct
+// auth middleware for its security scheme. Endpoints built so far
+// (Phase 11.1 errors, 11.2 readiness, 11.4 auth) are wired to their real
+// handlers; everything else remains a 501 stub until its own phase lands.
+//
+// [Flagged, build.md Phase 11.3] GET /api/v1/provider/downtime
+// (getActiveDowntime) is described in Session 11.6.5 but openapi.yaml
+// defines only POST /api/v1/provider/downtime (announceDowntime) — no GET
+// sibling path, schema, or operationId exists anywhere in the spec. This is
+// a genuine prerequisite gap, not an oversight in this file: the row is
+// listed in the routing table below for completeness and marked BLOCKED,
+// but is NOT registered on the mux until openapi.yaml is updated with the
+// GET path (Session 11.6.5 implements the handler LOGIC regardless, just
+// unreachable via HTTP for now).
+//
+// [REF: OAS paths, IC §2, build.md Phase 11.3 Session 11.3.1, Phase 11.4]
+
+package api
+
+import (
+	"crypto/ed25519"
+	"crypto/subtle"
+	"database/sql"
+	"encoding/hex"
+	"net/http"
+)
+
+// adminAPIKeyMinHexLen is the minimum X-Admin-API-Key header length: OAS's
+// AdminApiKey security scheme requires "≥32 random bytes hex-encoded" — 32
+// bytes hex-encoded is 64 characters.
+const adminAPIKeyMinHexLen = 64
+
+// stub501 is the placeholder handler for every not-yet-implemented
+// operation (Session 11.3.1). Later sessions in this milestone replace
+// individual stub501 registrations with real handlers as each endpoint is
+// built; this function itself is never called once every session is done.
+func stub501(w http.ResponseWriter, _ *http.Request) {
+	WriteError(w, http.StatusNotImplemented, ErrInternal, "not yet implemented", nil, "", nil)
+}
+
+// adminAuthMiddleware enforces OAS's AdminApiKey security scheme:
+// X-Admin-API-Key header, compared in constant time against the configured
+// key, rejecting anything shorter than adminAPIKeyMinHexLen characters
+// outright before even attempting the comparison. Per OAS's own
+// description, this key must never appear in client-facing code or
+// provider daemon builds — it is a server-side-only secret, configured by
+// whoever wires this middleware in (Milestone 12), never hardcoded here.
+func adminAuthMiddleware(configuredKey string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			provided := r.Header.Get("X-Admin-API-Key")
+			if len(provided) < adminAPIKeyMinHexLen {
+				WriteError(w, http.StatusUnauthorized, ErrUnauthorized, "missing or malformed X-Admin-API-Key", nil, "", nil)
+				return
+			}
+			if _, err := hex.DecodeString(provided); err != nil {
+				WriteError(w, http.StatusUnauthorized, ErrUnauthorized, "X-Admin-API-Key is not valid hex", nil, "", nil)
+				return
+			}
+			if subtle.ConstantTimeCompare([]byte(provided), []byte(configuredKey)) != 1 {
+				WriteError(w, http.StatusUnauthorized, ErrUnauthorized, "invalid X-Admin-API-Key", nil, "", nil)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// RouterConfig bundles every dependency NewRouter needs. It grows as later
+// phases in this milestone wire in more real handlers (payment, scoring,
+// repair) — a config struct rather than an ever-longer parameter list.
+type RouterConfig struct {
+	AdminAPIKey string
+	DB          *sql.DB
+
+	// JWT signing/verification (Phase 11.4). JWTPublicKey/JWTPrivateKey are
+	// the SAME keypair — split into two fields because most callers need
+	// only one half (verification-only middleware never sees the private
+	// key; issuance-only code never needs the public key separately).
+	JWTPublicKey  ed25519.PublicKey
+	JWTPrivateKey ed25519.PrivateKey
+	JWTKeyID      string // e.g. "vyomanaut-ms-2026-q2" (OAS JwksResponse.kid)
+
+	OtpSender OtpSender // NoopOtpSender{} until real SMS delivery exists
+
+	Readiness *ReadinessEvaluator
+}
+
+// NewRouter builds the full HTTP routing tree from cfg.
+func NewRouter(cfg RouterConfig) *http.ServeMux {
+	mux := http.NewServeMux()
+	adminAuth := adminAuthMiddleware(cfg.AdminAPIKey)
+	admin := func(h http.HandlerFunc) http.Handler { return adminAuth(h) }
+	bearerAny := bearerAuthAny(cfg.JWTPublicKey)
+	owner := func(h http.HandlerFunc) http.Handler { return bearerAuthRole(cfg.JWTPublicKey, "owner")(h) }
+	provider := func(h http.HandlerFunc) http.Handler { return bearerAuthRole(cfg.JWTPublicKey, "provider")(h) }
+
+	otpHandler := NewOtpHandler(cfg.DB, cfg.OtpSender)
+	otpVerifyHandler := NewOtpVerifyHandler(otpHandler, cfg.JWTPrivateKey)
+	tokenRefreshHandler := NewProviderTokenRefreshHandler(cfg.DB, cfg.JWTPublicKey, cfg.JWTPrivateKey)
+
+	// ── Public routes: no auth middleware ──────────────────────────────────
+	mux.HandleFunc("GET /.well-known/jwks.json", HandleJWKS(cfg.JWTPublicKey, cfg.JWTKeyID)) // getJwks
+	mux.HandleFunc("POST /api/v1/auth/otp/send", otpHandler.HandleSend)                      // sendOtp
+	mux.HandleFunc("POST /api/v1/auth/otp/verify", otpVerifyHandler.HandleVerify)            // verifyOtp
+	mux.HandleFunc("GET /api/v1/pricing/estimate", stub501)                                  // getPricingEstimate
+	mux.HandleFunc("GET /api/v1/pricing/provider-estimate", stub501)                         // getProviderEarningsEstimate
+
+	// ── BearerAuth routes ────────────────────────────────────────────────────
+	// register endpoints accept ANY validly-signed token, registration
+	// tokens included (bearerAny) — that is exactly the token type OTP
+	// verify hands a new entity. Every other BearerAuth route requires the
+	// specific role it names, which also means a registration token is
+	// correctly rejected everywhere except the two register endpoints.
+	mux.Handle("POST /api/v1/owner/register", bearerAny(http.HandlerFunc(stub501)))          // registerOwner
+	mux.Handle("POST /api/v1/owner/deposit", owner(stub501))                                 // initiateDeposit
+	mux.Handle("GET /api/v1/owner/{owner_id}/balance", owner(stub501))                       // getOwnerBalance
+	mux.Handle("GET /api/v1/owner/{owner_id}/files", owner(stub501))                         // listOwnerFiles
+	mux.Handle("GET /api/v1/owner/{owner_id}/escrow", owner(stub501))                        // getOwnerEscrowHistory
+	mux.Handle("POST /api/v1/owner/withdraw", owner(stub501))                                // withdrawOwnerEscrow
+	mux.Handle("POST /api/v1/provider/register", bearerAny(http.HandlerFunc(stub501)))       // registerProvider
+	mux.Handle("POST /api/v1/provider/heartbeat", provider(stub501))                         // providerHeartbeat
+	mux.HandleFunc("POST /api/v1/provider/token/refresh", tokenRefreshHandler.HandleRefresh) // refreshProviderToken — its own two-factor auth, not bearerAuthRole
+	mux.Handle("GET /api/v1/provider/{provider_id}/status", provider(stub501))               // getProviderStatus
+	mux.Handle("GET /api/v1/provider/receipts", provider(stub501))                           // listProviderReceipts
+	mux.Handle("POST /api/v1/provider/downtime", provider(stub501))                          // announceDowntime
+	// GET /api/v1/provider/downtime (getActiveDowntime): BLOCKED — not yet in
+	// openapi.yaml (flagged gap, this file's header comment). Not registered
+	// until the OAS path exists; Session 11.6.5 implements the handler logic
+	// directly-testably in the meantime.
+	mux.Handle("POST /api/v1/provider/depart", provider(stub501))    // announceDeparture
+	mux.Handle("POST /api/v1/upload/assign", owner(stub501))         // assignUpload
+	mux.Handle("POST /api/v1/file/register", owner(stub501))         // registerFile
+	mux.Handle("GET /api/v1/file/{file_id}/pointer", owner(stub501)) // getPointerFile
+	mux.Handle("DELETE /api/v1/file/{file_id}", owner(stub501))      // deleteFile
+
+	// ── AdminApiKey routes ──────────────────────────────────────────────────
+	mux.Handle("POST /api/v1/audit/challenge", admin(stub501)) // dispatchAuditChallenge
+	if cfg.Readiness != nil {
+		mux.Handle("GET /api/v1/admin/readiness", admin(http.HandlerFunc(cfg.Readiness.HandleReadiness))) // getReadiness
+	} else {
+		mux.Handle("GET /api/v1/admin/readiness", admin(stub501))
+	}
+	mux.Handle("GET /api/v1/admin/repair/queue", admin(stub501))      // getRepairQueue
+	mux.Handle("POST /api/v1/admin/repair/trigger", admin(stub501))   // triggerRepair
+	mux.Handle("GET /api/v1/admin/providers", admin(stub501))         // listAdminProviders
+	mux.Handle("GET /api/v1/admin/audit/stats", admin(stub501))       // getAuditStats
+	mux.Handle("GET /api/v1/admin/vetting/status", admin(stub501))    // getVettingStatus
+	mux.Handle("POST /api/v1/admin/vetting/gc/retry", admin(stub501)) // retryVettingGC
+
+	// ── Webhook: signature auth (IC §7), confirmed absent from OAS by design ──
+	mux.HandleFunc("POST /webhooks/razorpay", stub501)
+
+	return mux
+}
