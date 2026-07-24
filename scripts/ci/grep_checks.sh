@@ -29,7 +29,7 @@
   # Check 10: no references to non-existent ADRs (above ADR-031)
   # Pattern: ADR-0[3-9][2-9]|ADR-[1-9][0-9]{2,}
   check "ADR_REFERENCE" \
-    "ADR-0[3-9][2-9]|ADR-[1-9][0-9]{2,}" \
+    "ADR-0(3[4-9]|[4-9][0-9])|ADR-[1-9][0-9]{2,}" \
     "."
 
   # Check 11: no UPI Collect API endpoint calls

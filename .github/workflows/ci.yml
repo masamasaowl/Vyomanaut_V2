@@ -109,6 +109,14 @@ jobs:
       # ─────────────────────────────────────────────────────────────
       - name: check-04 — go test (race detector)
         id: check-04
+        env:
+          PGHOST: postgres
+          PGPORT: "5432"
+          PGDATABASE: vyomanaut_test
+          PGUSER: vyomanaut_app
+          PGPASSWORD: testpass
+          PGVERIFY_USER: vyomanaut_migrator
+          PGVERIFY_PASSWORD: testpass
         run: go test -race -count=1 ./...
 
       # ─────────────────────────────────────────────────────────────
@@ -143,7 +151,8 @@ jobs:
           PGPASSWORD: testpass
           PGHOST: postgres
           PGPORT: "5432"
-          PGUSER: vyomanaut_app
+          PGUSER: vyomanaut_migrator   
+          PGDATABASE: vyomanaut_test  
         run: |
           psql --version
 
@@ -155,9 +164,19 @@ jobs:
 
           psql -v ON_ERROR_STOP=1 -d vyomanaut_test \
             -f /tmp/001_prod.sql
+          
+          # Service roles are created with no password by the migration itself
+          # (ADR-032 §"Passwords ... set by the deployment"). CI needs one so
+          # migration_check.sh and go test's live-DB paths can authenticate.
 
-          go run migrations/generator.go --profile=demo \
-            > /tmp/001_demo.sql
+          psql -v ON_ERROR_STOP=1 -d vyomanaut_test -c \
+            "ALTER ROLE vyomanaut_app WITH PASSWORD 'testpass';
+            ALTER ROLE vyomanaut_gc  WITH PASSWORD 'testpass';"
+
+          bash scripts/ci/migration_check.sh
+
+                go run migrations/generator.go --profile=demo \
+                  > /tmp/001_demo.sql
 
           # Demo schema is applied to a separate database.
           # Each GitHub Actions run gets a fresh PostgreSQL service container.
