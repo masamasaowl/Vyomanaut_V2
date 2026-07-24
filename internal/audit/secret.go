@@ -204,6 +204,26 @@ func (c *ClusterSecretCache) CurrentSecret() (secret []byte, versionByte uint8, 
 	return c.currentSecret, c.currentVersion, nil
 }
 
+// IsLoaded reports whether Load has completed successfully at least once —
+// a trivial accessor, unlike CurrentSecret, that does not consult the
+// 5-minute TTL: it answers "has this cache ever been populated," not "is it
+// still fresh."
+//
+// [Retroactive addition, build.md Milestone 11 Session 11.2.1] Not part of
+// the original Milestones 7–8 ClusterSecretCache proposal; added because the
+// readiness gate's cluster_audit_secret_loaded condition (IC §3.4, OAS
+// ReadinessResponse) needs exactly this boolean and nothing more — it must
+// not fail (as CurrentSecret would) merely because the cache's TTL has
+// lapsed between refresh cycles, since that is not what "is the secret
+// loaded" is asking.
+//
+// Goroutine-safe: yes.
+func (c *ClusterSecretCache) IsLoaded() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.currentVersion != 0
+}
+
 // IsVersionValid reports whether versionByte corresponds to a
 // currently-accepted secret version — vN or vN+1 during the 24-hour
 // rotation overlap window (IC §8). Session 7.2.1's ValidateResponse caller
