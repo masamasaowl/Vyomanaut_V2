@@ -18,6 +18,11 @@ import "time"
 var ProductionProfile = NetworkProfile{
 	Mode: "prod",
 
+	// ── Storage pricing (build.md Milestone 11) ───────────────────────────────
+	// Identical to DemoProfile — pricing is profile-invariant (see
+	// network_profile.go's own note on this field).
+	StorageRatePaisePerGBPerMonth: 100,
+
 	// ── Erasure coding (ADR-003) ──────────────────────────────────────────────
 	DataShards:   16,
 	ParityShards: 40,
@@ -97,6 +102,11 @@ var ProductionProfile = NetworkProfile{
 // [REF: MVP §5.2]
 var DemoProfile = NetworkProfile{
 	Mode: "demo",
+
+	// ── Storage pricing (build.md Milestone 11) ───────────────────────────────
+	// Identical to ProductionProfile — pricing is profile-invariant (see
+	// network_profile.go's own note on this field).
+	StorageRatePaisePerGBPerMonth: 100,
 
 	// ── Erasure coding (ADR-003) ──────────────────────────────────────────────
 	DataShards:   3,

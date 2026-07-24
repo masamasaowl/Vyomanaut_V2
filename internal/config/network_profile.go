@@ -121,4 +121,16 @@ type NetworkProfile struct {
 	// Printed in full at startup (MVP §6.3 OR-01). MUST NOT be used for
 	// runtime branching inside business logic — use the typed fields above.
 	Mode string // "demo" | "prod"
+
+	// ── Storage pricing ────────────────────────────────────────────────────────
+	// [Added, build.md Milestone 11 Phase 11.5/11.8] FR-057 and FileListItem's
+	// monthly_cost_paise both need a concrete storage rate, but ADR-024 only
+	// describes it as "a product decision, set at contract creation" — no ADR
+	// or FR anywhere in scope gives an actual figure. Profile-invariant
+	// (identical in both modes, per this struct's own INVARIANT note above):
+	// pricing is a business decision independent of demo/prod scale, not a
+	// performance threshold or infrastructure parameter. 100 paise (₹1) per
+	// GB per month is a placeholder pending real product pricing — flagged
+	// here rather than left unimplemented.
+	StorageRatePaisePerGBPerMonth int64
 }
