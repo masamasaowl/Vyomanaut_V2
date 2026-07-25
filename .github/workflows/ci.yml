@@ -52,7 +52,7 @@ jobs:
         image: postgres:16
         env:
           POSTGRES_DB: vyomanaut_test
-          POSTGRES_USER: vyomanaut_migration
+          POSTGRES_USER: vyomanaut_migrator
           POSTGRES_PASSWORD: testpass
         ports:
           - 5432:5432
@@ -102,22 +102,6 @@ jobs:
         with:
           version: v2.12.2
           args: --timeout=5m
-
-      # ─────────────────────────────────────────────────────────────
-      # check-04: Tests with race detector
-      # REF: MVP §8.4 check 4
-      # ─────────────────────────────────────────────────────────────
-      - name: check-04 — go test (race detector)
-        id: check-04
-        env:
-          PGHOST: postgres
-          PGPORT: "5432"
-          PGDATABASE: vyomanaut_test
-          PGUSER: vyomanaut_app
-          PGPASSWORD: testpass
-          PGVERIFY_USER: vyomanaut_migrator
-          PGVERIFY_PASSWORD: testpass
-        run: go test -race -count=1 ./...
 
       # ─────────────────────────────────────────────────────────────
       # check-05: DHT key validator persistence (M6 gate)
@@ -188,6 +172,24 @@ jobs:
 
           psql -v ON_ERROR_STOP=1 -d vyomanaut_demo_test \
             -f /tmp/001_demo.sql
+
+      # ─────────────────────────────────────────────────────────────
+      # check-04: Tests with race detector
+      # Moved here, after the schema, passwords, and migration_check.sh is run by check-07
+      # REF: MVP §8.4 check 4
+      # ─────────────────────────────────────────────────────────────
+      - name: check-04 — go test (race detector)
+        id: check-04
+        env:
+          PGHOST: postgres
+          PGPORT: "5432"
+          PGDATABASE: vyomanaut_test
+          PGUSER: vyomanaut_app
+          PGPASSWORD: testpass
+          PGVERIFY_USER: vyomanaut_migrator
+          PGVERIFY_PASSWORD: testpass
+        run: go test -race -count=1 ./...
+      
 
       # ─────────────────────────────────────────────────────────────
       # check-08 through check-11: grep-based invariant checks
