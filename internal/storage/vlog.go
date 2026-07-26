@@ -96,34 +96,42 @@ func (ws *wiskeyStore) appendToVLog(chunkID [32]byte, chunkData []byte) (offset 
 	return offset, nil
 }
 
-// readFromVLog reads the vLogEntrySize-byte entry at byteOffset and verifies integrity.
+// readFromVLog reads the vLogEntrySize-byte entry at byteOffset and verifies
+// that its chunk_data hashes to wantChunkID — the content-address key the
+// caller looked up — not just the entry's own on-disk content_hash field.
 //
 // Goroutine-safe: uses ReadAt (POSIX pread semantics). Multiple goroutines
 // may call readFromVLog concurrently; concurrent AppendChunk calls in the
 // writer goroutine are also safe because pread does not move the file position.
 //
-// Algorithm (ARCH §16 §Audit lookup path, steps 4–5):
+// Algorithm (ARCH §16 §Audit lookup path, steps 4-5; corrected per M5 review §2):
 //  1. ReadAt vLogEntrySize bytes from byteOffset into a fixed-size buffer.
-//  2. Extract content_hash from buf[vlogOffContentHash:].
-//  3. Compute SHA-256(buf[vlogOffChunkData : vlogOffChunkData+ChunkDataSize]).
-//  4. Compare byte-by-byte — return nil, ErrContentHashMismatch on any mismatch
-//     (silent disk corruption; caller must set audit status 0x02, IC §4.2).
-//  5. Return a fresh ChunkDataSize-byte slice copied from the data region.
+//  2. Compute SHA-256(buf[vlogOffChunkData : vlogOffChunkData+ChunkDataSize]).
+//  3. Compare against wantChunkID — the key the RocksDB index was looked up
+//     under, supplied by the caller — NOT the entry's own internally-stored
+//     content_hash field. Checking only content_hash proves the entry is
+//     self-consistent with whatever it was paired with at AppendChunk time;
+//     it does not prove that pairing was ever correct (AppendChunk documents
+//     SHA-256(chunkData) == chunkID as a caller precondition it does NOT
+//     re-verify). Checking wantChunkID closes that gap and also catches a
+//     RocksDB index entry that points at the wrong vLog offset. Return
+//     ErrContentHashMismatch on any mismatch (caller must set audit status
+//     0x02, IC §4.2).
+//  4. Return a fresh ChunkDataSize-byte slice copied from the data region.
 //
 // The returned slice is always freshly allocated so callers may retain it
 // after this function returns without aliasing the I/O buffer.
-func (ws *wiskeyStore) readFromVLog(byteOffset uint64) ([]byte, error) {
+//
+// [REF: IC §5.3, ARCH §16, M5 review §2]
+func (ws *wiskeyStore) readFromVLog(wantChunkID [32]byte, byteOffset uint64) ([]byte, error) {
 	var buf [vLogEntrySize]byte
 	if _, err := ws.vlog.ReadAt(buf[:], int64(byteOffset)); err != nil {
 		return nil, fmt.Errorf("%w: ReadAt offset %d: %v", ErrVLogRead, byteOffset, err)
 	}
 
-	storedHash := buf[vlogOffContentHash : vlogOffContentHash+sha256.Size]
 	computed := sha256.Sum256(buf[vlogOffChunkData : vlogOffChunkData+ChunkDataSize])
-	for i := range computed {
-		if computed[i] != storedHash[i] {
-			return nil, ErrContentHashMismatch
-		}
+	if computed != wantChunkID {
+		return nil, ErrContentHashMismatch
 	}
 
 	data := make([]byte, ChunkDataSize)
@@ -181,9 +189,11 @@ func (ws *wiskeyStore) LookupChunk(chunkID [32]byte) ([]byte, error) {
 		return nil, err
 	}
 
-	// Step 2 (ARCH §16 steps 4–5): Read vLog entry and verify SHA-256(chunk_data).
-	// readFromVLog never returns partial data on ErrContentHashMismatch.
-	data, err := ws.readFromVLog(vlogOffset)
+	// Step 2 (ARCH §16 steps 4–5): Read vLog entry and verify SHA-256(chunk_data)
+	// against chunkID itself (M5 review §2), not just the entry's own stored
+	// content_hash field. readFromVLog never returns partial data on
+	// ErrContentHashMismatch.
+	data, err := ws.readFromVLog(chunkID, vlogOffset)
 	if err != nil {
 		return nil, err
 	}
