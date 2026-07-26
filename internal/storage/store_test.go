@@ -150,6 +150,44 @@ func TestLookupChunkCorrupt(t *testing.T) {
 		"corrupted chunk must return ErrContentHashMismatch, not partial data")
 }
 
+// TestLookupChunkRejectsMismatchedWriteTimePairing verifies that LookupChunk
+// never returns data for chunkID unless SHA-256(returned data) == chunkID,
+// even when AppendChunk was itself called with a (chunkID, chunkData) pair
+// that violates its own documented precondition (AppendChunk does not
+// re-verify SHA-256(chunkData) == chunkID; verifying that pairing before
+// calling AppendChunk is a caller obligation). Before this fix, LookupChunk
+// only checked the vLog entry's own internally-stored content_hash field —
+// which AppendChunk always writes as SHA-256 of whatever chunkData it was
+// given, correct or not — so a caller bug upstream of AppendChunk was
+// invisible to every read afterwards. This test calls AppendChunk directly
+// with a deliberately wrong id, the same way a buggy caller would, and
+// confirms LookupChunk(wrongID) now fails closed with
+// ErrContentHashMismatch instead of returning data as if it were valid.
+//
+// [REF: IC §5.3, ARCH §16, M5 review §2]
+func TestLookupChunkRejectsMismatchedWriteTimePairing(t *testing.T) {
+	store, err := storage.NewChunkStore(t.TempDir())
+	require.NoError(t, err)
+	require.NoError(t, store.RecoverFromCrash())
+	t.Cleanup(func() { _ = store.Close() })
+
+	data := make([]byte, 262144)
+	data[0] = 0xCD
+	var wrongID [32]byte
+	wrongID[0] = 0x99 // deliberately NOT sha256.Sum256(data)
+
+	writeCh := make(chan writeReq, 1)
+	startWriter(store, writeCh)
+	rc := sendChunk(writeCh, wrongID, data)
+	require.NoError(t, <-rc, "AppendChunk itself does not re-verify the pairing and must not error here")
+	close(writeCh)
+
+	_, lookupErr := store.LookupChunk(wrongID)
+	require.ErrorIs(t, lookupErr, storage.ErrContentHashMismatch,
+		"LookupChunk must reject a chunk whose actual content does not hash to the "+
+			"requested chunkID, not just a chunk whose content_hash field is internally self-consistent")
+}
+
 // TestDeleteChunk verifies that DeleteChunk removes the RocksDB index entry so
 // that subsequent LookupChunk calls return ErrChunkNotFound. The vLog entry
 // remains on disk until RunGC reclaims it (IC §5.3, ADR-023).

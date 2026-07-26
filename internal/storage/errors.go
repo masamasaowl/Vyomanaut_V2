@@ -20,15 +20,19 @@ var (
 	// [REF: IC §5.3, ARCH §16 §Audit lookup path, ARCH §27.1]
 	ErrChunkNotFound = errors.New("storage: chunk not found")
 
-	// ErrContentHashMismatch is returned by LookupChunk when the chunk data is
-	// present in the vLog but SHA-256(chunk_data) does not equal the stored
-	// content_hash. This indicates silent disk corruption.
+	// ErrContentHashMismatch is returned by LookupChunk when the chunk data
+	// present in the vLog does not hash to the requested chunkID — checked
+	// against the caller's content-address key itself, not just the vLog
+	// entry's own internally-stored content_hash field (M5 review §2). This
+	// indicates silent disk corruption, a stale/wrong RocksDB->vLog offset,
+	// or an AppendChunk caller that violated its own
+	// SHA-256(chunkData) == chunkID precondition.
 	//
 	// Callers must return audit_result = FAIL with status byte 0x02
 	// (FAIL_CORRUPTION) per IC §4.2. Repair is triggered by the microservice on
 	// receipt of a FAIL with this status.
 	//
-	// [REF: IC §5.3, IC §4.2, ARCH §16]
+	// [REF: IC §5.3, IC §4.2, ARCH §16, M5 review §2]
 	ErrContentHashMismatch = errors.New("storage: content hash mismatch (disk corruption)")
 
 	// ErrVLogFsync is returned by AppendChunk when the fsync() call fails after
