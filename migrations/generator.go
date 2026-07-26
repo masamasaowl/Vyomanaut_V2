@@ -118,16 +118,45 @@ func generateSchema(profile config.NetworkProfile) string {
 	// migration against an already-provisioned cluster is a no-op.
 	// [REF: DM §6, build.md Phase 4.6 Session 4.6.1]
 	rolesSection := "" +
-		"-- ── Roles ──────────────────────────────────────────────────────────────────────\n" +
-		"-- PREREQUISITE for the Row Security Policies declared later in this migration\n" +
-		"-- (see the \"Row Security Policies\" section below). Idempotent.\n" +
-		"-- [REF: DM §6, build.md Phase 4.6 Session 4.6.1]\n" +
+		"-- ── Roles (ADR-032) ─────────────────────────────────────────────────────────────\n" +
+		"-- Role model — three identities with distinct privilege levels:\n" +
+		"--   vyomanaut_migrator : OWNS this schema, runs migrations, refreshes materialised\n" +
+		"--                        views. Provisioned by the ENVIRONMENT (bootstrap\n" +
+		"--                        POSTGRES_USER in dev/CI; DBA-provisioned in prod) — it is\n" +
+		"--                        NOT created here, because a migration cannot create the\n" +
+		"--                        very role that is running it. MUST hold BYPASSRLS (or be\n" +
+		"--                        SUPERUSER) so maintenance and MV refresh can read the\n" +
+		"--                        FORCE-RLS tables below.\n" +
+		"--   vyomanaut_app      : the microservice request-path role. LOGIN, NOSUPERUSER,\n" +
+		"--                        NOBYPASSRLS — fully subject to the Row Security Policies.\n" +
+		"--   vyomanaut_gc       : the garbage-collector role. LOGIN, NOSUPERUSER, NOBYPASSRLS.\n" +
+		"-- Passwords are set by the deployment (ALTER ROLE ... PASSWORD from a secrets\n" +
+		"-- store) — NEVER in this migration. Idempotent: guarded by pg_roles checks, and\n" +
+		"-- the defensive ALTERs below re-assert the security-critical attributes even if a\n" +
+		"-- role pre-exists from an older migration.\n" +
+		"-- [REF: ADR-032, DM §6]\n" +
 		"DO $$ BEGIN\n" +
 		"    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'vyomanaut_app') THEN\n" +
-		"        CREATE ROLE vyomanaut_app;\n" +
+		"        CREATE ROLE vyomanaut_app LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;\n" +
 		"    END IF;\n" +
 		"    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'vyomanaut_gc') THEN\n" +
-		"        CREATE ROLE vyomanaut_gc;\n" +
+		"        CREATE ROLE vyomanaut_gc LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;\n" +
+		"    END IF;\n" +
+		"END $$;\n" +
+		"-- Defensive assertion: abort the migration if either service role was provisioned\n" +
+		"-- with RLS-bypassing power. This is READ-ONLY (any role, including a non-superuser\n" +
+		"-- migrator, can execute it) and guarantees the append-only policies below cannot be\n" +
+		"-- silently defeated by a mis-provisioned role. We assert rather than ALTER because\n" +
+		"-- clearing the SUPERUSER attribute itself requires superuser — an assertion keeps\n" +
+		"-- the migration runnable by a least-privilege migrator while still failing loudly.\n" +
+		"DO $$ BEGIN\n" +
+		"    IF EXISTS (\n" +
+		"        SELECT 1 FROM pg_roles\n" +
+		"        WHERE rolname IN ('vyomanaut_app', 'vyomanaut_gc')\n" +
+		"          AND (rolsuper OR rolbypassrls)\n" +
+		"    ) THEN\n" +
+		"        RAISE EXCEPTION 'ADR-032 violation: vyomanaut_app and vyomanaut_gc must be "+
+		"NOSUPERUSER and NOBYPASSRLS (they are subject to the FORCE-RLS append-only policies)';\n" +
 		"    END IF;\n" +
 		"END $$;\n" +
 		"\n"
@@ -686,7 +715,11 @@ CREATE TYPE otp_purpose AS ENUM (
 		"-- No DELETE ever.\n" +
 		"CREATE TABLE audit_receipts (\n" +
 		"    -- ── Primary key ──────────────────────────────────────────────────────────\n" +
-		"    receipt_id              UUID            PRIMARY KEY DEFAULT gen_random_uuid(),\n" +
+		"    -- Partitioned by RANGE (server_challenge_ts) — see PARTITION BY clause and\n" +
+		"    -- ADR-033. Postgres requires the partition key in every UNIQUE/PK constraint,\n" +
+		"    -- so the primary key is the composite (receipt_id, server_challenge_ts),\n" +
+		"    -- declared in the constraints block below (not inline here).\n" +
+		"    receipt_id              UUID            NOT NULL DEFAULT gen_random_uuid(),\n" +
 		"\n" +
 		"    schema_version          SMALLINT        NOT NULL DEFAULT 1,\n" +
 		"\n" +
@@ -748,10 +781,18 @@ CREATE TYPE otp_purpose AS ENUM (
 		"    -- Set by GC on PENDING rows older than 48 hours. See DM §8.15.\n" +
 		"\n" +
 		"    -- ── Constraints ──────────────────────────────────────────────────────────\n" +
+		"    CONSTRAINT audit_receipts_pkey\n" +
+		"        PRIMARY KEY (receipt_id, server_challenge_ts),\n" +
+		"    -- Composite PK: partition key (server_challenge_ts) MUST be part of the PK on\n" +
+		"    -- a partitioned table (ADR-033). receipt_id remains globally unique in practice\n" +
+		"    -- (gen_random_uuid); the ts is appended only to satisfy the partition rule.\n" +
+		"\n" +
 		"    CONSTRAINT audit_receipts_nonce_unique\n" +
-		"        UNIQUE (challenge_nonce),\n" +
-		"    -- Prevents replay: a provider cannot re-submit a response to an\n" +
-		"    -- already-recorded challenge (ADR-015).\n" +
+		"        UNIQUE (challenge_nonce, server_challenge_ts),\n" +
+		"    -- LOCAL (per-partition) uniqueness. GLOBAL nonce uniqueness — the actual replay\n" +
+		"    -- guarantee (DM §3 Invariant 5) — is enforced by the non-partitioned\n" +
+		"    -- audit_receipt_nonces guard table below, which a partitioned table cannot\n" +
+		"    -- enforce on challenge_nonce alone (ADR-033).\n" +
 		"\n" +
 		"    CONSTRAINT audit_receipts_response_consistency CHECK (\n" +
 		"        (audit_result IN ('PASS', 'FAIL') AND response_hash IS NOT NULL AND provider_sig IS NOT NULL)\n" +
@@ -766,7 +807,63 @@ CREATE TYPE otp_purpose AS ENUM (
 		"    )\n" +
 		"    -- No FK to chunk_assignments: chunk_assignments may be soft-deleted while\n" +
 		"    -- audit_receipts must remain permanently (Invariant 1).\n" +
+		") PARTITION BY RANGE (server_challenge_ts);\n" +
+		"-- ADR-033: monthly RANGE partitioning. This is the mechanism that lets the\n" +
+		"-- append-only audit log be archived without a DML DELETE — old months are\n" +
+		"-- DETACHed (DDL), never row-deleted (which Invariant 1 forbids). Satisfies the\n" +
+		"-- DM §9 \"partition from day one\" mandate and the ADR-015 \"periodic archival\"\n" +
+		"-- trade-off (architecture.md §25).\n" +
+		"\n" +
+		"-- DEFAULT partition: at V2 scale (architecture.md §26: hundreds of providers, far\n" +
+		"-- below the audit ceiling) all rows land here and the table \"just works\". When\n" +
+		"-- volume grows, create monthly partitions AHEAD of time with\n" +
+		"-- vyomanaut_create_audit_receipts_partition() below, then DETACH old months to\n" +
+		"-- cold storage. Emitting a DEFAULT partition (rather than a NOW()-based monthly\n" +
+		"-- partition) keeps this migration deterministic. (ADR-033)\n" +
+		"CREATE TABLE audit_receipts_default PARTITION OF audit_receipts DEFAULT;\n" +
+		"\n" +
+		"-- ── audit_receipt_nonces — GLOBAL nonce-uniqueness guard (Invariant 5) ─────────\n" +
+		"-- A partitioned table cannot enforce global uniqueness on challenge_nonce alone\n" +
+		"-- (the unique key must include the partition key). This small, non-partitioned\n" +
+		"-- table holds the global replay-protection guarantee: the microservice INSERTs the\n" +
+		"-- nonce here in the SAME TRANSACTION as the receipt (IC §6, ADR-033). A duplicate\n" +
+		"-- nonce raises a PK violation and aborts the audit write — the replay is rejected.\n" +
+		"-- Retention is bounded: rows older than the challenge-validity / secret-rotation\n" +
+		"-- window may be pruned by the migrator, keeping this index small even at V3 scale\n" +
+		"-- (capacity.md). Pruning here is safe — an expired nonce can never be replayed.\n" +
+		"CREATE TABLE audit_receipt_nonces (\n" +
+		"    challenge_nonce      BYTEA        PRIMARY KEY CHECK (octet_length(challenge_nonce) = 33),\n" +
+		"    server_challenge_ts  TIMESTAMPTZ  NOT NULL\n" +
 		");\n" +
+		"COMMENT ON TABLE audit_receipt_nonces IS\n" +
+		"    'Global replay-protection guard for audit_receipts (DM §3 Invariant 5, ADR-033). '\n" +
+		"    'One row per challenge_nonce, written in the same txn as the receipt. Prunable by '\n" +
+		"    'server_challenge_ts once the challenge-validity window has passed.';\n" +
+		"\n" +
+		"-- ── Partition maintenance (ADR-033) ───────────────────────────────────────────\n" +
+		"-- Deterministic DDL helper: creates the monthly partition covering p_month. A\n" +
+		"-- scheduled maintenance job calls this for next month BEFORE its rows arrive, e.g.\n" +
+		"--   SELECT vyomanaut_create_audit_receipts_partition((date_trunc('month', now()) + interval '1 month')::date);\n" +
+		"-- Archival (once a month is closed and exported to cold storage):\n" +
+		"--   ALTER TABLE audit_receipts DETACH PARTITION audit_receipts_2026_01;  -- DDL, not DELETE\n" +
+		"-- We deliberately do NOT depend on pg_partman: it is a non-trusted extension and\n" +
+		"-- architecture.md §25.1 forbids re-introducing a rejected dependency without an ADR.\n" +
+		"CREATE OR REPLACE FUNCTION vyomanaut_create_audit_receipts_partition(p_month DATE)\n" +
+		"    RETURNS void\n" +
+		"    LANGUAGE plpgsql\n" +
+		"AS $$\n" +
+		"DECLARE\n" +
+		"    v_start DATE := date_trunc('month', p_month)::date;\n" +
+		"    v_end   DATE := (date_trunc('month', p_month) + INTERVAL '1 month')::date;\n" +
+		"    v_name  TEXT := format('audit_receipts_%s', to_char(v_start, 'YYYY_MM'));\n" +
+		"BEGIN\n" +
+		"    EXECUTE format(\n" +
+		"        'CREATE TABLE IF NOT EXISTS %I PARTITION OF audit_receipts "+
+		"FOR VALUES FROM (%L) TO (%L)',\n" +
+		"        v_name, v_start, v_end\n" +
+		"    );\n" +
+		"END;\n" +
+		"$$;\n" +
 		"\n" +
 		"-- Nightly data integrity check — must return 0:\n" +
 		"-- SELECT COUNT(*) FROM audit_receipts ar\n" +
@@ -1109,8 +1206,20 @@ CREATE TYPE otp_purpose AS ENUM (
 -- [REF: DM §6, IC §6, build.md Phase 4.6]
 
 -- ── audit_receipts — INSERT only (Invariant 1) ────────────────────────────────
--- [REF: DM §6, DM §3 Invariant 1, ADR-015, build.md Phase 4.6 Session 4.6.1]
+-- [REF: DM §6, DM §3 Invariant 1, ADR-015, ADR-032, build.md Phase 4.6 Session 4.6.1]
 ALTER TABLE audit_receipts ENABLE ROW LEVEL SECURITY;
+-- FORCE so the policies apply even to a role that OWNS the table. Without this,
+-- an owner (or superuser) silently bypasses append-only enforcement (ADR-032).
+ALTER TABLE audit_receipts FORCE  ROW LEVEL SECURITY;
+
+-- SELECT: the request path must read receipts (own-receipt lookups, and the row
+-- read that the two-phase UPDATE's WHERE clause performs under FORCE RLS — without
+-- a SELECT policy that UPDATE silently matches zero rows). (ADR-032)
+CREATE POLICY audit_receipts_app_select
+    ON audit_receipts
+    FOR SELECT
+    TO vyomanaut_app
+    USING (TRUE);
 
 -- Phase 1 of the two-phase write: the microservice inserts a PENDING receipt
 -- (audit_result = NULL) immediately after dispatching the challenge.
@@ -1158,12 +1267,30 @@ CREATE POLICY audit_receipts_gc_abandon
         audit_result IS NULL      -- GC never sets the result; only abandoned_at
     );
 
+-- SELECT for the GC role: the abandon UPDATE's USING/WHERE clause must be able to
+-- read the stale PENDING rows it targets under FORCE RLS. (ADR-032)
+CREATE POLICY audit_receipts_gc_select
+    ON audit_receipts
+    FOR SELECT
+    TO vyomanaut_gc
+    USING (TRUE);
+
 -- No DELETE policy is created. Any DELETE attempt — by any role — returns
 -- permission denied. No physical deletion is ever permitted (Invariant 1).
 
 -- ── escrow_events — INSERT only (Invariant 2) ─────────────────────────────────
--- [REF: DM §6, DM §3 Invariant 2, ADR-016, build.md Phase 4.6 Session 4.6.2]
+-- [REF: DM §6, DM §3 Invariant 2, ADR-016, ADR-032, build.md Phase 4.6 Session 4.6.2]
 ALTER TABLE escrow_events ENABLE ROW LEVEL SECURITY;
+-- FORCE so append-only holds even for a table owner (ADR-032).
+ALTER TABLE escrow_events FORCE  ROW LEVEL SECURITY;
+
+-- SELECT: the request path reads the ledger for idempotency-key checks and any
+-- direct balance queries that do not go through the materialised view. (ADR-032)
+CREATE POLICY escrow_events_app_select
+    ON escrow_events
+    FOR SELECT
+    TO vyomanaut_app
+    USING (TRUE);
 
 CREATE POLICY escrow_events_insert_only
     ON escrow_events
@@ -1182,8 +1309,19 @@ CREATE POLICY escrow_events_insert_only
 -- corrective control: physical deletion is never permitted again, for any
 -- role. The only way to retire a row is the existing soft-delete pattern
 -- (UPDATE status = 'DELETED', deleted_at = NOW()) — see IC §6.
--- [REF: DM §6, IC §6, ADR-007, build.md Phase 4.6 Session 4.6.3]
+-- [REF: DM §6, IC §6, ADR-007, ADR-032, build.md Phase 4.6 Session 4.6.3]
 ALTER TABLE chunk_assignments ENABLE ROW LEVEL SECURITY;
+-- FORCE so soft-delete-only holds even for a table owner (ADR-032).
+ALTER TABLE chunk_assignments FORCE  ROW LEVEL SECURITY;
+
+-- SELECT: the request path reads assignments constantly (assignment lookups,
+-- repair scheduling, dashboard) and the status UPDATE's WHERE clause must read
+-- the target row under FORCE RLS. (ADR-032)
+CREATE POLICY chunk_assignments_app_select
+    ON chunk_assignments
+    FOR SELECT
+    TO vyomanaut_app
+    USING (TRUE);
 
 -- Normal assignment creation: upload assignment and repair replacement.
 -- The is_vetting_chunk / segment_id / shard_index consistency contract
@@ -1215,6 +1353,27 @@ CREATE POLICY chunk_assignments_status_update
 -- vyomanaut_app — returns permission denied. This is the fix for the
 -- historical hard-delete incident: chunk_assignments rows are retired by
 -- UPDATE status = 'DELETED' only, never by physical DELETE.
+
+-- ── audit_receipt_nonces — INSERT only, replay-guard integrity ─────────────────
+-- The app writes nonces here (never deletes); the migrator prunes expired nonces
+-- out-of-band (BYPASSRLS). FORCE + insert-only means a compromised app credential
+-- cannot delete guard rows to enable a replay. (ADR-033, DM §3 Invariant 5)
+ALTER TABLE audit_receipt_nonces ENABLE ROW LEVEL SECURITY;
+ALTER TABLE audit_receipt_nonces FORCE  ROW LEVEL SECURITY;
+
+CREATE POLICY audit_receipt_nonces_app_select
+    ON audit_receipt_nonces
+    FOR SELECT
+    TO vyomanaut_app
+    USING (TRUE);
+
+CREATE POLICY audit_receipt_nonces_insert_only
+    ON audit_receipt_nonces
+    FOR INSERT
+    TO vyomanaut_app
+    WITH CHECK (TRUE);
+
+-- No UPDATE or DELETE policy. A nonce, once recorded, is immutable for the app.
 
 `
 
@@ -1367,6 +1526,53 @@ CREATE UNIQUE INDEX ON mv_segment_shard_counts (segment_id);
 -- required for REFRESH MATERIALIZED VIEW CONCURRENTLY (DM §9 checklist).
 `
 
+	// ── Grants (ADR-032) — profile-invariant ─────────────────────────────────────────
+	// Least-privilege, table-level access for the non-owning service roles. Emitted
+	// LAST so every table, view, and materialised view it references already exists.
+	// The RLS policies above further restrict row-level access on the three FORCE-RLS
+	// tables; these GRANTs are the coarse table-level gate. NO DELETE is granted on any
+	// table: audit_receipts / escrow_events / owner_escrow_events are append-only,
+	// providers are never physically deleted (Invariant 3), and files / chunk_assignments
+	// use soft-delete. vyomanaut_migrator needs no GRANTs — it owns every object.
+	// [REF: ADR-032, DM §3 Invariants 1–4, DM §6]
+	grantsSection := `-- ── Grants ────────────────────────────────────────────────────────────────────
+-- Least-privilege table grants for the non-owning service roles (ADR-032).
+-- No DELETE is granted anywhere.
+
+-- audit_receipts: INSERT (phase 1) + UPDATE (phase 2) + SELECT (read + FORCE-RLS
+-- WHERE evaluation). Row scope is further constrained by the policies above.
+GRANT SELECT, INSERT, UPDATE ON audit_receipts TO vyomanaut_app;
+GRANT SELECT, UPDATE          ON audit_receipts TO vyomanaut_gc;
+
+-- escrow_events: append-only ledger — INSERT + SELECT only.
+GRANT SELECT, INSERT ON escrow_events TO vyomanaut_app;
+
+-- audit_receipt_nonces: global replay guard — INSERT + SELECT only (ADR-033).
+GRANT SELECT, INSERT ON audit_receipt_nonces TO vyomanaut_app;
+
+-- chunk_assignments: INSERT + UPDATE (status/soft-delete) + SELECT.
+GRANT SELECT, INSERT, UPDATE ON chunk_assignments TO vyomanaut_app;
+
+-- Non-RLS mutable operational tables the request path reads and writes. No DELETE.
+GRANT SELECT, INSERT, UPDATE ON owners        TO vyomanaut_app;
+GRANT SELECT, INSERT, UPDATE ON providers     TO vyomanaut_app;
+GRANT SELECT, INSERT, UPDATE ON files         TO vyomanaut_app;
+GRANT SELECT, INSERT, UPDATE ON audit_periods TO vyomanaut_app;
+GRANT SELECT, INSERT, UPDATE ON repair_jobs   TO vyomanaut_app;
+
+-- Append-only / write-once tables: INSERT + SELECT only.
+GRANT SELECT, INSERT ON segments            TO vyomanaut_app;
+GRANT SELECT, INSERT ON owner_escrow_events TO vyomanaut_app;
+
+-- Read-only derived objects for dashboards and scheduling.
+GRANT SELECT ON active_chunk_assignments TO vyomanaut_app;
+GRANT SELECT ON mv_provider_scores         TO vyomanaut_app;
+GRANT SELECT ON mv_provider_escrow_balance TO vyomanaut_app;
+GRANT SELECT ON mv_owner_escrow_balance    TO vyomanaut_app;
+GRANT SELECT ON mv_segment_shard_counts    TO vyomanaut_app;
+
+`
+
 	return header +
 		extensions +
 		rolesSection +
@@ -1386,5 +1592,6 @@ CREATE UNIQUE INDEX ON mv_segment_shard_counts (segment_id);
 		indexesSection +
 		rspSection +
 		triggersSection +
-		viewsSection
+		viewsSection +
+		grantsSection
 }
