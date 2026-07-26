@@ -140,38 +140,32 @@ jobs:
         run: |
           psql --version
 
-          psql -v ON_ERROR_STOP=1 -d vyomanaut_test \
-            -c "CREATE EXTENSION IF NOT EXISTS btree_gist;"
+            psql -v ON_ERROR_STOP=1 -d vyomanaut_test \
+              -c "CREATE EXTENSION IF NOT EXISTS btree_gist;"
 
-          go run migrations/generator.go --profile=prod \
-            > /tmp/001_prod.sql
+            # vyomanaut_test gets the DEMO schema — this is the database go test's
+            # default PGDATABASE targets, and DemoProfile is what nearly every live-DB
+            # test fixture (repair, scoring, audit) constructs its assertions against.
+            go run migrations/generator.go --profile=demo \
+              > /tmp/001_demo.sql
+            psql -v ON_ERROR_STOP=1 -d vyomanaut_test \
+              -f /tmp/001_demo.sql
 
-          psql -v ON_ERROR_STOP=1 -d vyomanaut_test \
-            -f /tmp/001_prod.sql
-          
-          # Service roles are created with no password by the migration itself
-          # (ADR-032 §"Passwords ... set by the deployment"). CI needs one so
-          # migration_check.sh and go test's live-DB paths can authenticate.
+            psql -v ON_ERROR_STOP=1 -d vyomanaut_test -c \
+              "ALTER ROLE vyomanaut_app WITH PASSWORD 'testpass';
+              ALTER ROLE vyomanaut_gc  WITH PASSWORD 'testpass';"
 
-          psql -v ON_ERROR_STOP=1 -d vyomanaut_test -c \
-            "ALTER ROLE vyomanaut_app WITH PASSWORD 'testpass';
-            ALTER ROLE vyomanaut_gc  WITH PASSWORD 'testpass';"
+            bash scripts/ci/migration_check.sh
 
-          bash scripts/ci/migration_check.sh
-
-                go run migrations/generator.go --profile=demo \
-                  > /tmp/001_demo.sql
-
-          # Demo schema is applied to a separate database.
-          # Each GitHub Actions run gets a fresh PostgreSQL service container.
-          psql -v ON_ERROR_STOP=1 -d vyomanaut_test \
-            -c "CREATE DATABASE vyomanaut_demo_test;"
-
-          psql -v ON_ERROR_STOP=1 -d vyomanaut_demo_test \
-            -c "CREATE EXTENSION IF NOT EXISTS btree_gist;"
-
-          psql -v ON_ERROR_STOP=1 -d vyomanaut_demo_test \
-            -f /tmp/001_demo.sql
+            # Prod schema is now a structural smoke test only — prove it applies
+            # cleanly, on a throwaway database go test never connects to.
+            go run migrations/generator.go --profile=prod \
+              > /tmp/001_prod.sql
+            psql -v ON_ERROR_STOP=1 -c "CREATE DATABASE vyomanaut_prod_smoketest;"
+            psql -v ON_ERROR_STOP=1 -d vyomanaut_prod_smoketest \
+              -c "CREATE EXTENSION IF NOT EXISTS btree_gist;"
+            psql -v ON_ERROR_STOP=1 -d vyomanaut_prod_smoketest \
+              -f /tmp/001_prod.sql
 
       # ─────────────────────────────────────────────────────────────
       # check-04: Tests with race detector

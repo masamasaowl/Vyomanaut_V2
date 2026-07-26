@@ -1537,7 +1537,7 @@ CREATE UNIQUE INDEX ON mv_segment_shard_counts (segment_id);
 	// [REF: ADR-032, DM §3 Invariants 1–4, DM §6]
 	grantsSection := `-- ── Grants ────────────────────────────────────────────────────────────────────
 -- Least-privilege table grants for the non-owning service roles (ADR-032).
--- No DELETE is granted anywhere.
+-- No DELETE is granted anywhere, EXCEPT pending_registrations (see below).
 
 -- audit_receipts: INSERT (phase 1) + UPDATE (phase 2) + SELECT (read + FORCE-RLS
 -- WHERE evaluation). Row scope is further constrained by the policies above.
@@ -1549,6 +1549,23 @@ GRANT SELECT, INSERT ON escrow_events TO vyomanaut_app;
 
 -- audit_receipt_nonces: global replay guard — INSERT + SELECT only (ADR-033).
 GRANT SELECT, INSERT ON audit_receipt_nonces TO vyomanaut_app;
+
+-- otp_codes (build.md Milestone 11 Phase 11.4): OTP send INSERTs a fresh row;
+-- the rate-limit check and the verify lookup both SELECT (COUNT WHERE
+-- created_at > NOW() - interval, and "most recent unconsumed, unexpired code");
+-- verify UPDATEs consumed_at on success. Never DELETEd -- rows are
+-- soft-consumed, not removed; this is NOT an ADR-032 append-only/invariant
+-- table, it just happens to have no delete path in the current design.
+GRANT SELECT, INSERT, UPDATE ON otp_codes TO vyomanaut_app;
+
+-- pending_registrations (build.md Milestone 11 Phase 11.4/11.5): written once
+-- at OTP-verify time, read once and DELETEd by whichever register endpoint
+-- redeems it (see the table's own doc comment: "deleted on redemption").
+-- This is ordinary session-bridge state, not an ADR-032 append-only ledger,
+-- so DELETE is legitimately granted here -- it is not covered by the "no
+-- DELETE anywhere" rule, which applies specifically to audit_receipts,
+-- escrow_events, owner_escrow_events, and the soft-delete-only tables.
+GRANT SELECT, INSERT, DELETE ON pending_registrations TO vyomanaut_app;
 
 -- chunk_assignments: INSERT + UPDATE (status/soft-delete) + SELECT.
 GRANT SELECT, INSERT, UPDATE ON chunk_assignments TO vyomanaut_app;
