@@ -57,8 +57,12 @@ type wiskeyStore struct {
 	vlogHead uint64
 
 	// isRotational is true for HDD-backed storage, false for SSD.
-	// Affects monitoring metrics and GC I/O scheduling only; all core
-	// vLog read/write paths are storage-medium-agnostic (ARCH §16).
+	// Captured at construction (via isRotationalDevice) for future GC I/O
+	// scheduling / monitoring-metrics differentiation (ARCH §16); as of M5,
+	// no code path in this package actually reads this field yet — see M5
+	// review §5. Core vLog read/write paths are storage-medium-agnostic
+	// regardless, so this is a forward-looking placeholder, not a
+	// currently-enforced behavioural difference.
 	isRotational bool
 }
 
