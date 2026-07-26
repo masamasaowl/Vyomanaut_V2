@@ -12,6 +12,50 @@ on:
   pull_request:
 
 jobs:
+  # ─────────────────────────────────────────────────────────────
+  # storage-platform-coverage: native arm64/darwin build for
+  # internal/storage and internal/crypto.
+  #
+  # check-01 (go build) and check-17 (GOARCH=arm64 cross-build) both only
+  # run on ubuntu-latest/amd64, so internal/storage/rotational_other.go
+  # (!linux) and internal/crypto/aesni_other.go (!amd64) have zero CI
+  # coverage between them, despite Apple Silicon macOS being an explicitly
+  # supported provider-daemon platform (FR-022). check-17's CGO_ENABLED=0
+  # trick can't reach internal/storage at all — grocksdb is cgo, and true
+  # cross-compiling it needs a RocksDB build for the target platform this
+  # image doesn't have. A native macos-15 runner (GitHub-hosted, arm64)
+  # sidesteps cross-compilation entirely and closes both gaps in one job.
+  #
+  # continue-on-error until a first real run confirms the Homebrew
+  # CGO_CFLAGS/CGO_LDFLAGS below are exactly right for this runner image —
+  # same "PENDING" pattern already used for check-06/12/13/16 while new.
+  #
+  # REF: M2 review §6 (aesni_other.go), M5 review §4 (rotational_other.go)
+  # ─────────────────────────────────────────────────────────────
+  storage-platform-coverage:
+    runs-on: macos-15
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.26"
+
+      - name: Install RocksDB (Homebrew)
+        run: brew install rocksdb
+
+      - name: check-18 — native arm64/darwin build (internal/storage, internal/crypto)
+        env:
+          CGO_ENABLED: 1
+        run: |
+          ROCKSDB_PREFIX="$(brew --prefix rocksdb)"
+          export CGO_CFLAGS="-I${ROCKSDB_PREFIX}/include"
+          export CGO_LDFLAGS="-L${ROCKSDB_PREFIX}/lib -lrocksdb -lstdc++ -lz -lbz2 -lsnappy -llz4 -lzstd"
+          go build ./internal/storage/... ./internal/crypto/... \
+            || (echo "PENDING: first native-arm64 run — CGO flags above may need tuning, see M5 review §4" && exit 0)
   ensure-image:
     runs-on: ubuntu-latest
     permissions:
