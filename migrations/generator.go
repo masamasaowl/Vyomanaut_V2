@@ -1565,7 +1565,7 @@ GRANT SELECT, INSERT, UPDATE ON otp_codes TO vyomanaut_app;
 -- so DELETE is legitimately granted here -- it is not covered by the "no
 -- DELETE anywhere" rule, which applies specifically to audit_receipts,
 -- escrow_events, owner_escrow_events, and the soft-delete-only tables.
-GRANT SELECT, INSERT, DELETE ON pending_registrations TO vyomanaut_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON pending_registrations TO vyomanaut_app;
 
 -- chunk_assignments: INSERT + UPDATE (status/soft-delete) + SELECT.
 GRANT SELECT, INSERT, UPDATE ON chunk_assignments TO vyomanaut_app;
