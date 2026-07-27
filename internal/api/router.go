@@ -151,17 +151,24 @@ func NewRouter(cfg RouterConfig) *http.ServeMux {
 	} else {
 		mux.Handle("POST /api/v1/owner/withdraw", owner(stub501))
 	}
-	mux.Handle("POST /api/v1/provider/register", bearerAny(http.HandlerFunc(stub501)))       // registerProvider
-	mux.Handle("POST /api/v1/provider/heartbeat", provider(stub501))                         // providerHeartbeat
-	mux.HandleFunc("POST /api/v1/provider/token/refresh", tokenRefreshHandler.HandleRefresh) // refreshProviderToken — its own two-factor auth, not bearerAuthRole
-	mux.Handle("GET /api/v1/provider/{provider_id}/status", provider(stub501))               // getProviderStatus
-	mux.Handle("GET /api/v1/provider/receipts", provider(stub501))                           // listProviderReceipts
-	mux.Handle("POST /api/v1/provider/downtime", provider(stub501))                          // announceDowntime
+	providerRegisterHandler := NewProviderRegisterHandler(cfg.DB, cfg.JWTPrivateKey, cfg.Profile)
+	providerHeartbeatHandler := NewProviderHeartbeatHandler(cfg.DB, cfg.JWTPrivateKey)
+	providerStatusHandler := NewProviderStatusHandler(cfg.DB, cfg.Profile, cfg.PaymentProvider)
+	providerReceiptsHandler := NewProviderReceiptsHandler(cfg.DB)
+	providerDowntimeHandler := NewProviderDowntimeHandler(cfg.DB, cfg.Profile)
+	providerDepartHandler := NewProviderDepartHandler(cfg.DB, cfg.Profile, cfg.PaymentProvider)
+
+	mux.Handle("POST /api/v1/provider/register", bearerAny(http.HandlerFunc(providerRegisterHandler.HandleRegister))) // registerProvider
+	mux.Handle("POST /api/v1/provider/heartbeat", provider(providerHeartbeatHandler.HandleHeartbeat))                 // providerHeartbeat
+	mux.HandleFunc("POST /api/v1/provider/token/refresh", tokenRefreshHandler.HandleRefresh)                         // refreshProviderToken — its own two-factor auth, not bearerAuthRole
+	mux.Handle("GET /api/v1/provider/{provider_id}/status", provider(providerStatusHandler.HandleStatus))            // getProviderStatus
+	mux.Handle("GET /api/v1/provider/receipts", provider(providerReceiptsHandler.HandleReceipts))                    // listProviderReceipts
+	mux.Handle("POST /api/v1/provider/downtime", provider(providerDowntimeHandler.HandleAnnounce))                   // announceDowntime
 	// GET /api/v1/provider/downtime (getActiveDowntime): BLOCKED — not yet in
 	// openapi.yaml (flagged gap, this file's header comment). Not registered
-	// until the OAS path exists; Session 11.6.5 implements the handler logic
-	// directly-testably in the meantime.
-	mux.Handle("POST /api/v1/provider/depart", provider(stub501))    // announceDeparture
+	// until the OAS path exists; ProviderDowntimeHandler.HandleGetActive
+	// implements the handler logic directly-testably in the meantime.
+	mux.Handle("POST /api/v1/provider/depart", provider(providerDepartHandler.HandleDepart)) // announceDeparture
 	mux.Handle("POST /api/v1/upload/assign", owner(stub501))         // assignUpload
 	mux.Handle("POST /api/v1/file/register", owner(stub501))         // registerFile
 	mux.Handle("GET /api/v1/file/{file_id}/pointer", owner(stub501)) // getPointerFile
