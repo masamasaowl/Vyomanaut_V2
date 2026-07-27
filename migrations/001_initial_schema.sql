@@ -1,5 +1,5 @@
 -- Generated for profile: prod
--- Generated at: 2026-07-27T13:39:00Z
+-- Generated at: 2026-07-27T15:47:48Z
 -- ShardSize: 262144 (compile-time constant; NOT profile-variable)
 -- DataShards: 16
 -- TotalShards: 56
@@ -262,6 +262,16 @@ CREATE TABLE providers (
     last_token_refresh_at   TIMESTAMPTZ,
     -- NULL until the first successful POST /api/v1/provider/token/refresh.
     -- Enforces "one successful refresh per 30 minutes per provider_id" (OAS).
+
+    -- ── Promised downtime (build.md Milestone 11 Phase 11.6 Session 11.6.5) ────
+    promised_return_at      TIMESTAMPTZ,
+    -- NULL when no downtime window is open. Set by POST /api/v1/provider/downtime
+    -- to NOW() + [0, profile.PromisedDowntimeMaximum]; cleared on the next
+    -- successful heartbeat or once overrun (FR-032, FR-033, ADR-007). IC §9's own
+    -- 'UPDATE promised_return_at' row already assumed this column existed; it did
+    -- not, in either data-model.md §4.2 or this file, until this session added it —
+    -- the same kind of mid-build schema addition already made for
+    -- last_token_refresh_at above.
 
     -- ── Timestamps ───────────────────────────────────────────────────────────
     created_at              TIMESTAMPTZ     NOT NULL DEFAULT NOW(),

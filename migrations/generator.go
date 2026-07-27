@@ -389,6 +389,16 @@ CREATE TYPE otp_purpose AS ENUM (
 		"    -- NULL until the first successful POST /api/v1/provider/token/refresh.\n" +
 		"    -- Enforces \"one successful refresh per 30 minutes per provider_id\" (OAS).\n" +
 		"\n" +
+		"    -- ── Promised downtime (build.md Milestone 11 Phase 11.6 Session 11.6.5) ────\n" +
+		"    promised_return_at      TIMESTAMPTZ,\n" +
+		"    -- NULL when no downtime window is open. Set by POST /api/v1/provider/downtime\n" +
+		"    -- to NOW() + [0, profile.PromisedDowntimeMaximum]; cleared on the next\n" +
+		"    -- successful heartbeat or once overrun (FR-032, FR-033, ADR-007). IC §9's own\n" +
+		"    -- 'UPDATE promised_return_at' row already assumed this column existed; it did\n" +
+		"    -- not, in either data-model.md §4.2 or this file, until this session added it —\n" +
+		"    -- the same kind of mid-build schema addition already made for\n" +
+		"    -- last_token_refresh_at above.\n" +
+		"\n" +
 		"    -- ── Timestamps ───────────────────────────────────────────────────────────\n" +
 		"    created_at              TIMESTAMPTZ     NOT NULL DEFAULT NOW(),\n" +
 		"\n" +
