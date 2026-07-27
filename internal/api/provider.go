@@ -55,6 +55,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"regexp"
 	"sort"
@@ -70,6 +71,9 @@ import (
 	"github.com/masamasaowl/Vyomanaut_V2/internal/payment"
 	"github.com/masamasaowl/Vyomanaut_V2/internal/repair"
 )
+
+// A named constant for decodeReceiptsCursor
+const receiptCursorParts = 2
 
 // ── Shared signing-input helpers ─────────────────────────────────────────
 
@@ -409,7 +413,13 @@ func assignDemoASN(ctx context.Context, db *sql.DB, n int) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("api: assignDemoASN: query usage: %w", err)
 	}
-	defer rows.Close()
+
+	defer func() {
+		if err := rows.Close(); err != nil {
+			slog.Error("assignDemoASN: close rows", "error", err)
+		}
+	}()
+
 	for rows.Next() {
 		var asn string
 		var count int
@@ -658,7 +668,7 @@ func (h *ProviderStatusHandler) HandleStatus(w http.ResponseWriter, r *http.Requ
 	}
 
 	var (
-		status                                string
+		status                                 string
 		region, asn                            string
 		consecutiveAuditPasses                 int
 		lastHeartbeatTS                        sql.NullTime
@@ -935,18 +945,23 @@ func (h *ProviderReceiptsHandler) HandleReceipts(w http.ResponseWriter, r *http.
 		WriteError(w, http.StatusInternalServerError, ErrInternal, "query failed", nil, "", nil)
 		return
 	}
-	defer rows.Close()
+
+	defer func() {
+		if err := rows.Close(); err != nil {
+			slog.Error("HandleReceipts: close rows", "error", err)
+		}
+	}()
 
 	items := make([]auditReceiptListItem, 0, limit)
 	for rows.Next() {
 		var (
-			item                                     auditReceiptListItem
-			chunkIDRaw, nonceRaw                      []byte
+			item                                       auditReceiptListItem
+			chunkIDRaw, nonceRaw                       []byte
 			responseHashRaw, providerSigRaw, svcSigRaw []byte
-			fileID                                    uuid.NullUUID
-			auditResult                               sql.NullString
-			responseLatency                           sql.NullInt64
-			svcCountersignTS                          sql.NullTime
+			fileID                                     uuid.NullUUID
+			auditResult                                sql.NullString
+			responseLatency                            sql.NullInt64
+			svcCountersignTS                           sql.NullTime
 		)
 		if err := rows.Scan(&item.ReceiptID, &chunkIDRaw, &fileID, &nonceRaw, &item.ServerChallengeTS,
 			&responseHashRaw, &responseLatency, &auditResult, &item.AddressWasStale,
@@ -1013,8 +1028,8 @@ func decodeReceiptsCursor(cursor string) (time.Time, uuid.UUID, error) {
 	if err != nil {
 		return time.Time{}, uuid.UUID{}, fmt.Errorf("api: decodeReceiptsCursor: %w", err)
 	}
-	parts := strings.SplitN(string(raw), ":", 2)
-	if len(parts) != 2 {
+	parts := strings.SplitN(string(raw), ":", receiptCursorParts)
+	if len(parts) != receiptCursorParts {
 		return time.Time{}, uuid.UUID{}, fmt.Errorf("api: decodeReceiptsCursor: malformed")
 	}
 	nanos, err := strconv.ParseInt(parts[0], 10, 64)
@@ -1209,7 +1224,7 @@ type providerDepartRequestBody struct {
 }
 
 type providerDepartResponseBody struct {
-	Status            string `json:"status"`
+	Status             string `json:"status"`
 	EscrowReleasePaise int64  `json:"escrow_release_paise"`
 	RepairJobsQueued   int    `json:"repair_jobs_queued"`
 }

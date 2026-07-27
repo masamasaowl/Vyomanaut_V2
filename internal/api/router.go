@@ -160,19 +160,19 @@ func NewRouter(cfg RouterConfig) *http.ServeMux {
 
 	mux.Handle("POST /api/v1/provider/register", bearerAny(http.HandlerFunc(providerRegisterHandler.HandleRegister))) // registerProvider
 	mux.Handle("POST /api/v1/provider/heartbeat", provider(providerHeartbeatHandler.HandleHeartbeat))                 // providerHeartbeat
-	mux.HandleFunc("POST /api/v1/provider/token/refresh", tokenRefreshHandler.HandleRefresh)                         // refreshProviderToken — its own two-factor auth, not bearerAuthRole
-	mux.Handle("GET /api/v1/provider/{provider_id}/status", provider(providerStatusHandler.HandleStatus))            // getProviderStatus
-	mux.Handle("GET /api/v1/provider/receipts", provider(providerReceiptsHandler.HandleReceipts))                    // listProviderReceipts
-	mux.Handle("POST /api/v1/provider/downtime", provider(providerDowntimeHandler.HandleAnnounce))                   // announceDowntime
+	mux.HandleFunc("POST /api/v1/provider/token/refresh", tokenRefreshHandler.HandleRefresh)                          // refreshProviderToken — its own two-factor auth, not bearerAuthRole
+	mux.Handle("GET /api/v1/provider/{provider_id}/status", provider(providerStatusHandler.HandleStatus))             // getProviderStatus
+	mux.Handle("GET /api/v1/provider/receipts", provider(providerReceiptsHandler.HandleReceipts))                     // listProviderReceipts
+	mux.Handle("POST /api/v1/provider/downtime", provider(providerDowntimeHandler.HandleAnnounce))                    // announceDowntime
 	// GET /api/v1/provider/downtime (getActiveDowntime): BLOCKED — not yet in
 	// openapi.yaml (flagged gap, this file's header comment). Not registered
 	// until the OAS path exists; ProviderDowntimeHandler.HandleGetActive
 	// implements the handler logic directly-testably in the meantime.
 	mux.Handle("POST /api/v1/provider/depart", provider(providerDepartHandler.HandleDepart)) // announceDeparture
-	mux.Handle("POST /api/v1/upload/assign", owner(stub501))         // assignUpload
-	mux.Handle("POST /api/v1/file/register", owner(stub501))         // registerFile
-	mux.Handle("GET /api/v1/file/{file_id}/pointer", owner(stub501)) // getPointerFile
-	mux.Handle("DELETE /api/v1/file/{file_id}", owner(stub501))      // deleteFile
+	mux.Handle("POST /api/v1/upload/assign", owner(stub501))                                 // assignUpload
+	mux.Handle("POST /api/v1/file/register", owner(stub501))                                 // registerFile
+	mux.Handle("GET /api/v1/file/{file_id}/pointer", owner(stub501))                         // getPointerFile
+	mux.Handle("DELETE /api/v1/file/{file_id}", owner(stub501))                              // deleteFile
 
 	// ── AdminApiKey routes ──────────────────────────────────────────────────
 	mux.Handle("POST /api/v1/audit/challenge", admin(stub501)) // dispatchAuditChallenge
