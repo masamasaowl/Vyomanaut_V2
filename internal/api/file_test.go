@@ -75,12 +75,12 @@ func TestFileRegisterSucceeds(t *testing.T) {
 	insertPlaceholderFile(t, db, fileID, ownerID, 2048)
 
 	req := fileRegisterRequestBody{
-		FileID:             fileID,
-		PointerCiphertext:  base64.StdEncoding.EncodeToString([]byte("ciphertext-bytes")),
-		PointerNonce:       base64.StdEncoding.EncodeToString(make([]byte, 12)),
-		PointerTag:         base64.StdEncoding.EncodeToString(make([]byte, 16)),
-		OriginalSizeBytes:  2048,
-		SchemaVersion:      1,
+		FileID:            fileID,
+		PointerCiphertext: base64.StdEncoding.EncodeToString([]byte("ciphertext-bytes")),
+		PointerNonce:      base64.StdEncoding.EncodeToString(make([]byte, 12)),
+		PointerTag:        base64.StdEncoding.EncodeToString(make([]byte, 16)),
+		OriginalSizeBytes: 2048,
+		SchemaVersion:     1,
 	}
 	req = signFileRegisterRequest(t, priv, req)
 	body, _ := json.Marshal(req)
@@ -226,7 +226,7 @@ func TestPointerFileReturnsCiphertextFieldsVerbatim(t *testing.T) {
 	req := fileRegisterRequestBody{
 		FileID:            fileID,
 		PointerCiphertext: base64.StdEncoding.EncodeToString([]byte("exact-pointer-bytes")),
-		PointerNonce:      base64.StdEncoding.EncodeToString([]byte("123456789012")), // 12 bytes
+		PointerNonce:      base64.StdEncoding.EncodeToString([]byte("123456789012")),     // 12 bytes
 		PointerTag:        base64.StdEncoding.EncodeToString([]byte("1234567890123456")), // 16 bytes
 		OriginalSizeBytes: 4096,
 		SchemaVersion:     1,

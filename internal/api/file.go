@@ -65,19 +65,25 @@ import (
 	"github.com/masamasaowl/Vyomanaut_V2/internal/config"
 )
 
+// Named constants for crypto
+const (
+	aesGCMNonceSize = 12
+	aesGCMTagSize   = 16
+)
+
 // ── Session 11.7.2 — File Register ──────────────────────────────────────
 
 type fileRegisterRequestBody struct {
-	FileID                 uuid.UUID `json:"file_id"`
-	PointerCiphertext      string    `json:"pointer_ciphertext"` // base64
-	PointerNonce           string    `json:"pointer_nonce"`      // base64, 12 bytes
-	PointerTag             string    `json:"pointer_tag"`        // base64, 16 bytes
-	OriginalSizeBytes      int64     `json:"original_size_bytes"`
-	DisplayNameCiphertext  *string   `json:"display_name_ciphertext"` // base64, optional
-	DisplayNameNonce       *string   `json:"display_name_nonce"`      // base64, optional, 12 bytes
-	DisplayNameTag         *string   `json:"display_name_tag"`        // base64, optional, 16 bytes
-	SchemaVersion          int       `json:"schema_version"`
-	OwnerSig               string    `json:"owner_sig"` // hex, Ed25519Signature
+	FileID                uuid.UUID `json:"file_id"`
+	PointerCiphertext     string    `json:"pointer_ciphertext"` // base64
+	PointerNonce          string    `json:"pointer_nonce"`      // base64, 12 bytes
+	PointerTag            string    `json:"pointer_tag"`        // base64, 16 bytes
+	OriginalSizeBytes     int64     `json:"original_size_bytes"`
+	DisplayNameCiphertext *string   `json:"display_name_ciphertext"` // base64, optional
+	DisplayNameNonce      *string   `json:"display_name_nonce"`      // base64, optional, 12 bytes
+	DisplayNameTag        *string   `json:"display_name_tag"`        // base64, optional, 16 bytes
+	SchemaVersion         int       `json:"schema_version"`
+	OwnerSig              string    `json:"owner_sig"` // hex, Ed25519Signature
 }
 
 type fileRegisterResponseBody struct {
@@ -116,7 +122,7 @@ func canonicalFileRegisterSigningInput(req fileRegisterRequestBody) []byte {
 // jstrInt and jstrInt64 render bare (unquoted) JSON integers for use as a
 // signingField.value, matching canonicalRegisterSigningInput's
 // declared_storage_gb treatment in provider.go.
-func jstrInt(n int) string   { return jstrInt64(int64(n)) }
+func jstrInt(n int) string { return jstrInt64(int64(n)) }
 func jstrInt64(n int64) string {
 	b, _ := json.Marshal(n)
 	return string(b)
@@ -153,11 +159,11 @@ func (h *FileRegisterHandler) HandleRegister(w http.ResponseWriter, r *http.Requ
 	if !ok {
 		return
 	}
-	pointerNonce, ok := decodeBase64Field(w, "pointer_nonce", req.PointerNonce, 12)
+	pointerNonce, ok := decodeBase64Field(w, "pointer_nonce", req.PointerNonce, aesGCMNonceSize)
 	if !ok {
 		return
 	}
-	pointerTag, ok := decodeBase64Field(w, "pointer_tag", req.PointerTag, 16)
+	pointerTag, ok := decodeBase64Field(w, "pointer_tag", req.PointerTag, aesGCMTagSize)
 	if !ok {
 		return
 	}
@@ -169,13 +175,13 @@ func (h *FileRegisterHandler) HandleRegister(w http.ResponseWriter, r *http.Requ
 		}
 	}
 	if req.DisplayNameNonce != nil {
-		displayNameNonce, ok = decodeBase64Field(w, "display_name_nonce", *req.DisplayNameNonce, 12)
+		displayNameNonce, ok = decodeBase64Field(w, "display_name_nonce", *req.DisplayNameNonce, aesGCMNonceSize)
 		if !ok {
 			return
 		}
 	}
 	if req.DisplayNameTag != nil {
-		displayNameTag, ok = decodeBase64Field(w, "display_name_tag", *req.DisplayNameTag, 16)
+		displayNameTag, ok = decodeBase64Field(w, "display_name_tag", *req.DisplayNameTag, aesGCMTagSize)
 		if !ok {
 			return
 		}
@@ -281,15 +287,15 @@ func nullableBytes(b []byte) any {
 // ── Session 11.7.3 — Pointer File Retrieval ─────────────────────────────
 
 type pointerFileResponseBody struct {
-	FileID                 uuid.UUID `json:"file_id"`
-	PointerCiphertext      string    `json:"pointer_ciphertext"`
-	PointerNonce           string    `json:"pointer_nonce"`
-	PointerTag             string    `json:"pointer_tag"`
-	SchemaVersion          int       `json:"schema_version"`
-	OriginalSizeBytes      int64     `json:"original_size_bytes"`
-	DisplayNameCiphertext  *string   `json:"display_name_ciphertext,omitempty"`
-	DisplayNameNonce       *string   `json:"display_name_nonce,omitempty"`
-	DisplayNameTag         *string   `json:"display_name_tag,omitempty"`
+	FileID                uuid.UUID `json:"file_id"`
+	PointerCiphertext     string    `json:"pointer_ciphertext"`
+	PointerNonce          string    `json:"pointer_nonce"`
+	PointerTag            string    `json:"pointer_tag"`
+	SchemaVersion         int       `json:"schema_version"`
+	OriginalSizeBytes     int64     `json:"original_size_bytes"`
+	DisplayNameCiphertext *string   `json:"display_name_ciphertext,omitempty"`
+	DisplayNameNonce      *string   `json:"display_name_nonce,omitempty"`
+	DisplayNameTag        *string   `json:"display_name_tag,omitempty"`
 }
 
 // PointerFileHandler serves GET /api/v1/file/{file_id}/pointer. The

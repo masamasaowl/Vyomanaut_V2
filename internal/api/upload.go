@@ -75,6 +75,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -91,6 +92,10 @@ const (
 	capabilityTokenDomainPrefix = "vyomanaut-chunk-upload-cap-v1"
 	capabilityTokenLifetime     = 1 * time.Hour
 	capabilityTokenByteLen      = 72 // 8-byte expiry_unix_ms || 64-byte Ed25519 signature
+
+	// Constants for the fixed binary sizes
+	sha256Size = 32
+	uint64Size = 8
 )
 
 // generateCapabilityToken implements IC §4.1's exact byte layout:
@@ -108,7 +113,7 @@ func generateCapabilityToken(msSigningKey ed25519.PrivateKey, chunkID [32]byte, 
 	var expiryBytes [8]byte
 	binary.BigEndian.PutUint64(expiryBytes[:], uint64(expiryUnixMs))
 
-	input := make([]byte, 0, len(capabilityTokenDomainPrefix)+32+16+16+8)
+	input := make([]byte, 0, len(capabilityTokenDomainPrefix)+sha256Size+len(providerID)+len(fileID)+uint64Size)
 	input = append(input, []byte(capabilityTokenDomainPrefix)...)
 	input = append(input, chunkID[:]...)
 	input = append(input, providerID[:]...)
@@ -126,9 +131,9 @@ func generateCapabilityToken(msSigningKey ed25519.PrivateKey, chunkID [32]byte, 
 // ── Request/response bodies ─────────────────────────────────────────────
 
 type uploadAssignRequestBody struct {
-	FileID             uuid.UUID `json:"file_id"`
-	NumSegments        int       `json:"num_segments"`
-	OriginalSizeBytes  int64     `json:"original_size_bytes"`
+	FileID            uuid.UUID `json:"file_id"`
+	NumSegments       int       `json:"num_segments"`
+	OriginalSizeBytes int64     `json:"original_size_bytes"`
 }
 
 // ShardAssignmentBody mirrors OAS ShardAssignment, plus ChunkID — see this
@@ -270,8 +275,8 @@ func (h *UploadAssignHandler) HandleAssign(w http.ResponseWriter, r *http.Reques
 // real values and uses pointer_ciphertext's emptiness as the "not yet
 // registered" signal (see that file's header for the full reasoning).
 func (h *UploadAssignHandler) createPlaceholderFile(ctx context.Context, fileID, ownerID uuid.UUID, originalSizeBytes int64) error {
-	placeholderNonce := make([]byte, 12)
-	placeholderTag := make([]byte, 16)
+	placeholderNonce := make([]byte, aesGCMNonceSize)
+	placeholderTag := make([]byte, aesGCMTagSize)
 	_, err := h.db.ExecContext(ctx, `
 		INSERT INTO files (file_id, owner_id, pointer_ciphertext, pointer_nonce, pointer_tag, original_size_bytes)
 		VALUES ($1, $2, ''::bytea, $3, $4, $5)`,
@@ -380,7 +385,12 @@ func (h *UploadAssignHandler) loadExistingAssignments(ctx context.Context, fileI
 	if err != nil {
 		return nil, fmt.Errorf("api: loadExistingAssignments: %w", err)
 	}
-	defer rows.Close()
+
+	defer func() {
+		if err := rows.Close(); err != nil {
+			slog.Error("loadExistingAssignments: close rows", "error", err)
+		}
+	}()
 
 	var out []existingShardRow
 	for rows.Next() {

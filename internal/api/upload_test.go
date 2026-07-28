@@ -256,7 +256,11 @@ func otherActiveProviderIDs(t *testing.T, db *sql.DB, excludeASNs ...string) []u
 	if err != nil {
 		t.Fatalf("query other active providers: %v", err)
 	}
-	defer rows.Close()
+	defer func() {
+		if err := rows.Close(); err != nil {
+			t.Fatalf("close rows: %v", err)
+		}
+	}()
 	var ids []uuid.UUID
 	for rows.Next() {
 		var id uuid.UUID
