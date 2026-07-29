@@ -547,3 +547,53 @@ func TestHandlePutGrowsRoutingTable(t *testing.T) {
 			"addToRoutingTable is still only reachable from Bootstrap's own seed list")
 	}
 }
+
+// TestHandleGetRespectsZeroMaxCount verifies that a GET_PROVIDERS request
+// with maxCount=0 returns zero results even when a matching record exists
+// locally. Unreachable through the exported FindProviders API (which
+// rejects maxCount <= 0 before ever sending a frame), so this hand-crafts
+// the wire request the way an adversarial or buggy peer could.
+// [REF: M6 review §5.6]
+func TestHandleGetRespectsZeroMaxCount(t *testing.T) {
+	serverHost := buildTestHost(t)
+	dht := buildTestDHT(t, serverHost)
+
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i + 3)
+	}
+	if err := dht.PutProviderRecord(context.Background(), key); err != nil {
+		t.Fatalf("PutProviderRecord: %v", err)
+	}
+
+	clientHost := buildTestHost(t)
+	addr, err := ParseMultiaddr("/ip4/127.0.0.1/tcp/" + testHostPort(t, serverHost))
+	if err != nil {
+		t.Fatalf("ParseMultiaddr: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := clientHost.Connect(ctx, serverHost.PeerID(), []Multiaddr{addr}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	stream, err := clientHost.NewStream(ctx, serverHost.PeerID(), ProtocolID(dhtKeyNamespace))
+	if err != nil {
+		t.Fatalf("NewStream: %v", err)
+	}
+	defer func() { _ = stream.Close() }()
+
+	var k [32]byte
+	copy(k[:], key)
+	if _, err := stream.Write(encodeGetRequest(k, 0)); err != nil { // hand-crafted maxCount=0
+		t.Fatalf("write GET_PROVIDERS(maxCount=0): %v", err)
+	}
+
+	infos, err := decodeGetResponse(stream)
+	if err != nil {
+		t.Fatalf("decodeGetResponse: %v", err)
+	}
+	if len(infos) != 0 {
+		t.Errorf("GET_PROVIDERS with maxCount=0 returned %d results, want 0 (a record for this key does exist "+
+			"locally, so a non-empty result here means the zero-maxCount guard is still backwards)", len(infos))
+	}
+}

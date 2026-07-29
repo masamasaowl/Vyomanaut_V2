@@ -657,7 +657,10 @@ func (d *kademliaDHT) handleGet(s Stream) {
 	if rec != nil {
 		infos = append(infos, rec.info)
 	}
-	if maxCountBuf[0] > 0 && len(infos) > int(maxCountBuf[0]) {
+	// M6 review §5.6: maxCount=0 must mean "return nothing", not "no
+	// limit". The old `maxCountBuf[0] > 0 &&` guard skipped truncation
+	// entirely for that case.
+	if len(infos) > int(maxCountBuf[0]) {
 		infos = infos[:maxCountBuf[0]]
 	}
 	_, _ = s.Write(encodeGetResponse(infos))
