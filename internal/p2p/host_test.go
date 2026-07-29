@@ -4,9 +4,10 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
-	"errors" 
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"testing"
 	"time"
 )
@@ -286,5 +287,82 @@ func TestConnectRejectsNonTCPAddress(t *testing.T) {
 	}
 	if errors.Is(err, ErrPeerIDMismatch) {
 		t.Errorf("got ErrPeerIDMismatch — the udp address should have been rejected before any dial attempt, got %v", err)
+	}
+}
+
+// TestPromoteConnAuthenticatesRawConnection verifies that PromoteConn can
+// turn a raw net.Conn — obtained some way other than Host's own
+// Connect/NewStream dial path, simulating what DialViaRelay or a
+// successful HolePunch hands back — into a fully authenticated,
+// protocol-negotiated Stream. The server side never knows the difference:
+// its normal acceptLoop/serveConn handles the inbound connection exactly
+// as it would a direct dial. [REF: M6 review §7]
+func TestPromoteConnAuthenticatesRawConnection(t *testing.T) {
+	serverHost, serverID, serverAddr := newTestHost(t)
+	clientHost, _, _ := newTestHost(t)
+
+	const testProtocol ProtocolID = "/vyomanaut/test-promote/1.0.0"
+	received := make(chan string, 1)
+	serverHost.SetStreamHandler(testProtocol, func(s Stream) {
+		defer func() { _ = s.Close() }()
+		buf := make([]byte, 64)
+		n, err := s.Read(buf)
+		if err != nil && err != io.EOF {
+			t.Errorf("server read: %v", err)
+			return
+		}
+		received <- string(buf[:n])
+	})
+
+	var d net.Dialer
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	rawConn, err := d.DialContext(ctx, "tcp", serverAddr)
+	if err != nil {
+		t.Fatalf("plain dial: %v", err)
+	}
+
+	stream, err := clientHost.PromoteConn(ctx, rawConn, serverID, testProtocol)
+	if err != nil {
+		t.Fatalf("PromoteConn: %v", err)
+	}
+	defer func() { _ = stream.Close() }()
+
+	if stream.Protocol() != testProtocol {
+		t.Errorf("stream.Protocol() = %q, want %q", stream.Protocol(), testProtocol)
+	}
+	if _, err := stream.Write([]byte("via-relay")); err != nil {
+		t.Fatalf("stream.Write: %v", err)
+	}
+
+	select {
+	case got := <-received:
+		if got != "via-relay" {
+			t.Errorf("server received %q, want %q", got, "via-relay")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for server to receive data over the promoted connection")
+	}
+}
+
+// TestPromoteConnRejectsWrongPeerID verifies PromoteConn performs real
+// identity verification, not just wire negotiation.
+func TestPromoteConnRejectsWrongPeerID(t *testing.T) {
+	serverHost, _, serverAddr := newTestHost(t)
+	clientHost, _, _ := newTestHost(t)
+	_ = serverHost
+
+	var d net.Dialer
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	rawConn, err := d.DialContext(ctx, "tcp", serverAddr)
+	if err != nil {
+		t.Fatalf("plain dial: %v", err)
+	}
+
+	wrongPeerID := PeerID("12D3KooWNotTheRealPeerIdAtAll00000000000000000000")
+	_, err = clientHost.PromoteConn(ctx, rawConn, wrongPeerID, "/vyomanaut/test-promote/1.0.0")
+	if !errors.Is(err, ErrPeerIDMismatch) {
+		t.Errorf("PromoteConn with a mismatched peerID: got %v, want ErrPeerIDMismatch", err)
 	}
 }

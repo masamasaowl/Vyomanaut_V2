@@ -82,6 +82,28 @@ type Host interface {
 	// handshakes are permitted for it.
 	NewStream(ctx context.Context, peerID PeerID, protocolID ProtocolID) (Stream, error)
 
+	// PromoteConn authenticates an already-established net.Conn as
+	// belonging to peerID (a TLS 1.3 client handshake, verified against
+	// peerID exactly as NewStream's own direct-dial path does) and
+	// negotiates protocolID over it, returning a Stream indistinguishable
+	// from one NewStream would have produced via a direct dial.
+	//
+	// This is the path for turning a connection obtained some other way —
+	// most notably nat.go's DialViaRelay, whose raw net.Conn previously had
+	// no way into this package's authenticated Stream pipeline — into a
+	// real, usable Stream. PromoteConn always acts as the TLS client;
+	// HolePunch is direction-symmetric, so pass the resulting net.Conn to
+	// PromoteConn only on whichever side is initiating the logical
+	// operation.
+	//
+	// Does not update Connect's address-cache bookkeeping (h.knownAddrs):
+	// a promoted connection didn't arrive via a normal, redialable
+	// Multiaddr in the same sense a direct dial did, so there's nothing
+	// meaningful to cache it under.
+	//
+	// [REF: M6 review §7]
+	PromoteConn(ctx context.Context, conn net.Conn, peerID PeerID, protocolID ProtocolID) (Stream, error)
+
 	// SetStreamHandler registers a handler for incoming streams of protocolID.
 	// Each incoming stream runs the handler in a new goroutine (IC §4).
 	SetStreamHandler(protocolID ProtocolID, handler StreamHandler)
@@ -338,6 +360,59 @@ func (h *host) NewStream(ctx context.Context, peerID PeerID, protocolID Protocol
 	}
 
 	return &tlsStream{Conn: conn, protocol: protocolID}, nil
+}
+
+// authenticateAndNegotiate performs a TLS 1.3 client handshake over an
+// already-established net.Conn (verifying it belongs to peerID, exactly as
+// NewStream's own dial path already does for a fresh TCP connection), then
+// negotiates protocolID over the resulting authenticated connection.
+// [REF: M6 review §7]
+func (h *host) authenticateAndNegotiate(ctx context.Context, conn net.Conn, peerID PeerID, protocolID ProtocolID) (Stream, error) {
+	tlsCfg := &tls.Config{
+		Certificates:          []tls.Certificate{h.cert},
+		InsecureSkipVerify:    true, //nolint:gosec // explicit peer-ID verification below, same as dialAndVerify/NewStream
+		MinVersion:            tls.VersionTLS13,
+		VerifyPeerCertificate: verifyPeerCertificateAgainst(peerID),
+	}
+	if zeroRTTPermitted(protocolID) {
+		tlsCfg.ClientSessionCache = h.sessionCacheForPeer(peerID)
+	} else {
+		tlsCfg.SessionTicketsDisabled = true
+	}
+
+	tlsConn := tls.Client(conn, tlsCfg)
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		_ = conn.Close()
+		if errors.Is(err, errPeerIDMismatchTLS) {
+			return nil, ErrPeerIDMismatch
+		}
+		return nil, fmt.Errorf("p2p.authenticateAndNegotiate: TLS handshake with %s: %w", peerID, err)
+	}
+
+	if err := writeNegotiationPreamble(tlsConn, protocolID); err != nil {
+		_ = tlsConn.Close()
+		return nil, fmt.Errorf("p2p.authenticateAndNegotiate: negotiate %s: %w", protocolID, err)
+	}
+	ack := make([]byte, 1)
+	if _, err := readFull(tlsConn, ack); err != nil {
+		_ = tlsConn.Close()
+		return nil, fmt.Errorf("p2p.authenticateAndNegotiate: read negotiation ack: %w", err)
+	}
+	if ack[0] != negotiationAckOK {
+		_ = tlsConn.Close()
+		return nil, fmt.Errorf("p2p.authenticateAndNegotiate: peer rejected protocol %s", protocolID)
+	}
+
+	return &tlsStream{Conn: tlsConn, protocol: protocolID}, nil
+}
+
+// PromoteConn implements Host.PromoteConn.
+func (h *host) PromoteConn(ctx context.Context, conn net.Conn, peerID PeerID, protocolID ProtocolID) (Stream, error) {
+	if len(protocolID) == 0 || len(protocolID) > maxProtocolIDLen {
+		_ = conn.Close()
+		return nil, fmt.Errorf("p2p.PromoteConn: protocol ID length %d out of bounds", len(protocolID))
+	}
+	return h.authenticateAndNegotiate(ctx, conn, peerID, protocolID)
 }
 
 // tlsSessionCacheSize bounds the per-peer TLS session ticket cache used to
