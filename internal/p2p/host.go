@@ -207,14 +207,28 @@ func (h *host) Connect(ctx context.Context, peerID PeerID, addrs []Multiaddr) er
 	}
 
 	var lastErr error
+	var mismatchErr error // first ErrPeerIDMismatch seen across any address, if any (M6 review §5.2)
 	for _, addr := range addrs {
 		hostport, ok := addr.HostPort()
 		if !ok {
 			lastErr = fmt.Errorf("p2p.Connect: %s: not a directly dialable address (relay addresses require SetupNAT's relay client)", addr)
 			continue
 		}
+		if addr.Network() != "tcp" {
+			// This package's transport is TLS over TCP only (doc.go); a
+			// udp/quic-v1-tagged address parses successfully (types.go
+			// accepts it for forward compatibility) but dialAndVerify below
+			// unconditionally dials "tcp" regardless of Network() — reject
+			// it explicitly here instead of silently misdialing it as tcp.
+			// [REF: M6 review §5.7]
+			lastErr = fmt.Errorf("p2p.Connect: %s: unsupported transport %q (this package only dials tcp)", addr, addr.Network())
+			continue
+		}
 		if err := h.dialAndVerify(ctx, peerID, hostport); err != nil {
 			lastErr = err
+			if mismatchErr == nil && errors.Is(err, ErrPeerIDMismatch) {
+				mismatchErr = err
+			}
 			continue
 		}
 		h.mu.Lock()
@@ -223,8 +237,12 @@ func (h *host) Connect(ctx context.Context, peerID PeerID, addrs []Multiaddr) er
 		return nil
 	}
 
-	if errors.Is(lastErr, ErrPeerIDMismatch) {
-		return lastErr
+	// A genuine Peer-ID mismatch on ANY address is a security-relevant
+	// impersonation signal (NFR-016) and must never be masked by a later,
+	// unrelated benign failure (e.g. connection refused) on a different
+	// address in the same list. [REF: M6 review §5.2]
+	if mismatchErr != nil {
+		return mismatchErr
 	}
 	return fmt.Errorf("%w: %v", ErrAllAddrsFailed, lastErr)
 }
@@ -232,6 +250,8 @@ func (h *host) Connect(ctx context.Context, peerID PeerID, addrs []Multiaddr) er
 // dialAndVerify opens a short-lived TLS connection purely to verify the
 // remote's identity, then closes it. NewStream performs the real, per-
 // operation dial.
+// dialAndVerify always dials "tcp": callers (Connect) reject any
+// addr.Network() != "tcp" before ever reaching here.
 func (h *host) dialAndVerify(ctx context.Context, peerID PeerID, hostport string) error {
 	dialer := &tls.Dialer{
 		Config: &tls.Config{
@@ -271,6 +291,10 @@ func (h *host) NewStream(ctx context.Context, peerID PeerID, protocolID Protocol
 	hostport, ok := addr.HostPort()
 	if !ok {
 		return nil, fmt.Errorf("p2p.NewStream: %s: known address is not directly dialable", addr)
+	}
+	if addr.Network() != "tcp" {
+		// See Connect's identical check for why (M6 review §5.7).
+		return nil, fmt.Errorf("p2p.NewStream: %s: unsupported transport %q (this package only dials tcp)", addr, addr.Network())
 	}
 
 	tlsCfg := &tls.Config{

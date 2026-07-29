@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"errors" 
 	"fmt"
 	"io"
 	"testing"
@@ -231,4 +232,59 @@ func portOf(t *testing.T, hostport string) string {
 	}
 	t.Fatalf("portOf: no colon in %q", hostport)
 	return ""
+}
+// TestHostConnectPrioritizesPeerIDMismatchOverLaterBenignFailure verifies
+// that a genuine ErrPeerIDMismatch on an EARLIER address in the list is not
+// masked by a later, unrelated, benign failure (e.g. nothing listening) on
+// a subsequent address — Connect must still surface the impersonation
+// signal (NFR-016), not a generic ErrAllAddrsFailed.
+// [REF: NFR-016, M6 review §5.2]
+func TestHostConnectPrioritizesPeerIDMismatchOverLaterBenignFailure(t *testing.T) {
+	serverHost, _, serverAddr := newTestHost(t)
+	clientHost, _, _ := newTestHost(t)
+	_ = serverHost
+
+	mismatchAddr, err := ParseMultiaddr(fmt.Sprintf("/ip4/127.0.0.1/tcp/%s", portOf(t, serverAddr)))
+	if err != nil {
+		t.Fatalf("ParseMultiaddr (mismatch addr): %v", err)
+	}
+	// Nothing listens here — a benign "connection refused", tried SECOND,
+	// after the mismatch.
+	deadAddr, err := ParseMultiaddr("/ip4/127.0.0.1/tcp/1")
+	if err != nil {
+		t.Fatalf("ParseMultiaddr (dead addr): %v", err)
+	}
+
+	wrongPeerID := PeerID("12D3KooWNotTheRealPeerIdAtAll00000000000000000000")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err = clientHost.Connect(ctx, wrongPeerID, []Multiaddr{mismatchAddr, deadAddr})
+	if !errors.Is(err, ErrPeerIDMismatch) {
+		t.Errorf("Connect with a real mismatch first and a benign failure second: got %v, want ErrPeerIDMismatch "+
+			"(the impersonation signal must survive even though it wasn't the last address tried)", err)
+	}
+}
+
+// TestConnectRejectsNonTCPAddress verifies that a udp/quic-v1-tagged
+// address is rejected explicitly by Connect rather than being silently
+// misdialed as tcp. [REF: M6 review §5.7]
+func TestConnectRejectsNonTCPAddress(t *testing.T) {
+	clientHost, _, _ := newTestHost(t)
+
+	udpAddr, err := ParseMultiaddr("/ip4/127.0.0.1/udp/4001/quic-v1")
+	if err != nil {
+		t.Fatalf("ParseMultiaddr: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	err = clientHost.Connect(ctx, PeerID("12D3KooWSomeTargetPeerId00000000000000000000000000"), []Multiaddr{udpAddr})
+	if err == nil {
+		t.Fatal("expected Connect to reject a udp/quic-v1-tagged address, got nil error")
+	}
+	if errors.Is(err, ErrPeerIDMismatch) {
+		t.Errorf("got ErrPeerIDMismatch — the udp address should have been rejected before any dial attempt, got %v", err)
+	}
 }
