@@ -482,3 +482,68 @@ func TestAddToRoutingTableIgnoresSelf(t *testing.T) {
 		}
 	}
 }
+
+// TestHandlePutGrowsRoutingTable verifies that receiving a PUT_PROVIDER
+// request adds the SENDER to the RECEIVER's routing table, not just
+// Bootstrap's own seed list — before this fix, addToRoutingTable was only
+// ever called from Bootstrap, so a node's k-buckets never grew from
+// ordinary inbound DHT traffic. [REF: M6 review §5.4]
+func TestHandlePutGrowsRoutingTable(t *testing.T) {
+	hostA := buildTestHost(t)
+	dhtAIface := buildTestDHT(t, hostA)
+	dhtA, ok := dhtAIface.(*kademliaDHT)
+	if !ok {
+		t.Fatalf("buildTestDHT returned %T, want *kademliaDHT", dhtAIface)
+	}
+
+	hostB := buildTestHost(t)
+	addrA, err := ParseMultiaddr("/ip4/127.0.0.1/tcp/" + testHostPort(t, hostA))
+	if err != nil {
+		t.Fatalf("ParseMultiaddr: %v", err)
+	}
+	dhtB, err := NewDHT(hostB, DHTConfig{
+		Seeds: []AddrInfo{{ID: hostA.PeerID(), Addrs: []Multiaddr{addrA}}},
+	})
+	if err != nil {
+		t.Fatalf("NewDHT (B): %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := dhtB.Bootstrap(ctx); err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i + 11)
+	}
+	if err := dhtB.PutProviderRecord(ctx, key); err != nil {
+		t.Fatalf("PutProviderRecord (B): %v", err)
+	}
+
+	// A never called Bootstrap and has no seeds of its own — its ONLY route
+	// to learning about B is via handlePut's fix. Runs in a background
+	// goroutine after the ack (see handlePut), so poll briefly.
+	deadline := time.Now().Add(3 * time.Second)
+	found := false
+	for time.Now().Before(deadline) {
+		dhtA.mu.RLock()
+		for _, bucket := range dhtA.buckets {
+			for _, entry := range bucket {
+				if entry.info.ID == hostB.PeerID() {
+					found = true
+				}
+			}
+		}
+		dhtA.mu.RUnlock()
+		if found {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !found {
+		t.Error("host B was never added to host A's routing table after A received B's PUT_PROVIDER — " +
+			"addToRoutingTable is still only reachable from Bootstrap's own seed list")
+	}
+}

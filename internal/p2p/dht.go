@@ -47,6 +47,13 @@ const kBucketSize = 16
 // dhtAlpha is the parallel-lookup fan-out (ARCH §13: produces O(log N / α) round trips).
 const dhtAlpha = 3
 
+// dhtPeerVerifyTimeout bounds how long handlePut waits for Connect to verify
+// a PUT_PROVIDER sender's self-reported addresses before giving up on
+// adding them to the routing table (M6 review §5.4). Does not block the
+// PUT itself — storeRecord and the ack both already completed before this
+// runs.
+const dhtPeerVerifyTimeout = 5 * time.Second
+
 // dhtMode documents that every Vyomanaut provider daemon runs the DHT in
 // Server mode — a full participant, reachable for challenge dispatch — never
 // Client (relay-only, unreachable) mode (ARCH §13 §DHT configuration).
@@ -57,13 +64,10 @@ const dhtMode = "Server"
 const dhtKeyLen = 32
 
 // defaultRecordTTL is used when DHTConfig.RecordTTL is zero. Real deployments
-// should pass profile.DHTExpiryDuration (24h prod / 4min demo per
-// NetworkProfile — not DHTRepublishInterval, a different field, which is
-// 12h prod / 2min demo; M6 review §1 flagged this comment for citing
-// DHTRepublishInterval's values while naming DHTExpiryDuration) — this
-// package intentionally does not import internal/config (consistent with
-// keeping internal/p2p dependency-free), so the caller is responsible for
-// threading the profile-appropriate value through DHTConfig.
+// should pass profile.DHTExpiryDuration (12h prod / 4min demo per
+// NetworkProfile) — this package intentionally does not import internal/config
+// (consistent with keeping internal/p2p dependency-free), so the caller is
+// responsible for threading the profile-appropriate value through DHTConfig.
 const defaultRecordTTL = 24 * time.Hour
 
 // maxGetCount is the maximum count encoded in a single GET_PROVIDERS request.
@@ -591,8 +595,30 @@ func (d *kademliaDHT) handlePut(s Stream) {
 	// handshake (RemotePeer), never from a self-reported field in the wire
 	// message — the wire message intentionally carries no separate,
 	// spoofable peer-ID field.
-	d.storeRecord(key, AddrInfo{ID: s.RemotePeer(), Addrs: addrs})
+	sender := AddrInfo{ID: s.RemotePeer(), Addrs: addrs}
+	d.storeRecord(key, sender)
 	_, _ = s.Write([]byte{negotiationAckOK})
+
+	// Grow the routing table from real DHT traffic, not just the initial
+	// seed list (M6 review §5.4) — without this, k-buckets never expand
+	// past whatever was hardcoded at startup, degrading the network to a
+	// star topology centred on the seeds. Runs after the ack, in its own
+	// goroutine, so a slow/unresponsive sender never delays the PUT
+	// response the caller is waiting on. Connect (not just
+	// addToRoutingTable) verifies the sender's self-reported addrs
+	// actually belong to them — the same authentication Bootstrap already
+	// performs for seeds — and populates h.knownAddrs, which NewStream
+	// requires before this peer can ever be dialled again by
+	// pushProviderRecord/queryPeer; skipping Connect would add a routing-
+	// table entry that silently can never be used. Best-effort: the PUT
+	// already succeeded via storeRecord above regardless of this outcome.
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), dhtPeerVerifyTimeout)
+		defer cancel()
+		if connErr := d.host.Connect(ctx, sender.ID, sender.Addrs); connErr == nil {
+			d.addToRoutingTable(sender)
+		}
+	}()
 }
 
 func (d *kademliaDHT) handleGet(s Stream) {
