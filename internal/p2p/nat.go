@@ -4,8 +4,11 @@
 // doc.go, AutoNAT / DCUtR / Circuit Relay v2 are replaced with a from-scratch
 // implementation of the same three tiers using only net and crypto/tls:
 //
-//	Tier 1 - reachability probe (this package's AutoNAT analogue): a helper
-//	         peer is asked to dial us back; success => NATStatusPublic.
+//	Tier 1 - reachability probe (this package's AutoNAT analogue): approximated
+//	         locally via local-address-shape (private/CGNAT detection) plus
+//	         helper dial-out (see probeReachability's own doc comment, M6
+//	         review §5.3) rather than a genuine remote dial-back, which this
+//	         package has no wire protocol for yet.
 //	Tier 2 - TCP simultaneous-open hole punching (this package's DCUtR
 //	         analogue): a rendezvous helper exchanges both sides' public
 //	         addresses and both sides dial each other at (approximately) the
@@ -130,23 +133,34 @@ func SetupNAT(h Host, cfg NATConfig) error {
 
 // ── Tier 1: reachability probe (AutoNAT analogue) ─────────────────────────────
 
-// probeReachability asks each helper in turn to attempt a TLS dial-back to
-// our own listen address. If any helper succeeds, we are publicly reachable;
-// if all fail, we are behind a NAT/firewall.
+// probeReachability classifies local reachability using two signals, in order:
 //
-// A "dial-back" here is approximated locally: since this package does not
-// implement a wire protocol for asking a *remote* helper to dial us (that
-// requires the helper to run Vyomanaut-specific probe-request handling this
-// session does not add a protocol ID for), probeReachability instead performs
-// the externally-observable half of the same test that matters for our
-// purposes — confirming the listener actually accepts a fresh inbound
-// connection from an address other than loopback-via-dial, which is the
-// condition NATStatusPublic vs NATStatusPrivate is gating downstream
-// (whether inbound challenge dispatch can reach us at all). Classification
-// therefore degrades to: listener present and accepting => best-effort
-// Public; no listener => Private. Full remote-helper dial-back is
-// Session 13.1.1 wiring once the daemon has a peer directory to draw
-// helpers from.
+//  1. Local address shape (localOutboundIPFunc): if this host's own
+//     outbound-resolved local address is private (RFC 1918), loopback,
+//     link-local, or carrier-grade-NAT-ranged (RFC 6598, common among
+//     residential/mobile ISPs in this project's target region), the host
+//     is classified NATStatusPrivate immediately — a private/CGNAT source
+//     address can never be publicly reachable, full stop, regardless of
+//     anything else. [Added, M6 review §5.3]
+//  2. Helper dial-out (the original check): if (1) didn't already decide
+//     it, ask each helper in turn to see if we can reach it. This is NOT a
+//     dial-BACK — this package has no wire protocol for asking a remote
+//     helper to dial US (that needs Vyomanaut-specific probe-request
+//     handling this session doesn't add a protocol ID for). Dialing OUT
+//     succeeds for nearly every NAT'd host too (that's what NAT exists to
+//     permit), so on its own this signal only rules out "no network at
+//     all" — it does NOT confirm inbound reachability. Kept as a fallback
+//     for hosts with a public-shaped local address that might still be
+//     unreachable for other reasons (cloud firewall rules, etc.) that (1)
+//     cannot detect; those will still be misclassified as Public.
+//
+// True inbound reachability confirmation — the microservice (the one
+// universally-reachable party in the topology) reporting whether it could
+// actually reach this host's last-known multiaddr — needs heartbeat-response
+// wire-format support that doesn't exist yet; that's still Session 13.1.1+
+// wiring once the microservice side exists to cooperate with. Until then,
+// read NATType() as "best-effort: reliably catches classic residential/CGNAT
+// NAT, does not confirm true public reachability."
 func probeReachability(h *host, helpers []Multiaddr) NATStatus {
 	if h.listener == nil {
 		return NATStatusPrivate
@@ -154,6 +168,14 @@ func probeReachability(h *host, helpers []Multiaddr) NATStatus {
 	if len(helpers) == 0 {
 		return NATStatusUnknown
 	}
+
+	if localIP, err := localOutboundIPFunc(); err == nil {
+		if localIP.IsPrivate() || localIP.IsLoopback() || localIP.IsLinkLocalUnicast() || isCGNAT(localIP) {
+			return NATStatusPrivate
+		}
+	}
+	// If localOutboundIPFunc itself fails (no route at all), fall through —
+	// the helper-dial loop below will also fail and correctly land on Private.
 
 	ctx, cancel := context.WithTimeout(context.Background(), reachabilityProbeTimeout)
 	defer cancel()
@@ -174,6 +196,46 @@ func probeReachability(h *host, helpers []Multiaddr) NATStatus {
 	return NATStatusPrivate
 }
 
+// localOutboundIP returns the local IP address this host's default outbound
+// route would use, by asking the kernel to resolve a route for a
+// documentation-only target (RFC 5737 TEST-NET-3) without ever sending or
+// receiving a packet — a UDP "Dial" is a local route lookup + socket bind;
+// it only actually transmits when Write is called, which never happens
+// here. Using a guaranteed-unroutable-on-the-real-internet address (rather
+// than, say, a real public DNS server) keeps this unambiguously a local-
+// only operation. [REF: M6 review §5.3]
+func localOutboundIP() (net.IP, error) {
+	conn, err := net.Dial("udp", "203.0.113.1:80") // TEST-NET-3 (RFC 5737); never actually contacted
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = conn.Close() }()
+	udpAddr, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		return nil, fmt.Errorf("p2p: localOutboundIP: unexpected LocalAddr type %T", conn.LocalAddr())
+	}
+	return udpAddr.IP, nil
+}
+
+// localOutboundIPFunc is a package-level indirection so tests can inject a
+// fake local address without depending on this machine's real network
+// routing. Production code always uses the default, localOutboundIP.
+var localOutboundIPFunc = localOutboundIP //nolint:gochecknoglobals // test seam, same pattern as other package-level test hooks in this codebase
+
+// isCGNAT reports whether ip falls in 100.64.0.0/10 (RFC 6598, Shared
+// Address Space) — the range ISPs commonly use for carrier-grade NAT.
+// net.IP.IsPrivate() does not cover this range (it is not RFC 1918), but a
+// host whose local address falls in it is exactly as unreachable from the
+// public internet as one with a private address, and CGNAT is common among
+// residential/mobile ISPs in this project's target deployment region.
+// [REF: M6 review §5.3]
+func isCGNAT(ip net.IP) bool {
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return false
+	}
+	return ip4[0] == 100 && ip4[1]&0xC0 == 0x40
+}
 // ── Tier 2: TCP simultaneous-open hole punch (DCUtR analogue) ────────────────
 
 // HolePunchResult reports the outcome of a hole-punch attempt.

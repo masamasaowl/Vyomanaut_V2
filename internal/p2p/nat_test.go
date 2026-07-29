@@ -240,3 +240,77 @@ func fakeRelay(t *testing.T, ln net.Listener) {
 		}(conn)
 	}
 }
+
+func TestIsCGNAT(t *testing.T) {
+	cases := []struct {
+		ip   string
+		want bool
+	}{
+		{"100.64.0.0", true},
+		{"100.64.0.1", true},
+		{"100.100.100.100", true},
+		{"100.127.255.255", true},
+		{"100.63.255.255", false}, // just below the range
+		{"100.128.0.0", false},    // just above the range
+		{"8.8.8.8", false},
+		{"192.168.1.1", false}, // RFC 1918, not CGNAT — covered separately by IsPrivate()
+	}
+	for _, tc := range cases {
+		got := isCGNAT(net.ParseIP(tc.ip))
+		if got != tc.want {
+			t.Errorf("isCGNAT(%s) = %v, want %v", tc.ip, got, tc.want)
+		}
+	}
+}
+
+// TestProbeReachabilityPrivateLocalAddressForcesPrivate verifies that a
+// private local address forces NATStatusPrivate even when dialing out to a
+// helper succeeds — under the old logic, the successful dial alone was
+// enough for NATStatusPublic. [REF: M6 review §5.3]
+func TestProbeReachabilityPrivateLocalAddressForcesPrivate(t *testing.T) {
+	testHost, _, addr := newTestHost(t)
+	helperAddr, err := ParseMultiaddr("/ip4/127.0.0.1/tcp/" + portOf(t, addr))
+	if err != nil {
+		t.Fatalf("ParseMultiaddr: %v", err)
+	}
+	concrete, ok := testHost.(*host)
+	if !ok {
+		t.Fatalf("expected *host")
+	}
+
+	orig := localOutboundIPFunc
+	t.Cleanup(func() { localOutboundIPFunc = orig })
+	localOutboundIPFunc = func() (net.IP, error) { return net.ParseIP("192.168.50.7"), nil }
+
+	status := probeReachability(concrete, []Multiaddr{helperAddr})
+	if status != NATStatusPrivate {
+		t.Errorf("probeReachability = %v with a private local address and a successful helper dial, "+
+			"want NATStatusPrivate — a private source address can never be publicly reachable regardless "+
+			"of outbound dial success (M6 review §5.3)", status)
+	}
+}
+
+// TestProbeReachabilityPublicLocalAddressStillUsesHelperDial verifies the
+// non-private case is unaffected: a public-shaped local address still
+// falls through to the (unchanged) helper-dial check.
+func TestProbeReachabilityPublicLocalAddressStillUsesHelperDial(t *testing.T) {
+	testHost, _, addr := newTestHost(t)
+	helperAddr, err := ParseMultiaddr("/ip4/127.0.0.1/tcp/" + portOf(t, addr))
+	if err != nil {
+		t.Fatalf("ParseMultiaddr: %v", err)
+	}
+	concrete, ok := testHost.(*host)
+	if !ok {
+		t.Fatalf("expected *host")
+	}
+
+	orig := localOutboundIPFunc
+	t.Cleanup(func() { localOutboundIPFunc = orig })
+	localOutboundIPFunc = func() (net.IP, error) { return net.ParseIP("203.0.113.9"), nil } // TEST-NET-3, "public-shaped"
+
+	status := probeReachability(concrete, []Multiaddr{helperAddr})
+	if status != NATStatusPublic {
+		t.Errorf("probeReachability = %v with a public-shaped local address and a successful helper dial, "+
+			"want NATStatusPublic (unchanged behaviour for the non-private case)", status)
+	}
+}
