@@ -113,8 +113,15 @@ func SetupNAT(h Host, cfg NATConfig) error {
 		go func() {
 			ticker := time.NewTicker(cfg.ReprobeInterval)
 			defer ticker.Stop()
-			for range ticker.C {
-				runProbe()
+			for {
+				select {
+				case <-concrete.closeCh:
+					// host.Close() was called — stop reprobing rather than
+					// leaking this goroutine forever. [REF: M6 review §5.1]
+					return
+				case <-ticker.C:
+					runProbe()
+				}
 			}
 		}()
 	}

@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"net"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -139,6 +140,41 @@ func TestSetupNATClassifiesPublicViaHelper(t *testing.T) {
 	}
 	if got := h.NATType(); got != NATStatusPublic {
 		t.Errorf("NATType() = %v, want %v", got, NATStatusPublic)
+	}
+}
+
+// TestSetupNATReprobeStopsOnClose verifies that host.Close() stops the
+// background reprobe goroutine SetupNAT starts when ReprobeInterval > 0 —
+// before this fix, that goroutine ran forever regardless of Close(),
+// leaking a goroutine (and continuing to dial helper addresses on a
+// schedule) for the lifetime of the process. [REF: M6 review §5.1]
+func TestSetupNATReprobeStopsOnClose(t *testing.T) {
+	h, _, addr := newTestHost(t)
+	helperAddr, err := ParseMultiaddr("/ip4/127.0.0.1/tcp/" + portOf(t, addr))
+	if err != nil {
+		t.Fatalf("ParseMultiaddr: %v", err)
+	}
+
+	const reprobeInterval = 10 * time.Millisecond
+	if err := SetupNAT(h, NATConfig{
+		ReachabilityHelpers: []Multiaddr{helperAddr},
+		ReprobeInterval:     reprobeInterval,
+	}); err != nil {
+		t.Fatalf("SetupNAT: %v", err)
+	}
+	time.Sleep(3 * reprobeInterval) // let the reprobe goroutine actually start looping
+
+	before := runtime.NumGoroutine()
+
+	if err := h.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	time.Sleep(3 * reprobeInterval) // give it a moment to observe closeCh and return
+
+	after := runtime.NumGoroutine()
+	if after >= before {
+		t.Errorf("NumGoroutine() = %d after Close(), want fewer than %d before it — "+
+			"the reprobe goroutine appears to have leaked", after, before)
 	}
 }
 
