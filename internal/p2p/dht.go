@@ -34,6 +34,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"log"
 	"sort"
 	"sync"
 	"time"
@@ -266,16 +267,24 @@ func (d *kademliaDHT) storeRecord(key [32]byte, info AddrInfo) {
 func (d *kademliaDHT) pushProviderRecord(ctx context.Context, peer *peerEntry, key [32]byte, info AddrInfo) {
 	stream, err := d.host.NewStream(ctx, peer.info.ID, ProtocolID(dhtKeyNamespace))
 	if err != nil {
+		log.Printf("[dht] push key %x to peer %s: open stream: %v", key, peer.info.ID, err)
 		return
 	}
 	defer func() { _ = stream.Close() }()
 
 	req := encodePutRequest(key, info)
 	if _, err := stream.Write(req); err != nil {
+		log.Printf("[dht] push key %x to peer %s: write request: %v", key, peer.info.ID, err)
 		return
 	}
 	ack := make([]byte, 1)
-	_, _ = streamReadFull(stream, ack)
+	if _, err := streamReadFull(stream, ack); err != nil {
+		log.Printf("[dht] push key %x to peer %s: read ack: %v", key, peer.info.ID, err)
+		return
+	}
+	if ack[0] != negotiationAckOK {
+		log.Printf("[dht] push key %x to peer %s: rejected", key, peer.info.ID)
+	}
 }
 
 // ── FindProviders ──────────────────────────────────────────────────────────
@@ -333,16 +342,19 @@ func (d *kademliaDHT) lookupLocal(key [32]byte) *providerRecord {
 func (d *kademliaDHT) queryPeer(ctx context.Context, peer *peerEntry, key [32]byte, maxCount int) []AddrInfo {
 	stream, err := d.host.NewStream(ctx, peer.info.ID, ProtocolID(dhtKeyNamespace))
 	if err != nil {
+		log.Printf("[dht] query peer %s for key %x: open stream: %v", peer.info.ID, key, err)
 		return nil
 	}
 	defer func() { _ = stream.Close() }()
 
 	req := encodeGetRequest(key, maxCount)
 	if _, err := stream.Write(req); err != nil {
+		log.Printf("[dht] query peer %s for key %x: write request: %v", peer.info.ID, key, err)
 		return nil
 	}
 	infos, err := decodeGetResponse(stream)
 	if err != nil {
+		log.Printf("[dht] query peer %s for key %x: read response: %v", peer.info.ID, key, err)
 		return nil
 	}
 	return infos
