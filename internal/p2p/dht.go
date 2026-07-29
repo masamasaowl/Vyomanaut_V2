@@ -113,6 +113,19 @@ type DHT interface {
 	// querying known peers), for use as the stale-address fallback path
 	// (IC §12.3).
 	//
+	// SCOPE (decided, M6 review §5.5): this is a single-hop lookup, not an
+	// iterative Kademlia lookup — it queries only the up-to-dhtAlpha
+	// closest peers already in the LOCAL routing table and returns
+	// whatever they report, without recursing into peers those peers might
+	// in turn know about. A record held only outside the querier's
+	// immediate k-buckets returns an empty result (not an error). This is
+	// a deliberate scope match to IC §12.3's own framing — the DHT is a
+	// fallback path, not primary retrieval (which uses microservice-
+	// heartbeat-tracked addresses) — not an oversight. Revisit as a
+	// dedicated iterative-lookup session if a concrete scenario ever
+	// requires the fallback path to survive microservice unavailability at
+	// real network scale.
+	//
 	// Error semantics:
 	//   - ErrDHTKeyInvalid: key fails the HMAC-shape validator (IC §12).
 	FindProviders(ctx context.Context, key []byte, maxCount int) ([]AddrInfo, error)
