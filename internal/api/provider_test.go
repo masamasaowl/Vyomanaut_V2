@@ -112,9 +112,17 @@ func insertChunkAssignmentDirect(t *testing.T, db *sql.DB, providerID uuid.UUID,
 	return chunkID
 }
 
-func refreshEscrowBalance(t *testing.T, db *sql.DB) {
+// refreshEscrowBalance refreshes mv_provider_escrow_balance using a
+// privileged openVerifyDB connection (vyomanaut_migrator), not the
+// vyomanaut_app connection tests otherwise use: vyomanaut_app does not own
+// this materialized view (ADR-032 — MV refresh is a vyomanaut_migrator-only
+// operation), so REFRESH on the app connection fails with "must be owner of
+// materialized view". Mirrors internal/repair's own
+// refreshProviderScoresForAssignment(t, verify) helper.
+func refreshEscrowBalance(t *testing.T) {
 	t.Helper()
-	if _, err := db.Exec(`REFRESH MATERIALIZED VIEW mv_provider_escrow_balance`); err != nil {
+	verify := openVerifyDB(t)
+	if _, err := verify.Exec(`REFRESH MATERIALIZED VIEW mv_provider_escrow_balance`); err != nil {
 		t.Fatalf("refresh mv_provider_escrow_balance: %v", err)
 	}
 }
@@ -947,7 +955,7 @@ func TestProviderDepartImmediateWhenDepartAtOmitted(t *testing.T) {
 		VerifiedClaims{Subject: providerID, Role: "provider"})
 	w := httptest.NewRecorder()
 
-	h := NewProviderDepartHandler(db, config.ProductionProfile, payment.NewMockProvider(db))
+	h := NewProviderDepartHandler(db, config.DemoProfile, payment.NewMockProvider(db))
 	h.HandleDepart(w, r)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
@@ -989,7 +997,7 @@ func TestProviderDepartQueuesRepairForAllRealChunks(t *testing.T) {
 		VerifiedClaims{Subject: providerID, Role: "provider"})
 	w := httptest.NewRecorder()
 
-	h := NewProviderDepartHandler(db, config.ProductionProfile, payment.NewMockProvider(db))
+	h := NewProviderDepartHandler(db, config.DemoProfile, payment.NewMockProvider(db))
 	h.HandleDepart(w, r)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
@@ -1018,7 +1026,7 @@ func TestProviderDepartReleasesProratedEscrow(t *testing.T) {
 	periodEnd := time.Now().Add(15 * 24 * time.Hour) // ~50% of the window elapsed
 	insertAuditPeriod(t, db, providerID, periodStart, periodEnd)
 	insertEscrowDeposit(t, db, providerID, 100000, uuid.New().String())
-	refreshEscrowBalance(t, db)
+	refreshEscrowBalance(t)
 
 	req := providerDepartRequestBody{}
 	req = signDepartRequest(t, priv, req)
@@ -1028,7 +1036,7 @@ func TestProviderDepartReleasesProratedEscrow(t *testing.T) {
 		VerifiedClaims{Subject: providerID, Role: "provider"})
 	w := httptest.NewRecorder()
 
-	h := NewProviderDepartHandler(db, config.ProductionProfile, payment.NewMockProvider(db))
+	h := NewProviderDepartHandler(db, config.DemoProfile, payment.NewMockProvider(db))
 	h.HandleDepart(w, r)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
@@ -1058,7 +1066,7 @@ func TestProviderDepartUsesDistinctIdempotencyKey(t *testing.T) {
 	periodEnd := time.Now().Add(20 * 24 * time.Hour)
 	insertAuditPeriod(t, db, providerID, periodStart, periodEnd)
 	insertEscrowDeposit(t, db, providerID, 100000, uuid.New().String())
-	refreshEscrowBalance(t, db)
+	refreshEscrowBalance(t)
 
 	departAt := time.Now().Add(1 * time.Minute).UTC().Format(time.RFC3339)
 	req := providerDepartRequestBody{DepartAt: &departAt}
@@ -1069,7 +1077,7 @@ func TestProviderDepartUsesDistinctIdempotencyKey(t *testing.T) {
 		VerifiedClaims{Subject: providerID, Role: "provider"})
 	w := httptest.NewRecorder()
 
-	h := NewProviderDepartHandler(db, config.ProductionProfile, payment.NewMockProvider(db))
+	h := NewProviderDepartHandler(db, config.DemoProfile, payment.NewMockProvider(db))
 	h.HandleDepart(w, r)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
@@ -1101,7 +1109,7 @@ func TestProviderDepartRejectsAlreadyDeparted(t *testing.T) {
 		VerifiedClaims{Subject: providerID, Role: "provider"})
 	w := httptest.NewRecorder()
 
-	h := NewProviderDepartHandler(db, config.ProductionProfile, payment.NewMockProvider(db))
+	h := NewProviderDepartHandler(db, config.DemoProfile, payment.NewMockProvider(db))
 	h.HandleDepart(w, r)
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403, body = %s", w.Code, w.Body.String())
