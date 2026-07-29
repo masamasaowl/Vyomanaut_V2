@@ -38,6 +38,8 @@ import (
 	"log"
 	mathrand "math/rand/v2"
 	"net/http"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/masamasaowl/Vyomanaut_V2/internal/config"
@@ -149,8 +151,8 @@ func RunHeartbeat(ctx context.Context, cfg HeartbeatConfig) {
 	heartbeatTimer := time.NewTimer(jitteredInterval(cfg.Profile.HeartbeatInterval, cfg.Profile.HeartbeatJitter))
 	defer heartbeatTimer.Stop()
 
-	republishTicker := time.NewTicker(cfg.Profile.DHTRepublishInterval)
-	defer republishTicker.Stop()
+	republishTimer := time.NewTimer(jitteredRepublishInterval(cfg.Profile.DHTRepublishInterval))
+	defer republishTimer.Stop()
 
 	for {
 		select {
@@ -159,12 +161,35 @@ func RunHeartbeat(ctx context.Context, cfg HeartbeatConfig) {
 		case <-heartbeatTimer.C:
 			doHeartbeat(ctx, cfg)
 			heartbeatTimer.Reset(jitteredInterval(cfg.Profile.HeartbeatInterval, cfg.Profile.HeartbeatJitter))
-		case <-republishTicker.C:
+		case <-republishTimer.C:
 			doRepublish(ctx, cfg)
+			republishTimer.Reset(jitteredRepublishInterval(cfg.Profile.DHTRepublishInterval))
 		}
 	}
 }
 
+// dhtRepublishJitterFraction bounds the random jitter applied to each DHT
+// republication cycle, as a fraction of cfg.Profile.DHTRepublishInterval
+// itself — unlike the heartbeat timer, NetworkProfile has no dedicated
+// republication-jitter field (IC §12.2 does not call for one), so jitter is
+// derived from the existing interval rather than adding a new profile
+// field. Still closes the real operational gap M6 review §8 flagged:
+// without this, a fleet of daemons started around the same time
+// republishes in lockstep on every cycle.
+const dhtRepublishJitterFraction = 10 // interval/10 = ±10% jitter
+
+// jitteredRepublishInterval applies ±(base/dhtRepublishJitterFraction)
+// jitter to base, reusing the existing, already-tested jitteredInterval
+// helper. Falls back to base unchanged if the derived jitter window is too
+// small to be meaningful (e.g. an aggressively fast test profile).
+// [REF: IC §12.2, M6 review §8]
+func jitteredRepublishInterval(base time.Duration) time.Duration {
+	jitter := base / dhtRepublishJitterFraction
+	if jitter <= 0 {
+		return base
+	}
+	return jitteredInterval(base, jitter)
+}
 // jitteredInterval returns base plus a uniformly random offset in
 // [-jitter, +jitter]. jitter <= 0 returns base unchanged.
 func jitteredInterval(base, jitter time.Duration) time.Duration {
@@ -345,6 +370,26 @@ func postHeartbeat(ctx context.Context, client *http.Client, url string, body []
 //     available to the daemon after upload completes (IC §12.2).
 //  2. Call cfg.DHT.PutProviderRecord(ctx, dhtKey) for each, best-effort: one
 //     failed key does not abort the batch.
+const (
+	// doRepublishMaxConcurrency bounds how many PutProviderRecord calls run
+	// in parallel during one republish cycle — without this, republication
+	// is fully serial, and each PutProviderRecord internally opens up to
+	// kBucketSize (dht.go) fresh streams of its own.
+	doRepublishMaxConcurrency = 8
+
+	// doRepublishMaxPerCycle caps how many chunks a single republish cycle
+	// attempts. A provider can hold up to ~200,000+ chunks at 50GB declared
+	// storage (ARCH §27.2) — without a cap, one cycle could still be
+	// running when the next DHTRepublishInterval fires. Any keys beyond the
+	// cap are simply picked up on a later cycle (AllChunkDHTKeys is
+	// re-queried fresh every cycle, so there is no missed-forever key, only
+	// a bounded delay before retry — IC §12.2's staleness window is hours,
+	// not seconds, so this delay is immaterial in practice).
+	//
+	// [REF: ARCH §27.2, IC §12.2, M6 review §8]
+	doRepublishMaxPerCycle = 5000
+)
+
 func doRepublish(ctx context.Context, cfg HeartbeatConfig) {
 	if cfg.Store == nil || cfg.DHT == nil {
 		return
@@ -356,14 +401,44 @@ func doRepublish(ctx context.Context, cfg HeartbeatConfig) {
 		return
 	}
 
-	var failed int
-	for chunkID, dhtKey := range keys {
-		if err := cfg.DHT.PutProviderRecord(ctx, dhtKey[:]); err != nil {
-			failed++
-			log.Printf("[republish] chunk %x: PutProviderRecord failed: %v", chunkID, err)
-		}
+	type republishJob struct {
+		chunkID [32]byte
+		dhtKey  [32]byte
 	}
+	jobs := make(chan republishJob, doRepublishMaxConcurrency)
+
+	var wg sync.WaitGroup
+	var failed int32 // written concurrently by worker goroutines below; read after wg.Wait()
+	for i := 0; i < doRepublishMaxConcurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range jobs {
+				if err := cfg.DHT.PutProviderRecord(ctx, j.dhtKey[:]); err != nil {
+					atomic.AddInt32(&failed, 1)
+					log.Printf("[republish] chunk %x: PutProviderRecord failed: %v", j.chunkID, err)
+				}
+			}
+		}()
+	}
+
+	// Only this goroutine ever touches attempted/skipped — no atomics needed.
+	attempted, skipped := 0, 0
+	for chunkID, dhtKey := range keys {
+		if attempted >= doRepublishMaxPerCycle {
+			skipped++
+			continue
+		}
+		attempted++
+		jobs <- republishJob{chunkID: chunkID, dhtKey: dhtKey}
+	}
+	close(jobs)
+	wg.Wait()
+
 	if failed > 0 {
-		log.Printf("[republish] %d/%d chunk records failed to republish this cycle", failed, len(keys))
+		log.Printf("[republish] %d/%d chunk records failed to republish this cycle", failed, attempted)
+	}
+	if skipped > 0 {
+		log.Printf("[republish] %d chunk records deferred to a later cycle (per-cycle cap %d reached)", skipped, doRepublishMaxPerCycle)
 	}
 }

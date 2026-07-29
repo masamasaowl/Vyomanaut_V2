@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -607,5 +608,30 @@ func TestRunHeartbeatUsesProfileIntervalsNotHardcoded(t *testing.T) {
 	}
 	if prodInterval <= time.Hour {
 		t.Errorf("production jittered interval = %v, want well over 1 hour", prodInterval)
+	}
+}
+
+// TestDoRepublishCapsPerCycleAndDefersRemainder verifies that a chunk count
+// exceeding doRepublishMaxPerCycle only attempts the cap's worth in a
+// single doRepublish call, deferring the rest. [REF: ARCH §27.2, M6 review §8]
+func TestDoRepublishCapsPerCycleAndDefersRemainder(t *testing.T) {
+	keys := make(map[[32]byte][32]byte, doRepublishMaxPerCycle+50)
+	for i := 0; i < doRepublishMaxPerCycle+50; i++ {
+		var chunkID, dhtKey [32]byte
+		binary.BigEndian.PutUint32(chunkID[:4], uint32(i))
+		binary.BigEndian.PutUint32(dhtKey[:4], uint32(i))
+		keys[chunkID] = dhtKey
+	}
+	store := &fakeChunkDHTKeySource{keys: keys}
+	dht := &fakeDHT{}
+
+	cfg := HeartbeatConfig{Store: store, DHT: dht}
+	doRepublish(context.Background(), cfg)
+
+	dht.mu.Lock()
+	got := len(dht.puts)
+	dht.mu.Unlock()
+	if got != doRepublishMaxPerCycle {
+		t.Errorf("PutProviderRecord called %d times in one cycle, want exactly the cap (%d)", got, doRepublishMaxPerCycle)
 	}
 }
