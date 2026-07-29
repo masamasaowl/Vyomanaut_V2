@@ -236,6 +236,7 @@ func isCGNAT(ip net.IP) bool {
 	}
 	return ip4[0] == 100 && ip4[1]&0xC0 == 0x40
 }
+
 // ── Tier 2: TCP simultaneous-open hole punch (DCUtR analogue) ────────────────
 
 // HolePunchResult reports the outcome of a hole-punch attempt.

@@ -190,6 +190,7 @@ func jitteredRepublishInterval(base time.Duration) time.Duration {
 	}
 	return jitteredInterval(base, jitter)
 }
+
 // jitteredInterval returns base plus a uniformly random offset in
 // [-jitter, +jitter]. jitter <= 0 returns base unchanged.
 func jitteredInterval(base, jitter time.Duration) time.Duration {

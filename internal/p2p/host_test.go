@@ -234,6 +234,7 @@ func portOf(t *testing.T, hostport string) string {
 	t.Fatalf("portOf: no colon in %q", hostport)
 	return ""
 }
+
 // TestHostConnectPrioritizesPeerIDMismatchOverLaterBenignFailure verifies
 // that a genuine ErrPeerIDMismatch on an EARLIER address in the list is not
 // masked by a later, unrelated, benign failure (e.g. nothing listening) on
