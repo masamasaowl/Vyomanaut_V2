@@ -122,6 +122,11 @@ type host struct {
 	sessionCacheFor map[PeerID]tls.ClientSessionCache
 	natStatus       NATStatus
 	closed          bool
+
+	// closeCh is closed exactly once, by Close(), to signal any background
+	// goroutine tied to this host's lifetime (currently: SetupNAT's reprobe
+	// loop, nat.go) that it must stop. [REF: M6 review §5.1]
+	closeCh chan struct{}
 }
 
 // HostConfig supplies the identity and listen address for NewHost.
@@ -160,6 +165,7 @@ func NewHost(cfg HostConfig) (Host, error) {
 		handlers:        make(map[ProtocolID]StreamHandler),
 		knownAddrs:      make(map[PeerID]Multiaddr),
 		sessionCacheFor: make(map[PeerID]tls.ClientSessionCache),
+		closeCh:         make(chan struct{}), // closed once by Close() (M6 review §5.1)
 	}
 
 	if cfg.ListenAddr != "" {
@@ -362,6 +368,12 @@ func (h *host) Close() error {
 	h.closed = true
 	ln := h.listener
 	h.mu.Unlock()
+
+	// Signal any background goroutine tied to this host's lifetime (e.g.
+	// SetupNAT's reprobe loop, nat.go) to stop. Safe to close exactly once
+	// here because h.closed above already guards this whole block against
+	// running twice. [REF: M6 review §5.1]
+	close(h.closeCh)
 
 	if ln != nil {
 		return ln.Close()

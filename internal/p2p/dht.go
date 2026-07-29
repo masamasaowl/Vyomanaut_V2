@@ -57,10 +57,13 @@ const dhtMode = "Server"
 const dhtKeyLen = 32
 
 // defaultRecordTTL is used when DHTConfig.RecordTTL is zero. Real deployments
-// should pass profile.DHTExpiryDuration (12h prod / 4min demo per
-// NetworkProfile) — this package intentionally does not import internal/config
-// (consistent with keeping internal/p2p dependency-free), so the caller is
-// responsible for threading the profile-appropriate value through DHTConfig.
+// should pass profile.DHTExpiryDuration (24h prod / 4min demo per
+// NetworkProfile — not DHTRepublishInterval, a different field, which is
+// 12h prod / 2min demo; M6 review §1 flagged this comment for citing
+// DHTRepublishInterval's values while naming DHTExpiryDuration) — this
+// package intentionally does not import internal/config (consistent with
+// keeping internal/p2p dependency-free), so the caller is responsible for
+// threading the profile-appropriate value through DHTConfig.
 const defaultRecordTTL = 24 * time.Hour
 
 // maxGetCount is the maximum count encoded in a single GET_PROVIDERS request.
