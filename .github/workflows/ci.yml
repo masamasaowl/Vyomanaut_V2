@@ -226,7 +226,7 @@ jobs:
           PGPASSWORD: testpass
           PGVERIFY_USER: vyomanaut_migrator
           PGVERIFY_PASSWORD: testpass
-        run: go test -race -count=1 ./...
+        run: go test -race -count=1 -p 1 ./...
       
 
       # ─────────────────────────────────────────────────────────────
