@@ -107,6 +107,8 @@ func NewRouter(cfg RouterConfig) *http.ServeMux {
 	otpHandler := NewOtpHandler(cfg.DB, cfg.OtpSender)
 	otpVerifyHandler := NewOtpVerifyHandler(otpHandler, cfg.JWTPrivateKey)
 	tokenRefreshHandler := NewProviderTokenRefreshHandler(cfg.DB, cfg.JWTPublicKey, cfg.JWTPrivateKey)
+	pricingEstimateHandler := NewPricingEstimateHandler(cfg.Profile)
+	providerEarningsEstimateHandler := NewProviderEarningsEstimateHandler(cfg.Profile)
 	ownerRegisterHandler := NewOwnerRegisterHandler(cfg.DB, cfg.JWTPrivateKey)
 	var ownerDepositHandler *OwnerDepositHandler
 	if cfg.PaymentProvider != nil {
@@ -125,11 +127,11 @@ func NewRouter(cfg RouterConfig) *http.ServeMux {
 	}
 
 	// ── Public routes: no auth middleware ──────────────────────────────────
-	mux.HandleFunc("GET /.well-known/jwks.json", HandleJWKS(cfg.JWTPublicKey, cfg.JWTKeyID)) // getJwks
-	mux.HandleFunc("POST /api/v1/auth/otp/send", otpHandler.HandleSend)                      // sendOtp
-	mux.HandleFunc("POST /api/v1/auth/otp/verify", otpVerifyHandler.HandleVerify)            // verifyOtp
-	mux.HandleFunc("GET /api/v1/pricing/estimate", stub501)                                  // getPricingEstimate
-	mux.HandleFunc("GET /api/v1/pricing/provider-estimate", stub501)                         // getProviderEarningsEstimate
+	mux.HandleFunc("GET /.well-known/jwks.json", HandleJWKS(cfg.JWTPublicKey, cfg.JWTKeyID))                // getJwks
+	mux.HandleFunc("POST /api/v1/auth/otp/send", otpHandler.HandleSend)                                     // sendOtp
+	mux.HandleFunc("POST /api/v1/auth/otp/verify", otpVerifyHandler.HandleVerify)                           // verifyOtp
+	mux.HandleFunc("GET /api/v1/pricing/estimate", pricingEstimateHandler.HandleEstimate)                   // getPricingEstimate
+	mux.HandleFunc("GET /api/v1/pricing/provider-estimate", providerEarningsEstimateHandler.HandleEstimate) // getProviderEarningsEstimate
 
 	// ── BearerAuth routes ────────────────────────────────────────────────────
 	// register endpoints accept ANY validly-signed token, registration
