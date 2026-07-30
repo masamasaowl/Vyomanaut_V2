@@ -28,6 +28,27 @@ var (
 	// ADR-015).
 	ErrReceiptAlreadyFinal = errors.New("audit: receipt already has a terminal result")
 
+	// ErrReplayDetected is returned by WriteReceiptPhase1 when
+	// challenge_nonce has already been used in a prior audit_receipts row —
+	// the audit_receipt_nonces PRIMARY KEY (DM §4.7, ADR-033) rejecting a
+	// replayed nonce. Unlike ErrReceiptAlreadyFinal, this is NOT a legitimate
+	// idempotent retry: a replayed nonce means a provider (or an attacker)
+	// is resubmitting proof against a challenge that was already answered
+	// once, under a different server_challenge_ts. Callers must treat this
+	// as a hard rejection of the dispatch attempt.
+	ErrReplayDetected = errors.New("audit: challenge nonce already used (replay detected)")
+
+	// ErrResponseAlreadyRecorded is returned by WriteReceiptRecordResponse
+	// when the target row's response-derived columns are already populated
+	// (response_hash IS NOT NULL) — the idempotent-retry counterpart to
+	// ErrReceiptAlreadyFinal, one step earlier in the three-phase pipeline
+	// (IC §5.5 Option B): a provider's signed response was already recorded
+	// for this receipt, whether or not WriteReceiptPhase2 has adjudicated it
+	// yet. Also returned if the row is already abandoned or already final,
+	// for the same reason WriteReceiptPhase2's own WHERE clause cannot
+	// distinguish those cases from each other.
+	ErrResponseAlreadyRecorded = errors.New("audit: response already recorded for this receipt")
+
 	// ErrSecretNotFound mirrors IC §8: the requested secrets-manager path
 	// does not exist.
 	ErrSecretNotFound = errors.New("audit: secret path not found")
