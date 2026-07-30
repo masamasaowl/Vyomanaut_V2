@@ -214,7 +214,7 @@ func (h *ProviderEarningsEstimateHandler) HandleEstimate(w http.ResponseWriter, 
 		return
 	}
 
-	grossExact := float64(storageGB) * float64(h.profile.StorageRatePaisePerGBPerMonth) * (uptimeTargetPct / 100.0)
+	grossExact := float64(storageGB) * float64(h.profile.StorageRatePaisePerGBPerMonth) * (uptimeTargetPct / maxUptimeTargetPct)
 	gross := int64(grossExact + roundingHalf)
 
 	vettingPortion := gross * vettingReleaseCapBP / pricingBasisPointsDivisor
