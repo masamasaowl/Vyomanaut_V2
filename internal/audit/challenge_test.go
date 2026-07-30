@@ -2,12 +2,14 @@
 // Unit tests for ChallengeNonce.
 //
 // Tests:
-//   - TestChallengeNonceLength                 always exactly 33 bytes
 //   - TestChallengeNonceVersionByte             nonce[0] == versionByte
 //   - TestChallengeNonceDeterministic           identical inputs → identical nonce
 //   - TestChallengeNonceVariesWithTs            different serverTsMs → different nonce
 //   - TestChallengeNonceVariesWithChunk         different chunkID → different nonce
 //   - TestChallengeNoncePanicsOnBadSecretLength wrong-length secret → panic
+//
+// NOTE: no TestChallengeNonceLength — see the NO RUNTIME TEST note below,
+// just above TestChallengeNonceVersionByte.
 //
 // [REF: IC §5.5, FR-038, DM §3 Invariant 5, build.md Phase 7.1 Session 7.1.1]
 
@@ -49,18 +51,25 @@ const (
 )
 
 // TestChallengeNonceLength verifies the output is always exactly 33 bytes.
-// The [33]byte return type enforces this at compile time; this test makes
-// the invariant visible in the suite.
-// Hits SA4006: this value of nonce is never used (staticcheck)
-// Commented out; Open for fixes
+// NO RUNTIME TEST FOR "nonce IS 33 BYTES": ChallengeNonce's return type is
+// [33]byte, a fixed-size array — Go's type system makes every returned value
+// exactly 33 bytes at compile time; there is no runtime path that could ever
+// produce a different length to catch. An earlier attempt at
+// TestChallengeNonceLength (asserting len(nonce) == 33) was dead code by
+// construction — always true, unreachable failure branch — and correctly
+// tripped staticcheck's SA4006 ("value never used") on the local `nonce`
+// binding, since the only thing done with it was a tautological length
+// check. It was commented out rather than fixed and left dangling in the
+// Tests list below and in build.md's Phase 7.1.1 VERIFY block; both are
+// corrected here (Milestone 7 corrections session) by removing the
+// reference rather than resurrecting an unfixable test. DM §3 Invariant 5's
+// 33-byte requirement DOES have a real runtime check — but it belongs to
+// audit_receipts' octet_length(challenge_nonce) = 33 CHECK constraint (DM
+// §4.7), which guards the boundary where the value leaves Go's type system
+// (nonce[:] becomes a plain []byte for the SQL parameter) — not to this
+// package.
 //
-// [REF: DM §3 Invariant 5, build.md Phase 7.1 Session 7.1.1]
-// func TestChallengeNonceLength(t *testing.T) {
-// 	nonce := ChallengeNonce(katServerSecret[:], 0, katChunkID, katServerTsMs)
-// 	if len(nonce) != 33 {
-// 		t.Errorf("ChallengeNonce: len = %d, want 33", len(nonce))
-// 	}
-// }
+// [REF: DM §3 Invariant 5, DM §4.7, build.md Phase 7.1 Session 7.1.1]
 
 // TestChallengeNonceVersionByte verifies nonce[0] == versionByte across the
 // uint8 boundaries and a representative middle value.
