@@ -108,7 +108,6 @@ linters:
             - "**/internal/audit/**"
           allow:
             - $gostd
-            - github.com/masamasaowl/Vyomanaut_V2/internal/config
             - github.com/masamasaowl/Vyomanaut_V2/internal/crypto
             - github.com/google/uuid
             - github.com/lib/pq
