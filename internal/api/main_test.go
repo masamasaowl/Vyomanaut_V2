@@ -79,7 +79,11 @@ func runTestMain(m *testing.M) int {
 		fmt.Fprintf(os.Stderr, "TestMain: sql.Open failed (%v) — running the suite anyway; individual tests will skip via their own t.Skipf if Postgres is unreachable\n", err)
 		return m.Run()
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "TestMain: failed to close database: %v\n", err)
+		}
+	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
