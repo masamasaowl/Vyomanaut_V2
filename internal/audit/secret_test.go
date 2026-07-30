@@ -17,6 +17,8 @@
 //   - TestClusterSecretCacheExpiresAfterTTL             TTL elapsed + unreachable -> ErrSecretExpired
 //   - TestClusterSecretCacheRotationOverlap             both vN and vN+1 loaded -> IsVersionValid true for both
 //   - TestClusterSecretCacheRejectsRetiredVersion       version outside the 24h overlap -> IsVersionValid false
+//   - TestClusterSecretCacheLoadRecoversFromPrunedBaseVersion  base version pruned -> Load scans forward and recovers
+//   - TestClusterSecretCacheLoadFailsWhenScanExhausted  no version within the scan bound -> clear error, no infinite scan
 //
 // [REF: IC §8, MVP §8.2, build.md Phase 7.4 Session 7.4.1]
 
@@ -233,5 +235,56 @@ func TestClusterSecretCacheRejectsRetiredVersion(t *testing.T) {
 
 	if _, err := cache.SecretForVersion(1); !errors.Is(err, ErrSecretNotFound) {
 		t.Errorf("SecretForVersion(1) after retirement: got %v, want ErrSecretNotFound", err)
+	}
+}
+
+// TestClusterSecretCacheLoadRecoversFromPrunedBaseVersion verifies the
+// Milestone 7 corrections session fix: a cold-started cache whose assumed
+// base version (1) has already been pruned — because the cluster has
+// rotated well past it by the time this replica joins — must recover by
+// scanning forward, not fail outright. Before the fix, this scenario made
+// Load unrecoverable: it would try v1, get ErrSecretNotFound, and return an
+// error every time it was called, forever.
+//
+// [REF: IC §8, ADR-027; Milestone 7 corrections session]
+func TestClusterSecretCacheLoadRecoversFromPrunedBaseVersion(t *testing.T) {
+	fake := newFakeSecretsManager()
+	// v1..v4 deliberately absent (pruned) — only v5 survives.
+	fake.set(5, testSecret(0x07))
+	cache := NewClusterSecretCache(fake)
+
+	if err := cache.Load(context.Background()); err != nil {
+		t.Fatalf("Load: %v, want nil (should recover by scanning forward to v5)", err)
+	}
+
+	secret, version, err := cache.CurrentSecret()
+	if err != nil {
+		t.Fatalf("CurrentSecret: %v", err)
+	}
+	if version != 5 {
+		t.Errorf("version = %d, want 5", version)
+	}
+	if string(secret) != string(testSecret(0x07)) {
+		t.Errorf("secret = %x, want %x", secret, testSecret(0x07))
+	}
+}
+
+// TestClusterSecretCacheLoadFailsWhenScanExhausted verifies that when no
+// surviving version exists within secretScanUpperBound versions of the
+// pruned base, Load returns a clear error rather than scanning forever or
+// silently succeeding with no secret.
+//
+// [REF: IC §8, ADR-027; Milestone 7 corrections session]
+func TestClusterSecretCacheLoadFailsWhenScanExhausted(t *testing.T) {
+	fake := newFakeSecretsManager()
+	// Nothing set at all within v1..v(1+secretScanUpperBound).
+	cache := NewClusterSecretCache(fake)
+
+	err := cache.Load(context.Background())
+	if err == nil {
+		t.Fatal("Load: expected an error when no version exists within the scan bound, got nil")
+	}
+	if _, _, curErr := cache.CurrentSecret(); curErr == nil {
+		t.Error("CurrentSecret: expected an error after Load never succeeded, got nil")
 	}
 }
