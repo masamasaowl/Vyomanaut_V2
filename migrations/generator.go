@@ -1240,10 +1240,10 @@ CREATE POLICY audit_receipts_insert_only
     WITH CHECK (TRUE);
 
 -- Phase 2 of the two-phase write: promotes a PENDING row to its terminal
--- state. This is the ONLY permitted UPDATE on audit_receipts. Scope is
--- narrowly limited: only audit_result, service_sig, and
--- service_countersign_ts may be written; all other fields are immutable
--- once the Phase 1 INSERT completes.
+-- state. This is the ONLY permitted UPDATE on audit_receipts that sets a
+-- terminal audit_result. Scope is narrowly limited: only audit_result,
+-- service_sig, and service_countersign_ts may be written; all other fields
+-- are immutable once the Phase 1 INSERT completes.
 CREATE POLICY audit_receipts_phase2_update
     ON audit_receipts
     FOR UPDATE
@@ -1253,6 +1253,34 @@ CREATE POLICY audit_receipts_phase2_update
         audit_result   IN ('PASS', 'FAIL', 'TIMEOUT') AND
         service_sig    IS NOT NULL AND
         service_countersign_ts IS NOT NULL
+    );
+
+-- Milestone 7 corrections session (Option B, three-phase write): persists
+-- response_hash, provider_sig, response_latency_ms, and jit_flag onto a
+-- still-PENDING row the instant a provider's signed response is validated —
+-- BEFORE audit_receipts_phase2_update above adjudicates PASS/FAIL/TIMEOUT.
+-- This is a SEPARATE PERMISSIVE policy, not an edit to
+-- audit_receipts_phase2_update above: PostgreSQL ORs the USING/WITH CHECK
+-- clauses of multiple PERMISSIVE policies for the same role and command, so
+-- the two policies together cover exactly the two UPDATE shapes vyomanaut_app
+-- performs on this table — audit_result staying NULL (this policy) or
+-- becoming terminal (the policy above) — and nothing else. WITH CHECK below
+-- requires audit_result to REMAIN NULL specifically so this policy can never
+-- be (ab)used to set a terminal result without going through the policy
+-- above.
+CREATE POLICY audit_receipts_record_response
+    ON audit_receipts
+    FOR UPDATE
+    TO vyomanaut_app
+    USING (
+        audit_result IS NULL AND
+        abandoned_at IS NULL AND
+        response_hash IS NULL
+    )
+    WITH CHECK (
+        audit_result   IS NULL AND
+        response_hash  IS NOT NULL AND
+        provider_sig   IS NOT NULL
     );
 
 -- Allow the GC process to mark stale PENDING rows as abandoned after 48h,
