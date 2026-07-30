@@ -1,17 +1,19 @@
 // Package audit is declared in doc.go.
-// Unit and live-database integration tests for WriteReceiptPhase1 and
-// WriteReceiptPhase2.
+// Unit and live-database integration tests for WriteReceiptPhase1,
+// WriteReceiptRecordResponse, and WriteReceiptPhase2 — the three-phase
+// crash-safe audit_receipts write (Option B, Milestone 7 corrections
+// session).
 //
 // DB-dependent tests use TWO connections:
 //   - db (openTestDB): authenticated as vyomanaut_app, the restricted role
-//     WriteReceiptPhase1/WriteReceiptPhase2 actually run as in production.
-//     Only this connection is ever passed into the functions under test.
+//     WriteReceiptPhase1/WriteReceiptRecordResponse/WriteReceiptPhase2
+//     actually run as in production. Only this connection is ever passed
+//     into the functions under test.
 //   - verify (openVerifyDB): authenticated as a privileged role (default:
-//     the postgres superuser), used ONLY to read back and independently
-//     confirm state. This exists because DM §6 defines no SELECT policy for
-//     vyomanaut_app on audit_receipts — confirmed live: vyomanaut_app cannot
-//     read back a row via plain SELECT even immediately after inserting it
-//     itself. See openVerifyDB's doc comment for the full finding.
+//     the postgres superuser; CI: vyomanaut_migrator), used ONLY to read
+//     back and independently confirm state, and to seed/inspect fixtures
+//     (e.g. simulating GC abandonment) that vyomanaut_app's own RLS policies
+//     correctly forbid it from doing itself.
 //
 // Both connections use the PG*-style environment variable convention
 // scripts/ci/migration_check.sh already established (PGHOST, PGPORT,
@@ -25,48 +27,34 @@
 // whenever a live database is available.
 //
 // Tests:
-//   - TestWriteReceiptPhase1InsertsPending           audit_result IS NULL after insert
-//   - TestWriteReceiptPhase1ReturnsUUIDv7             receipt_id is a valid, time-ordered UUIDv7
-//   - TestWriteReceiptPhase1RejectsBadFields          missing required field -> error, no row created
-//   - TestWriteReceiptPhase2PromotesToTerminal        PENDING -> PASS/FAIL/TIMEOUT succeeds
-//   - TestWriteReceiptPhase2Idempotent                second call -> ErrReceiptAlreadyFinal, no second row
-//   - TestWriteReceiptPhase2RejectsAbandonedRow       abandoned_at IS NOT NULL -> error, not silent success
-//   - TestWriteReceiptPhase2OnlyTouchesAllowedColumns all other columns unchanged after update
+//   - TestWriteReceiptPhase1InsertsPending             audit_result IS NULL after insert
+//   - TestWriteReceiptPhase1ReturnsUUIDv7               receipt_id is a valid, time-ordered UUIDv7
+//   - TestWriteReceiptPhase1RejectsBadFields            missing required field -> error, no row created
+//   - TestWriteReceiptPhase1RejectsReplayedNonce        same nonce, different server_challenge_ts -> ErrReplayDetected, no row created
+//   - TestWriteReceiptRecordResponsePersistsJITFlag     response_hash/provider_sig/response_latency_ms/jit_flag all land
+//   - TestWriteReceiptRecordResponseIdempotent          second call for the same receipt -> ErrResponseAlreadyRecorded
+//   - TestWriteReceiptPhase2PromotesToTerminal          PENDING -> PASS/FAIL/TIMEOUT all succeed (PASS/FAIL via RecordResponse first)
+//   - TestWriteReceiptPhase2RejectsPassFailWithoutRecordResponse  PASS/FAIL skipping RecordResponse -> CHECK-constraint error, not silent success
+//   - TestWriteReceiptPhase2Idempotent                  second call -> ErrReceiptAlreadyFinal, no second row
+//   - TestWriteReceiptPhase2RejectsAbandonedRow          abandoned_at IS NOT NULL -> error, not silent success
+//   - TestWriteReceiptPhase2OnlyTouchesAllowedColumns    all other columns unchanged after update
 //
-// TWO SCHEMA-LEVEL FINDINGS, both confirmed against a live database rather
-// than just read from the DDL, both affecting whether the Phase 2 tests
-// below can pass at all:
+// HISTORICAL NOTE (both resolved as of the Milestone 7 corrections session —
+// left here so the resolution is traceable, not because either still
+// applies):
+//   1. An earlier schema revision defined no SELECT policy for vyomanaut_app
+//      on audit_receipts, which made every WriteReceiptPhase2 call affect
+//      zero rows under RLS regardless of the target row's actual state.
+//      audit_receipts_app_select (ADR-032) has since closed this; confirmed
+//      live in this session against the current migration.
+//   2. WriteReceiptPhase2's signature originally had no path for
+//      response_hash/provider_sig ever to become non-NULL, so only
+//      AuditTimeout's branch of audit_receipts_response_consistency was
+//      reachable. WriteReceiptRecordResponse (this session, Option B) closes
+//      this — see receipt.go.
 //
-//  1. DM §6 defines no SELECT policy for vyomanaut_app (or vyomanaut_gc) on
-//     audit_receipts. PostgreSQL's RLS implementation requires an
-//     applicable SELECT policy for UPDATE/DELETE to locate candidate rows
-//     in the first place — an UPDATE-only policy's own USING clause is NOT
-//     sufficient by itself. Without a SELECT policy, every
-//     WriteReceiptPhase2 call affects zero rows regardless of the target
-//     row's actual state, which WriteReceiptPhase2 cannot distinguish from
-//     a legitimately-already-final row, so it returns ErrReceiptAlreadyFinal
-//     for every call. This was reproduced with a minimal, isolated raw-SQL
-//     UPDATE outside of any Go code before being traced back here.
-//  2. Independently, DM §4.7's audit_receipts_response_consistency CHECK
-//     constraint requires response_hash and provider_sig to be non-NULL for
-//     audit_result IN ('PASS','FAIL') — columns neither WriteReceiptPhase1
-//     nor WriteReceiptPhase2 has any parameter to populate. Only
-//     AuditTimeout's branch of that constraint (both columns NULL) is
-//     reachable through the two functions as currently specified.
-//
-// Neither finding is a bug in WriteReceiptPhase1/WriteReceiptPhase2's own
-// logic — both functions correctly implement the SQL their specifications
-// describe. They are gaps in the schema/interface those functions write
-// against. This test file works around finding 1 for its own verification
-// purposes only (see openVerifyDB's SANDBOX SETUP note) and turns finding 2
-// into an explicit regression assertion (TestWriteReceiptPhase2PromotesToTerminal).
-// Run against a database migrated EXACTLY per the DM §6 DDL as given, with
-// no local patching, every Phase 2 test in this file would fail outright
-// (not skip) with ErrReceiptAlreadyFinal — that failure is the correct,
-// intended signal that DM §6 needs a SELECT policy before this code can
-// function in production; see receipt.go's WriteReceiptPhase2 doc comment.
-//
-// [REF: IC §5.5, DM §4.7, DM §6, ADR-015, build.md Phase 7.3 Sessions 7.3.1 and 7.3.2]
+// [REF: IC §5.5, IC §6, DM §4.7, DM §6, ADR-015, ADR-032, ADR-033, build.md
+//  Phase 7.3 Sessions 7.3.1 and 7.3.2]
 
 package audit
 
@@ -102,50 +90,29 @@ func openTestDB(t *testing.T) *sql.DB {
 }
 
 // openVerifyDB returns a second *sql.DB, authenticated as a privileged role
-// (default: the postgres superuser), used ONLY to read back and independently
-// verify state after calling WriteReceiptPhase1/WriteReceiptPhase2 through
-// the vyomanaut_app-authenticated db from openTestDB.
+// (default: the postgres superuser; CI: vyomanaut_migrator, matching ci.yml's
+// postgres service — see the CI ROLE NOTE below), used ONLY to read back and
+// independently verify state after calling
+// WriteReceiptPhase1/WriteReceiptRecordResponse/WriteReceiptPhase2 through
+// the vyomanaut_app-authenticated db from openTestDB, and to seed fixtures
+// vyomanaut_app's own RLS policies correctly forbid it from creating itself
+// (e.g. TestWriteReceiptPhase2RejectsAbandonedRow's simulated GC abandonment).
 //
-// This second connection exists because DM §6 defines exactly three policies
-// on audit_receipts — audit_receipts_insert_only (INSERT), and two UPDATE
-// policies (audit_receipts_phase2_update for vyomanaut_app,
-// audit_receipts_gc_abandon for vyomanaut_gc) — and NO SELECT policy for any
-// role. Confirmed against a live database: vyomanaut_app cannot read back a
-// row via plain SELECT even immediately after inserting it itself; RLS
-// silently returns zero rows rather than erroring. WriteReceiptPhase1 and
-// WriteReceiptPhase2 never need to SELECT (Phase 1 returns the UUID it
-// generated itself; Phase 2 uses ExecContext + RowsAffected, not a readback),
-// so this is not a bug in either function — but it does mean any FUTURE
-// caller wanting to read audit_receipts as vyomanaut_app (e.g. ADR-015's
-// "return the existing countersignature on a duplicate response" idempotent-
-// retry text) will need either a SELECT policy added to DM §6 or a
-// RETURNING-based read path; flagged for whoever picks that up next
-// (Milestone 12's dispatch loop is the first caller who will hit this).
-//
-// SEPARATE CI CAVEAT, also worth flagging here: ci.yml's postgres service
-// sets POSTGRES_USER: vyomanaut_app, and the official postgres Docker image
-// makes POSTGRES_USER the bootstrap superuser. migrations/generator.go's
-// role-creation block is `CREATE ROLE vyomanaut_app` guarded by
-// `IF NOT EXISTS` — so against ci.yml's actual service container, that role
-// already exists (as a superuser, from image bootstrap) before the migration
-// ever runs, and the guarded CREATE ROLE is skipped. Superusers bypass RLS
-// entirely in PostgreSQL. Net effect: as ci.yml and the migration are
-// currently configured, audit_receipts' row security policies are never
-// actually exercised in CI — go test would pass against a superuser
-// vyomanaut_app even if every policy above were deleted. This test file
-// still exercises RLS correctly against a properly-restricted vyomanaut_app
-// (that's the whole reason for the two-connection split above), but closing
-// this gap for real CI runs needs a fix in ci.yml or the migration itself
-// (e.g. bootstrapping under a differently-named superuser and creating
-// vyomanaut_app restricted from scratch) — out of scope for this session.
-// SANDBOX SETUP NOTE: to actually exercise WriteReceiptPhase2 end to end
-// during development of this session, a temporary, LOCAL-ONLY SELECT policy
-// was added directly via psql against the verification database — it is not
-// part of any file in migrations/ and is not shipped. Applying only the real
-// migration DDL (DM §6 exactly as given) reproduces finding 1 above: every
-// Phase 2 test in this file fails with ErrReceiptAlreadyFinal until that gap
-// is closed for real, in migrations/, by someone with the review authority
-// CODEOWNERS requires for that path.
+// CI ROLE NOTE, corrected as of the Milestone 7 corrections session: an
+// earlier version of this comment claimed ci.yml's postgres service bootstrapped
+// POSTGRES_USER as vyomanaut_app itself, making it a superuser that bypasses
+// RLS entirely and meaning this file's Phase 2 tests would pass in CI even
+// with every policy deleted. That was true of an older ci.yml revision.
+// Current ci.yml (confirmed by reading it directly, not by trusting this
+// comment) bootstraps as vyomanaut_migrator; migrations/generator.go creates
+// vyomanaut_app and vyomanaut_gc as ordinary, non-superuser roles via
+// CREATE ROLE ... IF NOT EXISTS, and scripts/ci/migration_check.sh's
+// app_gc_no_bypassrls / app_select_policies_present checks are a hard CI
+// gate confirming neither role is a superuser or has BYPASSRLS. Re-verified
+// live in this session by running migration_check.sh against a database
+// bootstrapped exactly like ci.yml's service — all 30 checks pass. RLS is
+// genuinely exercised in CI today; this test file's two-connection split
+// exercises the identical boundary in local development.
 func openVerifyDB(t *testing.T) *sql.DB {
 	t.Helper()
 	return openAndPing(t, testDSN("PGVERIFY_USER", "postgres", "PGVERIFY_PASSWORD"))
@@ -337,27 +304,199 @@ func TestWriteReceiptPhase1RejectsBadFields(t *testing.T) {
 	}
 }
 
+// ── WriteReceiptPhase1 replay protection ──────────────────────────────────
+
+// TestWriteReceiptPhase1RejectsReplayedNonce verifies the fix for the
+// Milestone 7 corrections session's highest-priority finding: a
+// challenge_nonce reused with a DIFFERENT server_challenge_ts must be
+// rejected, not silently accepted as a second row. Before the fix, this
+// exact scenario was reproduced live (a duplicate nonce with a later
+// timestamp was accepted, producing two audit_receipts rows for one
+// challenge) — audit_receipts_nonce_unique alone
+// (UNIQUE(challenge_nonce, server_challenge_ts), necessarily scoped to the
+// partition key per ADR-033) cannot catch this; only audit_receipt_nonces'
+// PRIMARY KEY on challenge_nonce ALONE can, and WriteReceiptPhase1 never
+// wrote to that table until this session.
+func TestWriteReceiptPhase1RejectsReplayedNonce(t *testing.T) {
+	db := openTestDB(t)
+	verify := openVerifyDB(t)
+	providerID := ensureTestProvider(t, db)
+
+	fields := freshFields(providerID)
+	id1, err := WriteReceiptPhase1(context.Background(), db, fields)
+	if err != nil {
+		t.Fatalf("first WriteReceiptPhase1: %v", err)
+	}
+
+	// Same nonce, different server_challenge_ts, different chunk — exactly
+	// the scenario audit_receipts_nonce_unique's per-partition scope misses.
+	replay := fields
+	replay.ChunkID = randChunkID()
+	replay.ServerChallengeTs = fields.ServerChallengeTs.Add(5 * time.Minute)
+
+	_, err = WriteReceiptPhase1(context.Background(), db, replay)
+	if !errors.Is(err, ErrReplayDetected) {
+		t.Fatalf("replayed nonce: got %v, want ErrReplayDetected", err)
+	}
+
+	var count int
+	if err := verify.QueryRow(`SELECT COUNT(*) FROM audit_receipts WHERE challenge_nonce = $1`, fields.ChallengeNonce[:]).Scan(&count); err != nil {
+		t.Fatalf("count for challenge_nonce: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("audit_receipts rows for this nonce = %d, want exactly 1 (the replay must not create a second row)", count)
+	}
+
+	var nonceCount int
+	if err := verify.QueryRow(`SELECT COUNT(*) FROM audit_receipt_nonces WHERE challenge_nonce = $1`, fields.ChallengeNonce[:]).Scan(&nonceCount); err != nil {
+		t.Fatalf("count for audit_receipt_nonces: %v", err)
+	}
+	if nonceCount != 1 {
+		t.Errorf("audit_receipt_nonces rows for this nonce = %d, want exactly 1", nonceCount)
+	}
+
+	// id1 must be untouched and still the only receipt for this nonce.
+	var stillPending sql.NullString
+	if err := verify.QueryRow(`SELECT audit_result FROM audit_receipts WHERE receipt_id = $1`, id1).Scan(&stillPending); err != nil {
+		t.Fatalf("query back original receipt: %v", err)
+	}
+	if stillPending.Valid {
+		t.Errorf("original receipt's audit_result = %q, want NULL (untouched by the rejected replay)", stillPending.String)
+	}
+}
+
+// ── WriteReceiptRecordResponse ──────────────────────────────────────────────
+
+// TestWriteReceiptRecordResponsePersistsJITFlag verifies that
+// WriteReceiptRecordResponse actually persists response_hash, provider_sig,
+// response_latency_ms, and jit_flag — closing the gap where EvaluateJIT's
+// result was computed but had no caller anywhere in the codebase to persist
+// it. p95ThroughputKbps = 1000 and the two chosen latencies are far enough
+// from EvaluateJIT's floor (76.8ms at that throughput — see jit.go) that
+// this is not a boundary-precision test; jit_test.go already covers
+// EvaluateJIT's own math at the boundary. This test's job is persistence,
+// not arithmetic.
+func TestWriteReceiptRecordResponsePersistsJITFlag(t *testing.T) {
+	db := openTestDB(t)
+	verify := openVerifyDB(t)
+	providerID := ensureTestProvider(t, db)
+	p95 := 1000.0 // KB/s -> EvaluateJIT floor = (256/1000)*0.3*1000 = 76.8ms
+
+	cases := []struct {
+		name        string
+		latencyMs   int
+		wantJITFlag bool
+	}{
+		{"fast_response_flags_jit", 50, true},   // 50ms < 76.8ms floor
+		{"normal_response_no_flag", 500, false}, // 500ms > 76.8ms floor
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			id, err := WriteReceiptPhase1(context.Background(), db, freshFields(providerID))
+			if err != nil {
+				t.Fatalf("WriteReceiptPhase1: %v", err)
+			}
+
+			var hash [32]byte
+			var sig [64]byte
+			_, _ = rand.Read(hash[:])
+			_, _ = rand.Read(sig[:])
+
+			if err := WriteReceiptRecordResponse(context.Background(), db, id, hash, sig, tc.latencyMs, &p95); err != nil {
+				t.Fatalf("WriteReceiptRecordResponse: %v", err)
+			}
+
+			var gotHash, gotSig []byte
+			var gotLatency int
+			var gotJIT bool
+			var gotAuditResult sql.NullString
+			err = verify.QueryRow(`
+				SELECT response_hash, provider_sig, response_latency_ms, jit_flag, audit_result
+				FROM audit_receipts WHERE receipt_id = $1`, id).
+				Scan(&gotHash, &gotSig, &gotLatency, &gotJIT, &gotAuditResult)
+			if err != nil {
+				t.Fatalf("query back: %v", err)
+			}
+
+			if !bytes.Equal(gotHash, hash[:]) {
+				t.Error("response_hash was not persisted correctly")
+			}
+			if !bytes.Equal(gotSig, sig[:]) {
+				t.Error("provider_sig was not persisted correctly")
+			}
+			if gotLatency != tc.latencyMs {
+				t.Errorf("response_latency_ms = %d, want %d", gotLatency, tc.latencyMs)
+			}
+			if gotJIT != tc.wantJITFlag {
+				t.Errorf("jit_flag = %v, want %v", gotJIT, tc.wantJITFlag)
+			}
+			if gotAuditResult.Valid {
+				t.Errorf("audit_result = %q, want still NULL — RecordResponse must not adjudicate", gotAuditResult.String)
+			}
+		})
+	}
+}
+
+// TestWriteReceiptRecordResponseIdempotent verifies a second
+// WriteReceiptRecordResponse call for the same receipt returns
+// ErrResponseAlreadyRecorded and does not overwrite the first response —
+// guarding against a second, potentially different, signed response for the
+// same challenge silently clobbering the first.
+func TestWriteReceiptRecordResponseIdempotent(t *testing.T) {
+	db := openTestDB(t)
+	verify := openVerifyDB(t)
+	providerID := ensureTestProvider(t, db)
+	p95 := 1000.0
+
+	id, err := WriteReceiptPhase1(context.Background(), db, freshFields(providerID))
+	if err != nil {
+		t.Fatalf("WriteReceiptPhase1: %v", err)
+	}
+
+	var hash1, hash2 [32]byte
+	var sig1, sig2 [64]byte
+	_, _ = rand.Read(hash1[:])
+	_, _ = rand.Read(sig1[:])
+	_, _ = rand.Read(hash2[:])
+	_, _ = rand.Read(sig2[:])
+
+	if err := WriteReceiptRecordResponse(context.Background(), db, id, hash1, sig1, 100, &p95); err != nil {
+		t.Fatalf("first WriteReceiptRecordResponse: %v", err)
+	}
+
+	err = WriteReceiptRecordResponse(context.Background(), db, id, hash2, sig2, 200, &p95)
+	if !errors.Is(err, ErrResponseAlreadyRecorded) {
+		t.Errorf("second call: got %v, want ErrResponseAlreadyRecorded", err)
+	}
+
+	var gotHash []byte
+	if err := verify.QueryRow(`SELECT response_hash FROM audit_receipts WHERE receipt_id = $1`, id).Scan(&gotHash); err != nil {
+		t.Fatalf("query back: %v", err)
+	}
+	if !bytes.Equal(gotHash, hash1[:]) {
+		t.Error("response_hash was overwritten by the second (rejected) call — must retain the first response")
+	}
+}
+
 // ── WriteReceiptPhase2 ─────────────────────────────────────────────────────────
 
 // TestWriteReceiptPhase2PromotesToTerminal verifies all three terminal
 // results (PASS, FAIL, TIMEOUT) correctly promote a PENDING row.
-// TestWriteReceiptPhase2PromotesToTerminal verifies WriteReceiptPhase2
-// against all three AuditResult values.
 //
-// Only AuditTimeout actually succeeds: DM §4.7's
-// audit_receipts_response_consistency CHECK constraint requires
-// response_hash IS NOT NULL AND provider_sig IS NOT NULL whenever
-// audit_result IN ('PASS','FAIL'), and neither WriteReceiptPhase1 nor
-// WriteReceiptPhase2 has any parameter to supply either column — see the
-// KNOWN GAP note on WriteReceiptPhase2 in receipt.go. AuditPass and
-// AuditFail are asserted to fail here on purpose: if this constraint is ever
-// silently weakened, or if a future signature change quietly starts
-// populating those columns without updating this test, that's exactly the
-// kind of regression this sub-test is meant to catch.
+// All three now succeed (Milestone 7 corrections session, Option B): PASS
+// and FAIL first go through WriteReceiptRecordResponse to populate
+// response_hash/provider_sig, satisfying DM §4.7's
+// audit_receipts_response_consistency CHECK constraint before
+// WriteReceiptPhase2 sets a terminal audit_result. TIMEOUT skips
+// RecordResponse entirely, same as before. See
+// TestWriteReceiptPhase2RejectsPassFailWithoutRecordResponse for the
+// negative case (PASS/FAIL WITHOUT RecordResponse first).
 func TestWriteReceiptPhase2PromotesToTerminal(t *testing.T) {
 	db := openTestDB(t)
 	verify := openVerifyDB(t)
 	providerID := ensureTestProvider(t, db)
+	p95 := 1000.0
 
 	t.Run("TIMEOUT_succeeds", func(t *testing.T) {
 		id, err := WriteReceiptPhase1(context.Background(), db, freshFields(providerID))
@@ -383,6 +522,58 @@ func TestWriteReceiptPhase2PromotesToTerminal(t *testing.T) {
 	for _, result := range []AuditResult{AuditPass, AuditFail} {
 		result := result
 		want, _ := auditResultToSQL(result)
+		t.Run(want+"_succeeds_after_RecordResponse", func(t *testing.T) {
+			id, err := WriteReceiptPhase1(context.Background(), db, freshFields(providerID))
+			if err != nil {
+				t.Fatalf("WriteReceiptPhase1: %v", err)
+			}
+
+			var hash [32]byte
+			var providerSig [64]byte
+			_, _ = rand.Read(hash[:])
+			_, _ = rand.Read(providerSig[:])
+			if err := WriteReceiptRecordResponse(context.Background(), db, id, hash, providerSig, 100, &p95); err != nil {
+				t.Fatalf("WriteReceiptRecordResponse: %v", err)
+			}
+
+			var serviceSig [64]byte
+			_, _ = rand.Read(serviceSig[:])
+			if err := WriteReceiptPhase2(context.Background(), db, id, result, serviceSig, time.Now().UTC()); err != nil {
+				t.Fatalf("WriteReceiptPhase2(%s): %v", want, err)
+			}
+
+			var got string
+			var gotHash []byte
+			if err := verify.QueryRow(`SELECT audit_result::text, response_hash FROM audit_receipts WHERE receipt_id = $1`, id).Scan(&got, &gotHash); err != nil {
+				t.Fatalf("query back: %v", err)
+			}
+			if got != want {
+				t.Errorf("audit_result = %q, want %q", got, want)
+			}
+			if !bytes.Equal(gotHash, hash[:]) {
+				t.Error("response_hash written by RecordResponse was disturbed by Phase 2")
+			}
+		})
+	}
+}
+
+// TestWriteReceiptPhase2RejectsPassFailWithoutRecordResponse verifies that
+// calling WriteReceiptPhase2 with PASS or FAIL WITHOUT a prior
+// WriteReceiptRecordResponse call still fails DM §4.7's
+// audit_receipts_response_consistency CHECK constraint, rather than being
+// silently allowed through with NULL response_hash/provider_sig. This is now
+// a caller-ordering-contract regression test (see the PRECONDITION note on
+// WriteReceiptPhase2 in receipt.go), not a "known gap": if a future change
+// ever let this succeed, it would mean the CHECK constraint was silently
+// weakened or bypassed.
+func TestWriteReceiptPhase2RejectsPassFailWithoutRecordResponse(t *testing.T) {
+	db := openTestDB(t)
+	verify := openVerifyDB(t)
+	providerID := ensureTestProvider(t, db)
+
+	for _, result := range []AuditResult{AuditPass, AuditFail} {
+		result := result
+		want, _ := auditResultToSQL(result)
 		t.Run(want+"_fails_response_consistency_check", func(t *testing.T) {
 			id, err := WriteReceiptPhase1(context.Background(), db, freshFields(providerID))
 			if err != nil {
@@ -393,14 +584,13 @@ func TestWriteReceiptPhase2PromotesToTerminal(t *testing.T) {
 			_, _ = rand.Read(sig[:])
 			err = WriteReceiptPhase2(context.Background(), db, id, result, sig, time.Now().UTC())
 			if err == nil {
-				t.Fatalf("WriteReceiptPhase2(%s): got nil error, want a CHECK-constraint failure "+
-					"(response_hash/provider_sig are never populated by Phase 1 or Phase 2 as currently specified)", want)
+				t.Fatalf("WriteReceiptPhase2(%s) without RecordResponse: got nil error, want a CHECK-constraint failure", want)
 			}
 			if errors.Is(err, ErrReceiptAlreadyFinal) {
 				t.Fatalf("WriteReceiptPhase2(%s): got ErrReceiptAlreadyFinal, want a database CHECK-constraint "+
 					"error — a fresh PENDING row should reach the constraint, not be treated as already-final", want)
 			}
-			t.Logf("WriteReceiptPhase2(%s) correctly failed: %v", want, err)
+			t.Logf("WriteReceiptPhase2(%s) without RecordResponse correctly failed: %v", want, err)
 
 			var auditResult sql.NullString
 			if qErr := verify.QueryRow(`SELECT audit_result FROM audit_receipts WHERE receipt_id = $1`, id).Scan(&auditResult); qErr != nil {
