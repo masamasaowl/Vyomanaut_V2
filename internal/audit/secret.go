@@ -24,6 +24,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"time"
 )
@@ -44,6 +45,15 @@ const (
 	// secretPathPrefix is the IC §8 path convention; secretPath appends the
 	// version integer. N starts at 1 at cluster bootstrap.
 	secretPathPrefix = "/vyomanaut/audit-secret/v"
+
+	// secretScanUpperBound bounds Load's upward-scan recovery (see
+	// scanForwardFromPrunedVersion) for when the base version it expected to
+	// find has been pruned out from under it. At the default 24-hour
+	// rotation cadence, 32 versions covers roughly a month of missed
+	// rotations — far more generous than any expected outage — while still
+	// bounding the number of network calls a single Load call can make.
+	// Milestone 7 corrections session addition.
+	secretScanUpperBound = 32
 )
 
 // secretPath returns the IC §8 secrets-manager path for versionByte, e.g.
@@ -109,6 +119,17 @@ func NewClusterSecretCache(client SecretsManagerClient) *ClusterSecretCache {
 // caller chooses (IC §8 suggests every 5 minutes) to keep the cache fresh
 // and to pick up a newly-started rotation.
 //
+// COLD-START / LONG-OUTAGE RECOVERY (Milestone 7 corrections session): if
+// the base version (currentVersion, or 1 on a genuinely first-ever call) has
+// been pruned from the secrets manager — e.g. a replica cold-starts, or
+// reconnects after an outage, well behind several rotations — the base fetch
+// fails with ErrSecretNotFound and Load now scans forward (see
+// scanForwardFromPrunedVersion) to find the lowest surviving version, rather
+// than failing outright. Before this fix, that scenario made Load
+// unrecoverable: assuming base=1 on cold start (or clinging to a
+// long-retired currentVersion on a stale warm cache) and probing only base
+// and base+1 could never reach a cluster that had since rotated past both.
+//
 // Pre-conditions:
 //   - ctx is a live context for the network calls this makes
 //
@@ -122,7 +143,10 @@ func NewClusterSecretCache(client SecretsManagerClient) *ClusterSecretCache {
 // version+1 probe returned ErrSecretNotFound" is returned to the caller,
 // and the cache's existing (possibly now-stale) state is left untouched —
 // CurrentSecret's own TTL grace period governs how long that stale state
-// remains usable, not this function.
+// remains usable, not this function. This includes exhausting
+// secretScanUpperBound during cold-start/long-outage recovery: that surfaces
+// as an error asking for operator attention, rather than silently retrying
+// forever.
 //
 // Goroutine-safe: yes. Network calls happen without holding the lock; only
 // the brief in-memory state update at the end is lock-protected.
@@ -137,7 +161,13 @@ func (c *ClusterSecretCache) Load(ctx context.Context) error {
 	}
 
 	baseSecret, err := c.client.GetSecret(ctx, secretPath(base))
-	if err != nil {
+	if errors.Is(err, ErrSecretNotFound) {
+		var scanErr error
+		base, baseSecret, scanErr = c.scanForwardFromPrunedVersion(ctx, base)
+		if scanErr != nil {
+			return fmt.Errorf("audit.ClusterSecretCache.Load: %w", scanErr)
+		}
+	} else if err != nil {
 		return fmt.Errorf("audit.ClusterSecretCache.Load: fetch %s: %w", secretPath(base), err)
 	}
 
@@ -178,6 +208,35 @@ func (c *ClusterSecretCache) Load(ctx context.Context) error {
 
 	c.lastLoadedAt = time.Now()
 	return nil
+}
+
+// scanForwardFromPrunedVersion is called only when GetSecret(prunedBase)
+// returns ErrSecretNotFound — see the COLD-START / LONG-OUTAGE RECOVERY note
+// on Load. It walks forward, one version at a time, up to
+// secretScanUpperBound versions past prunedBase, until it finds the lowest
+// surviving version, and returns that version and its secret. versionByte is
+// a uint8, so the scan also stops cleanly at 255 rather than wrapping around.
+//
+// [REF: IC §8, ADR-027; Milestone 7 corrections session]
+func (c *ClusterSecretCache) scanForwardFromPrunedVersion(ctx context.Context, prunedBase uint8) (found uint8, secret []byte, err error) {
+	v := prunedBase
+	for i := 0; i < secretScanUpperBound; i++ {
+		if v == math.MaxUint8 {
+			break
+		}
+		v++
+
+		s, getErr := c.client.GetSecret(ctx, secretPath(v))
+		if getErr == nil {
+			return v, s, nil
+		}
+		if !errors.Is(getErr, ErrSecretNotFound) {
+			return 0, nil, fmt.Errorf("scan forward from v%d: probe %s: %w", prunedBase, secretPath(v), getErr)
+		}
+	}
+	return 0, nil, fmt.Errorf(
+		"no valid secret version found scanning forward from v%d (pruned) up to %d versions ahead — "+
+			"operator intervention likely needed", prunedBase, secretScanUpperBound)
 }
 
 // CurrentSecret returns the highest currently-valid server_secret and its
