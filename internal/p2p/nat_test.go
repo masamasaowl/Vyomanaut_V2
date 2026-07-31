@@ -128,6 +128,19 @@ func TestSetupNATNoHelpersIsNoop(t *testing.T) {
 // NATStatusPublic when a reachable helper address is supplied and the host
 // itself has a live listener.
 func TestSetupNATClassifiesPublicViaHelper(t *testing.T) {
+	// probeReachability now checks the local machine's actual outbound
+	// address shape before trying the helper dial (M6 review §5.3) — in a
+	// CI/container/sandboxed test environment that address is itself
+	// almost always private (a Docker bridge network, a runner's internal
+	// network, etc.), which would otherwise force NATStatusPrivate
+	// regardless of what this test is actually exercising: that a
+	// successful helper dial classifies Public. Override the indirection
+	// with a public-shaped address, same as
+	// TestProbeReachabilityPublicLocalAddressStillUsesHelperDial does.
+	orig := localOutboundIPFunc
+	t.Cleanup(func() { localOutboundIPFunc = orig })
+	localOutboundIPFunc = func() (net.IP, error) { return net.ParseIP("203.0.113.9"), nil } // TEST-NET-3
+
 	h, _, addr := newTestHost(t)
 
 	helperAddr, err := ParseMultiaddr("/ip4/127.0.0.1/tcp/" + portOf(t, addr))
