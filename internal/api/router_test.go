@@ -107,8 +107,8 @@ func allRegisteredRoutes() []routeFixture {
 		{"POST", "/api/v1/file/register", authBearerOwner, true},
 		{"GET", "/api/v1/file/11111111-1111-1111-1111-111111111111/pointer", authBearerOwner, true},
 		{"DELETE", "/api/v1/file/11111111-1111-1111-1111-111111111111", authBearerOwner, true},
-		{"POST", "/api/v1/audit/challenge", authAdmin, false},
-		{"GET", "/api/v1/admin/readiness", authAdmin, false}, // cfg.Readiness left nil in these tests -> still stub501
+		{"POST", "/api/v1/audit/challenge", authAdmin, false}, // cfg.ClusterSecretCache left nil in these tests -> still stub501
+		{"GET", "/api/v1/admin/readiness", authAdmin, false},  // cfg.Readiness left nil in these tests -> still stub501
 		{"GET", "/api/v1/admin/repair/queue", authAdmin, false},
 		{"POST", "/api/v1/admin/repair/trigger", authAdmin, false},
 		{"GET", "/api/v1/admin/providers", authAdmin, false},

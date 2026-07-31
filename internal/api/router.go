@@ -26,6 +26,7 @@ import (
 	"encoding/hex"
 	"net/http"
 
+	"github.com/masamasaowl/Vyomanaut_V2/internal/audit"
 	"github.com/masamasaowl/Vyomanaut_V2/internal/config"
 	"github.com/masamasaowl/Vyomanaut_V2/internal/payment"
 )
@@ -93,6 +94,13 @@ type RouterConfig struct {
 	Profile         config.NetworkProfile // Phase 11.5+
 	PaymentProvider payment.PaymentProvider
 	InFlightUploads InFlightUploadChecker // NoInFlightUploadChecker{} until Phase 11.7's tracking exists
+
+	// ClusterSecretCache backs POST /api/v1/audit/challenge (Phase 11.9).
+	// Must already have a successful Load() before being wired in here —
+	// see AuditChallengeHandler's own constructor note. nil until whichever
+	// later milestone owns cluster-secret startup wires it (mirrors
+	// cfg.Readiness's own "may be nil until its owning milestone" pattern).
+	ClusterSecretCache *audit.ClusterSecretCache
 }
 
 // NewRouter builds the full HTTP routing tree from cfg.
@@ -159,6 +167,10 @@ func NewRouter(cfg RouterConfig) *http.ServeMux {
 	providerReceiptsHandler := NewProviderReceiptsHandler(cfg.DB)
 	providerDowntimeHandler := NewProviderDowntimeHandler(cfg.DB, cfg.Profile)
 	providerDepartHandler := NewProviderDepartHandler(cfg.DB, cfg.Profile, cfg.PaymentProvider)
+	var auditChallengeHandler *AuditChallengeHandler
+	if cfg.ClusterSecretCache != nil {
+		auditChallengeHandler = NewAuditChallengeHandler(cfg.DB, cfg.Profile, cfg.ClusterSecretCache)
+	}
 
 	mux.Handle("POST /api/v1/provider/register", bearerAny(http.HandlerFunc(providerRegisterHandler.HandleRegister))) // registerProvider
 	mux.Handle("POST /api/v1/provider/heartbeat", provider(providerHeartbeatHandler.HandleHeartbeat))                 // providerHeartbeat
@@ -186,7 +198,11 @@ func NewRouter(cfg RouterConfig) *http.ServeMux {
 	mux.Handle("DELETE /api/v1/file/{file_id}", owner(fileDeleteHandler.HandleDelete))        // deleteFile
 
 	// ── AdminApiKey routes ──────────────────────────────────────────────────
-	mux.Handle("POST /api/v1/audit/challenge", admin(stub501)) // dispatchAuditChallenge
+	if auditChallengeHandler != nil {
+		mux.Handle("POST /api/v1/audit/challenge", admin(auditChallengeHandler.HandleDispatch)) // dispatchAuditChallenge
+	} else {
+		mux.Handle("POST /api/v1/audit/challenge", admin(stub501))
+	}
 	if cfg.Readiness != nil {
 		mux.Handle("GET /api/v1/admin/readiness", admin(http.HandlerFunc(cfg.Readiness.HandleReadiness))) // getReadiness
 	} else {
