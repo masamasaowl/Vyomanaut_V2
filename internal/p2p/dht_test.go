@@ -512,8 +512,20 @@ func TestHandlePutGrowsRoutingTable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseMultiaddr: %v", err)
 	}
+	addrB, err := ParseMultiaddr("/ip4/127.0.0.1/tcp/" + testHostPort(t, hostB))
+	if err != nil {
+		t.Fatalf("ParseMultiaddr: %v", err)
+	}
 	dhtB, err := NewDHT(hostB, DHTConfig{
-		Seeds: []AddrInfo{{ID: hostA.PeerID(), Addrs: []Multiaddr{addrA}}},
+		// B must advertise a real, dialable address of its own in its
+		// PUT_PROVIDER message — handlePut's fix calls
+		// Connect(sender.ID, sender.Addrs) before adding the sender to the
+		// routing table, and Connect requires at least one address.
+		// Without this, B always sends an empty Addrs list, Connect always
+		// fails with "at least one address is required", and the fix
+		// (correctly) never adds an unverifiable peer.
+		SelfAddrs: []Multiaddr{addrB},
+		Seeds:     []AddrInfo{{ID: hostA.PeerID(), Addrs: []Multiaddr{addrA}}},
 	})
 	if err != nil {
 		t.Fatalf("NewDHT (B): %v", err)
