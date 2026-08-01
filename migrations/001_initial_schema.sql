@@ -1,5 +1,5 @@
 -- Generated for profile: prod
--- Generated at: 2026-07-30T17:21:00Z
+-- Generated at: 2026-08-01T05:57:43Z
 -- ShardSize: 262144 (compile-time constant; NOT profile-variable)
 -- DataShards: 16
 -- TotalShards: 56
@@ -1213,8 +1213,45 @@ CREATE POLICY audit_receipt_nonces_insert_only
 -- Medium,Long} (ADR-031, MVP §5.5). The DDL here exists so check-07's migration
 -- apply/rollback gate and any fresh-clone developer have a working view before
 -- the microservice has ever started once.
--- [REF: DM §7, MVP §5.5, IC §6, build.md Phase 4.7 Session 4.7.1]
+--
+-- Milestone 8 corrections session addition (ARCH §20): "Three or more JIT
+-- flags from the same provider within a rolling 7-day window triggers a
+-- 0.5x weight penalty on that provider's audit passes in the 24h scoring
+-- window for 30 days." The write side of this — audit_receipts.jit_flag —
+-- has shipped since the Milestone 7 corrections session
+-- (WriteReceiptRecordResponse, internal/audit/receipt.go); until now nothing
+-- read it back. jit_penalized below is the read side.
+--
+-- Framed as "did a qualifying 7-day window occur at any point in the last
+-- 30 days" rather than "set a flag when the 3rd one lands and expire it 30
+-- days later" — the latter would need mutable, persisted state (a table
+-- with its own retention/cleanup), which this view's whole design avoids:
+-- it is DROPPED AND RECREATED at every microservice startup and fully
+-- recomputed from audit_receipts on every REFRESH, nothing else remembered
+-- in between. The two framings are logically equivalent: "some 7-day
+-- window ending on a JIT-flagged receipt within the last 30 days had >= 3
+-- JIT flags" is true for exactly the same span of time "the 3rd flag
+-- started a 30-day penalty" would be. The partial index on
+-- audit_receipts(provider_id, server_challenge_ts DESC) WHERE jit_flag,
+-- already present above, supports both the outer scan and the correlated
+-- COUNT below.
+-- [REF: DM §7, MVP §5.5, IC §6, build.md Phase 4.7 Session 4.7.1, ARCH §20]
 CREATE MATERIALIZED VIEW mv_provider_scores AS
+WITH jit_penalized AS (
+    SELECT DISTINCT ar.provider_id
+    FROM audit_receipts ar
+    WHERE ar.jit_flag = TRUE
+      AND ar.abandoned_at IS NULL
+      AND ar.server_challenge_ts >= NOW() - INTERVAL '30 days'
+      AND (
+          SELECT COUNT(*)
+          FROM audit_receipts ar2
+          WHERE ar2.provider_id = ar.provider_id
+            AND ar2.jit_flag = TRUE
+            AND ar2.abandoned_at IS NULL
+            AND ar2.server_challenge_ts BETWEEN ar.server_challenge_ts - INTERVAL '7 days' AND ar.server_challenge_ts
+      ) >= 3
+)
 SELECT
     provider_id,
     score_24h,
@@ -1228,29 +1265,40 @@ SELECT
     NOW() AS scores_as_of  -- consumers must check age before using for payment decisions
 FROM (
     SELECT
-        provider_id,
-        -- SHORT WINDOW (placeholder: 24h production; overridden at startup)
-        SUM(CASE WHEN server_challenge_ts >= NOW() - INTERVAL '24 hours'
-                AND audit_result = 'PASS' THEN 1 ELSE 0 END)::FLOAT
-        / NULLIF(SUM(CASE WHEN server_challenge_ts >= NOW() - INTERVAL '24 hours'
-                          AND audit_result IS NOT NULL THEN 1 ELSE 0 END), 0)
+        sub.provider_id,
+        -- SHORT WINDOW (placeholder: 24h production; overridden at startup).
+        -- ARCH §20, Milestone 8 corrections session: pass_24h is weighted
+        -- 0.5x ONLY when this provider is in jit_penalized above. The 7d/30d
+        -- windows below are deliberately unaffected — ARCH §20 names the
+        -- 24h window specifically.
+        (sub.pass_24h * (CASE WHEN jp.provider_id IS NOT NULL THEN 0.5 ELSE 1.0 END))
+        / NULLIF(sub.total_24h, 0)
         AS score_24h,
         -- MEDIUM WINDOW (placeholder: 7 days production; overridden at startup)
-        SUM(CASE WHEN server_challenge_ts >= NOW() - INTERVAL '7 days'
-                AND audit_result = 'PASS' THEN 1 ELSE 0 END)::FLOAT
-        / NULLIF(SUM(CASE WHEN server_challenge_ts >= NOW() - INTERVAL '7 days'
-                          AND audit_result IS NOT NULL THEN 1 ELSE 0 END), 0)
-        AS score_7d,
+        sub.pass_7d::FLOAT / NULLIF(sub.total_7d, 0) AS score_7d,
         -- LONG WINDOW (placeholder: 30 days production; overridden at startup)
-        SUM(CASE WHEN server_challenge_ts >= NOW() - INTERVAL '30 days'
-                AND audit_result = 'PASS' THEN 1 ELSE 0 END)::FLOAT
-        / NULLIF(SUM(CASE WHEN server_challenge_ts >= NOW() - INTERVAL '30 days'
-                          AND audit_result IS NOT NULL THEN 1 ELSE 0 END), 0)
-        AS score_30d
-    FROM audit_receipts
-    WHERE abandoned_at IS NULL
-    GROUP BY provider_id
-) sub;
+        sub.pass_30d::FLOAT / NULLIF(sub.total_30d, 0) AS score_30d
+    FROM (
+        SELECT
+            provider_id,
+            SUM(CASE WHEN server_challenge_ts >= NOW() - INTERVAL '24 hours'
+                    AND audit_result = 'PASS' THEN 1 ELSE 0 END) AS pass_24h,
+            SUM(CASE WHEN server_challenge_ts >= NOW() - INTERVAL '24 hours'
+                    AND audit_result IS NOT NULL THEN 1 ELSE 0 END) AS total_24h,
+            SUM(CASE WHEN server_challenge_ts >= NOW() - INTERVAL '7 days'
+                    AND audit_result = 'PASS' THEN 1 ELSE 0 END) AS pass_7d,
+            SUM(CASE WHEN server_challenge_ts >= NOW() - INTERVAL '7 days'
+                    AND audit_result IS NOT NULL THEN 1 ELSE 0 END) AS total_7d,
+            SUM(CASE WHEN server_challenge_ts >= NOW() - INTERVAL '30 days'
+                    AND audit_result = 'PASS' THEN 1 ELSE 0 END) AS pass_30d,
+            SUM(CASE WHEN server_challenge_ts >= NOW() - INTERVAL '30 days'
+                    AND audit_result IS NOT NULL THEN 1 ELSE 0 END) AS total_30d
+        FROM audit_receipts
+        WHERE abandoned_at IS NULL
+        GROUP BY provider_id
+    ) sub
+    LEFT JOIN jit_penalized jp ON jp.provider_id = sub.provider_id
+) scores;
 
 CREATE UNIQUE INDEX ON mv_provider_scores (provider_id);
 -- Required for REFRESH MATERIALIZED VIEW CONCURRENTLY (DM §9 checklist).
