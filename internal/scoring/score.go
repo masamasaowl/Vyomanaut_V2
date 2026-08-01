@@ -35,12 +35,27 @@ const dualWindowDropThreshold = 0.20
 // (DM §7) so callers — especially payment release computation (Milestone 10)
 // — can enforce the "< 60 minutes old" staleness rule before using a score
 // for a payment decision (DM §7 CRITICAL note, ADR-024).
+//
+// HasScore24h/HasScore7d/HasScore30d (Milestone 8 corrections session): a
+// provider with SOME audit history but ZERO terminal results in a given
+// window scores NULL for that window in mv_provider_scores (the view's own
+// NULLIF, DM §7) — "no data yet," not "zero reliability." Score24h/Score7d/
+// Score30d themselves still collapse that NULL to 0.0 (see nullFloatOrZero's
+// doc comment for why that fallback is still correct for Composite and for
+// Score30dBasisPoints/Score7dBasisPoints, both unchanged by this session).
+// These three bools are the ONLY way to distinguish "genuinely 0.0" from
+// "unknown" — check them before trusting a 0.0 Score*, exactly the
+// distinction internal/api/provider.go's status endpoint needs to return
+// `null` rather than `0` over the wire (openapi.yaml's nullable: true).
 type ProviderScore struct {
-	Score24h       float64   // window weight 0.50 in the composite
-	Score7d        float64   // window weight 0.30
-	Score30d       float64   // window weight 0.20
+	Score24h       float64   // window weight 0.50 in the composite; 0.0 if !HasScore24h
+	Score7d        float64   // window weight 0.30; 0.0 if !HasScore7d
+	Score30d       float64   // window weight 0.20; 0.0 if !HasScore30d
+	HasScore24h    bool      // false: zero terminal results in the 24h window (not a real 0.0)
+	HasScore7d     bool      // false: zero terminal results in the 7d window (not a real 0.0)
+	HasScore30d    bool      // false: zero terminal results in the 30d window (not a real 0.0)
 	Composite      float64   // 0.50*24h + 0.30*7d + 0.20*30d
-	DualWindowFlag bool      // true when score30d - score7d > 0.20 (FR-050, ADR-024 §3)
+	DualWindowFlag bool      // true when score30d - score7d > 0.20 (FR-050, ADR-024 §3); requires HasScore7d AND HasScore30d — see queryProviderScore
 	ScoresAsOf     time.Time // from mv_provider_scores.scores_as_of (DM §7)
 }
 
@@ -70,19 +85,13 @@ func GetScore(ctx context.Context, db *sql.DB, providerID uuid.UUID) (ProviderSc
 // computation (Milestone 10) MUST call this, not GetScore, per DM §7's
 // staleness requirement.
 //
-// [TODO M10: internal/payment's depguard rule and IC §9's import table do not
-// yet list internal/scoring among internal/payment's permitted imports, even
-// though this doc comment (and DM §7's own staleness rule) requires Milestone
-// 10's release computation to call GetScoreFromPrimary directly. Every other
-// row in the import-constraint table that names a real cross-package caller
-// spells out the allowed import explicitly; this one gap is most likely an
-// oversight rather than a deliberate omission, since nothing else in the
-// governing docs describes an alternative path for payment to reach a score.
-// Flagged here rather than silently worked around — whoever picks up
-// Milestone 10 will need to add internal/scoring to internal/payment's
-// depguard allow-list and to IC §9's table in the same PR, the same way this
-// session's own README note added google/uuid and lib/pq to scoring's own
-// entry.]
+// internal/payment does import internal/scoring for exactly this purpose
+// (see release.go) — permitted by .golangci.yml's payment depguard entry,
+// which explicitly allows internal/scoring with a comment on the same
+// reasoning as IC §9 §Package Import Constraints now states directly (fixed
+// in the Milestone 8 corrections session; an earlier revision of this
+// comment flagged that gap as still open, but by the time this was checked
+// against the live config, it had already been closed).
 //
 // Goroutine-safe: yes.
 func GetScoreFromPrimary(ctx context.Context, primaryDB *sql.DB, providerID uuid.UUID) (ProviderScore, error) {
@@ -127,6 +136,17 @@ WHERE provider_id = $1`
 	// column already treats a missing window as 0 via COALESCE; the three
 	// window fields returned here follow that same convention so Composite
 	// and (Score24h, Score7d, Score30d) never disagree with each other.
+	//
+	// Milestone 8 corrections session: that same 0-fallback used to ALSO feed
+	// DualWindowFlag's comparison directly, which meant a provider with real
+	// 30-day history but zero terminal results in the last 7 days (brand new
+	// to a rotation, or simply not yet re-challenged this week) would score
+	// score7d = 0.0 — indistinguishable from "audited all week and failed
+	// every time" — and any score30d above the 0.20 threshold would then
+	// raise a false degradation flag. HasScore7h/HasScore30d (via score7h.Valid/
+	// score30d.Valid, preserved below rather than discarded) are what let
+	// DualWindowFlag tell "unknown" apart from "zero" and only fire when both
+	// windows actually have real data to compare.
 	s24 := nullFloatOrZero(score24h)
 	s7 := nullFloatOrZero(score7d)
 	s30 := nullFloatOrZero(score30d)
@@ -135,8 +155,11 @@ WHERE provider_id = $1`
 		Score24h:       s24,
 		Score7d:        s7,
 		Score30d:       s30,
+		HasScore24h:    score24h.Valid,
+		HasScore7d:     score7d.Valid,
+		HasScore30d:    score30d.Valid,
 		Composite:      composite,
-		DualWindowFlag: (s30 - s7) > dualWindowDropThreshold,
+		DualWindowFlag: score7d.Valid && score30d.Valid && (s30-s7) > dualWindowDropThreshold,
 		ScoresAsOf:     scoresAsOf,
 	}, nil
 }
