@@ -34,16 +34,36 @@ const (
 // warrants it.
 const poolMedianCacheTTL = 5 * time.Minute
 
-// poolMedianCache holds the last computed pool-median RTO, process-wide.
-// PoolMedianRTO takes no parameters beyond ctx/db (IC §4.2, FR-040 describe
-// exactly one network-wide value), so a single package-level cache — not
-// something keyed per call — matches the production use case: there is only
-// ever one "the pool-median RTO" for the whole network at a given moment.
+// poolMedianCache holds the last computed pool-median RTO, keyed by the
+// *sql.DB handle it was computed against.
+//
+// Milestone 8 corrections session: this used to be a single unkeyed value,
+// shared across every caller regardless of which *sql.DB they passed in. In
+// production there is genuinely only one pool-median RTO for the whole
+// network at a given moment, as the original comment here said — but that
+// argument is about there being one CORRECT ANSWER, not about there being
+// only ever one *sql.DB handle asking for it. A process that (like
+// GetScore/GetScoreFromPrimary, see score.go) distinguishes a
+// pooled/replica-routed handle from a forced-primary one, or that runs
+// parallel test suites each against their own database, would have every
+// caller silently share one cache entry computed against whichever handle
+// happened to populate it first — stale or simply wrong for a different
+// handle, and a source of cross-test interference in exactly the kind of
+// parallel Postgres-backed test suite this package's own tests use. Keying
+// by *sql.DB matches GetScore/GetScoreFromPrimary's own stated philosophy:
+// which handle to use is entirely the caller's concern; this package just
+// serves whichever one it's given. The map is not unbounded in practice —
+// *sql.DB handles are long-lived singletons created once at process startup
+// (or once per test), not created per-request.
 var poolMedianCache = struct {
-	mu         sync.RWMutex
+	mu      sync.RWMutex
+	entries map[*sql.DB]poolMedianCacheEntry
+}{entries: make(map[*sql.DB]poolMedianCacheEntry)}
+
+type poolMedianCacheEntry struct {
 	value      float64
 	computedAt time.Time
-}{}
+}
 
 // UpdateRTO updates a provider's EWMA response-time and throughput statistics
 // after one audit response is recorded, and increments rto_sample_count.
@@ -141,32 +161,33 @@ WHERE provider_id = $4`
 // documented requirement — revisit the cache duration if measured DB load
 // warrants it).
 //
-// Error semantics: returns an error if no ACTIVE provider has
-// rto_sample_count >= 5 yet (PERCENTILE_CONT has no rows to aggregate over —
-// expected only very early in the network's life, before this session's own
-// UNIT_TESTS name a dedicated sentinel for it, so this is a plain wrapped
-// error rather than a new exported one).
+// Error semantics:
+//   - ErrNoPoolMedianAvailable: no ACTIVE provider has rto_sample_count >= 5
+//     yet (PERCENTILE_CONT has no rows to aggregate over — expected only
+//     very early in the network's life). Milestone 8 corrections session:
+//     this used to be a plain wrapped error with no sentinel, indistinguishable
+//     from any other database failure by a caller using errors.Is.
+//   - other database errors: returned to caller.
+//
 // Goroutine-safe: yes (the shared cache is guarded by a RWMutex).
 func PoolMedianRTO(ctx context.Context, db *sql.DB) (float64, error) {
 	poolMedianCache.mu.RLock()
-	if !poolMedianCache.computedAt.IsZero() && time.Since(poolMedianCache.computedAt) < poolMedianCacheTTL {
-		v := poolMedianCache.value
-		poolMedianCache.mu.RUnlock()
-		return v, nil
-	}
+	entry, found := poolMedianCache.entries[db]
 	poolMedianCache.mu.RUnlock()
+	if found && time.Since(entry.computedAt) < poolMedianCacheTTL {
+		return entry.value, nil
+	}
 
 	median, ok, err := queryPoolMedianRTO(ctx, db)
 	if err != nil {
 		return 0, fmt.Errorf("scoring.PoolMedianRTO: %w", err)
 	}
 	if !ok {
-		return 0, fmt.Errorf("scoring.PoolMedianRTO: no ACTIVE providers with rto_sample_count >= 5 yet")
+		return 0, fmt.Errorf("scoring.PoolMedianRTO: %w", ErrNoPoolMedianAvailable)
 	}
 
 	poolMedianCache.mu.Lock()
-	poolMedianCache.value = median
-	poolMedianCache.computedAt = time.Now()
+	poolMedianCache.entries[db] = poolMedianCacheEntry{value: median, computedAt: time.Now()}
 	poolMedianCache.mu.Unlock()
 
 	return median, nil
