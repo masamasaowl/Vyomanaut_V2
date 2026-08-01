@@ -70,6 +70,7 @@ import (
 	localcrypto "github.com/masamasaowl/Vyomanaut_V2/internal/crypto"
 	"github.com/masamasaowl/Vyomanaut_V2/internal/payment"
 	"github.com/masamasaowl/Vyomanaut_V2/internal/repair"
+	"github.com/masamasaowl/Vyomanaut_V2/internal/scoring"
 )
 
 // A named constant for decodeReceiptsCursor
@@ -668,27 +669,23 @@ func (h *ProviderStatusHandler) HandleStatus(w http.ResponseWriter, r *http.Requ
 	}
 
 	var (
-		status                                 string
-		region, asn                            string
-		consecutiveAuditPasses                 int
-		lastHeartbeatTS                        sql.NullTime
-		multiaddrStale                         bool
-		p95ThroughputKbps                      sql.NullFloat64
-		acceleratedReaudit                     bool
-		firstChunkAssignmentAt                 sql.NullTime
-		score24h, score7d, score30d, scoreComp sql.NullFloat64
+		status                 string
+		region, asn            string
+		consecutiveAuditPasses int
+		lastHeartbeatTS        sql.NullTime
+		multiaddrStale         bool
+		p95ThroughputKbps      sql.NullFloat64
+		acceleratedReaudit     bool
+		firstChunkAssignmentAt sql.NullTime
 	)
 	err = h.db.QueryRowContext(ctx, `
 		SELECT p.status, p.region, p.asn, p.consecutive_audit_passes, p.last_heartbeat_ts,
 		       p.multiaddr_stale, p.p95_throughput_kbps, p.accelerated_reaudit,
-		       p.first_chunk_assignment_at,
-		       s.score_24h, s.score_7d, s.score_30d, s.score_composite
+		       p.first_chunk_assignment_at
 		FROM providers p
-		LEFT JOIN mv_provider_scores s ON s.provider_id = p.provider_id
 		WHERE p.provider_id = $1`, providerID,
 	).Scan(&status, &region, &asn, &consecutiveAuditPasses, &lastHeartbeatTS,
-		&multiaddrStale, &p95ThroughputKbps, &acceleratedReaudit, &firstChunkAssignmentAt,
-		&score24h, &score7d, &score30d, &scoreComp)
+		&multiaddrStale, &p95ThroughputKbps, &acceleratedReaudit, &firstChunkAssignmentAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		WriteError(w, http.StatusNotFound, ErrNotFound, "provider not found", nil, "", nil)
 		return
@@ -755,17 +752,45 @@ func (h *ProviderStatusHandler) HandleStatus(w http.ResponseWriter, r *http.Requ
 	if firstChunkAssignmentAt.Valid {
 		resp.FirstChunkAssignmentAt = &firstChunkAssignmentAt.Time
 	}
-	if score24h.Valid {
-		resp.Score24h = &score24h.Float64
-	}
-	if score7d.Valid {
-		resp.Score7d = &score7d.Float64
-	}
-	if score30d.Valid {
-		resp.Score30d = &score30d.Float64
-	}
-	if scoreComp.Valid {
-		resp.ScoreComposite = &scoreComp.Float64
+
+	// Milestone 8 corrections session: this used to be its own independent
+	// LEFT JOIN mv_provider_scores query, scanned into four sql.NullFloat64
+	// and copied across with four .Valid checks — a second, subtly
+	// out-of-sync implementation of exactly what scoring.GetScore already
+	// does. Folded into one coordinated call, now that GetScore's own
+	// NULL-vs-zero handling is fixed (see score.go) and actually gives this
+	// handler the real nullable semantics openapi.yaml's nullable: true
+	// requires, rather than the false-0.0-on-error/no-history behavior the
+	// standalone query silently had before.
+	score, err := scoring.GetScore(ctx, h.db, providerID)
+	switch {
+	case errors.Is(err, scoring.ErrProviderNotFound):
+		// No audit history yet: all four score_* fields stay nil in the
+		// response, exactly as the old LEFT JOIN's all-NULL row did for a
+		// provider absent from mv_provider_scores entirely.
+	case err != nil:
+		WriteError(w, http.StatusInternalServerError, ErrInternal, "score lookup failed", nil, "", nil)
+		return
+	default:
+		if score.HasScore24h {
+			v := score.Score24h
+			resp.Score24h = &v
+		}
+		if score.HasScore7d {
+			v := score.Score7d
+			resp.Score7d = &v
+		}
+		if score.HasScore30d {
+			v := score.Score30d
+			resp.Score30d = &v
+		}
+		// score_composite has no Has* counterpart: mv_provider_scores'
+		// score_composite column is COALESCE'd to 0 per missing window at
+		// the view level (DM §7), so it is always a real number whenever
+		// this provider has ANY row in the view at all — i.e. whenever
+		// GetScore did not return ErrProviderNotFound above.
+		v := score.Composite
+		resp.ScoreComposite = &v
 	}
 
 	// Vetting fields: vetting_chunks_assigned / vetting_chunk_cap /
