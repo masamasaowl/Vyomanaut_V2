@@ -178,6 +178,21 @@ func insertTestProvider(t *testing.T, db *sql.DB, spec testProviderSpec) uuid.UU
 // PASS/FAIL case rather than being blocked by it.
 func insertTestAuditReceipt(t *testing.T, verify *sql.DB, providerID uuid.UUID, challengeTS time.Time, result string) {
 	t.Helper()
+	insertTestAuditReceiptFull(t, verify, providerID, challengeTS, result, false)
+}
+
+// insertTestAuditReceiptJIT is insertTestAuditReceipt with jit_flag = TRUE —
+// added in the Milestone 8 corrections session alongside mv_provider_scores'
+// new JIT weight-penalty logic (ARCH §20). A separate function rather than
+// widening insertTestAuditReceipt's own signature, so the 12 existing call
+// sites across this file that don't care about jit_flag stay untouched.
+func insertTestAuditReceiptJIT(t *testing.T, verify *sql.DB, providerID uuid.UUID, challengeTS time.Time, result string) {
+	t.Helper()
+	insertTestAuditReceiptFull(t, verify, providerID, challengeTS, result, true)
+}
+
+func insertTestAuditReceiptFull(t *testing.T, verify *sql.DB, providerID uuid.UUID, challengeTS time.Time, result string, jitFlag bool) {
+	t.Helper()
 	var chunkID [32]byte
 	_, _ = rand.Read(chunkID[:])
 	var nonce [33]byte
@@ -196,12 +211,12 @@ func insertTestAuditReceipt(t *testing.T, verify *sql.DB, providerID uuid.UUID, 
 	_, err := verify.Exec(`
 		INSERT INTO audit_receipts (
 			chunk_id, provider_id, challenge_nonce, server_challenge_ts,
-			audit_result, response_hash, provider_sig
-		) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-		chunkID[:], providerID, nonce[:], challengeTS, result, responseHash, providerSig,
+			audit_result, response_hash, provider_sig, jit_flag
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+		chunkID[:], providerID, nonce[:], challengeTS, result, responseHash, providerSig, jitFlag,
 	)
 	if err != nil {
-		t.Fatalf("insertTestAuditReceipt: %v", err)
+		t.Fatalf("insertTestAuditReceiptFull: %v", err)
 	}
 }
 
@@ -327,6 +342,189 @@ func TestGetScoreDualWindowFlagFalse(t *testing.T) {
 	if score.DualWindowFlag {
 		t.Errorf("DualWindowFlag = true, want false (score30d %v - score7d %v = %v, not > 0.20)",
 			score.Score30d, score.Score7d, score.Score30d-score.Score7d)
+	}
+}
+
+// ── Milestone 8 corrections session: NULL-window handling ────────────────────
+
+// TestGetScoreNullWindowNotTreatedAsZero is the regression test for the
+// Milestone 8 corrections session's root-cause fix: a provider with real
+// 30-day history but ZERO terminal results in the last 7 days (e.g. audited
+// heavily a few weeks ago, then simply not re-challenged this week — no
+// PASS, no FAIL, no TIMEOUT at all in that window) must NOT have that
+// silence collapsed into score_7d = 0.0 for DualWindowFlag's purposes.
+// Before this fix, HasScore7d did not exist and queryProviderScore fed the
+// same 0.0 fallback used for Composite straight into the DualWindowFlag
+// comparison — indistinguishable from "audited every day this week and
+// failed every time," which would incorrectly raise a false degradation
+// signal for a provider that has simply gone quiet, not gotten worse.
+func TestGetScoreNullWindowNotTreatedAsZero(t *testing.T) {
+	db := openTestDB(t)
+	verify := openVerifyDB(t)
+	providerID := insertTestProvider(t, db, testProviderSpec{})
+
+	now := time.Now().UTC()
+	// Real 30-day history, well above the 0.20 dual-window threshold if
+	// compared against a naive score7d = 0.0 — entirely OUTSIDE the 7-day
+	// window (8+ days ago), so score_7d itself has zero terminal rows to
+	// aggregate over.
+	for _, daysAgo := range []int{8, 10, 12, 14, 16, 18, 20, 22} {
+		insertTestAuditReceipt(t, verify, providerID, now.Add(-time.Duration(daysAgo)*24*time.Hour), "PASS")
+	}
+	refreshProviderScores(t, verify)
+
+	score, err := GetScore(context.Background(), db, providerID)
+	if err != nil {
+		t.Fatalf("GetScore: %v", err)
+	}
+	if !floatsClose(score.Score30d, 1.0) {
+		t.Fatalf("Score30d = %v, want 1.0 (test setup assumption)", score.Score30d)
+	}
+	if score.HasScore7d {
+		t.Fatalf("HasScore7d = true, want false (zero terminal results in the 7-day window; test setup assumption)")
+	}
+	if !score.HasScore30d {
+		t.Errorf("HasScore30d = false, want true (real 30-day history exists)")
+	}
+	if score.DualWindowFlag {
+		t.Errorf("DualWindowFlag = true, want false — score_7d has NO DATA (not a real 0.0), "+
+			"so it must not be compared against score_30d %v at all", score.Score30d)
+	}
+}
+
+// TestGetScoreHasScoreFlagsAllPresent is the sanity-check counterpart to
+// TestGetScoreNullWindowNotTreatedAsZero: when a provider DOES have real
+// terminal results in all three windows, all three Has* flags must be true
+// (the fix must not make a genuinely-present window look absent).
+func TestGetScoreHasScoreFlagsAllPresent(t *testing.T) {
+	db := openTestDB(t)
+	verify := openVerifyDB(t)
+	providerID := insertTestProvider(t, db, testProviderSpec{})
+
+	insertTestAuditReceipt(t, verify, providerID, time.Now().UTC().Add(-1*time.Hour), "PASS")
+	refreshProviderScores(t, verify)
+
+	score, err := GetScore(context.Background(), db, providerID)
+	if err != nil {
+		t.Fatalf("GetScore: %v", err)
+	}
+	if !score.HasScore24h || !score.HasScore7d || !score.HasScore30d {
+		t.Errorf("HasScore24h=%v HasScore7d=%v HasScore30d=%v, want all true (one recent PASS falls inside all three windows)",
+			score.HasScore24h, score.HasScore7d, score.HasScore30d)
+	}
+}
+
+// ── Milestone 8 corrections session: JIT weight penalty (ARCH §20) ───────────
+
+// TestJITPenaltyAppliesToScore24hOnly verifies ARCH §20's "3+ JIT flags in a
+// rolling 7-day window -> 0.5x weight penalty on the 24h scoring window"
+// rule, and specifically that 7d/30d are UNAFFECTED — ARCH §20 names the
+// 24h window only.
+func TestJITPenaltyAppliesToScore24hOnly(t *testing.T) {
+	db := openTestDB(t)
+	verify := openVerifyDB(t)
+	providerID := insertTestProvider(t, db, testProviderSpec{})
+
+	now := time.Now().UTC()
+	// Exactly 3 JIT-flagged PASS receipts, all within the last 3 hours (well
+	// within both the 24h window and a qualifying 7-day span of each other).
+	for _, hoursAgo := range []int{1, 2, 3} {
+		insertTestAuditReceiptJIT(t, verify, providerID, now.Add(-time.Duration(hoursAgo)*time.Hour), "PASS")
+	}
+	refreshProviderScores(t, verify)
+
+	score, err := GetScore(context.Background(), db, providerID)
+	if err != nil {
+		t.Fatalf("GetScore: %v", err)
+	}
+	// pass_24h=3, total_24h=3 -> (3*0.5)/3 = 0.5, not 1.0.
+	if !floatsClose(score.Score24h, 0.5) {
+		t.Errorf("Score24h = %v, want 0.5 (3 PASS, all JIT-flagged, weighted 0.5x)", score.Score24h)
+	}
+	if !floatsClose(score.Score7d, 1.0) {
+		t.Errorf("Score7d = %v, want 1.0 — the JIT penalty must not touch the 7d window", score.Score7d)
+	}
+	if !floatsClose(score.Score30d, 1.0) {
+		t.Errorf("Score30d = %v, want 1.0 — the JIT penalty must not touch the 30d window", score.Score30d)
+	}
+}
+
+// TestJITPenaltyBelowThresholdNoEffect verifies exactly 2 JIT flags (one
+// short of ARCH §20's 3-flag trigger) has NO weighting effect at all —
+// confirming the boundary is >= 3, not >= 2 or "any."
+func TestJITPenaltyBelowThresholdNoEffect(t *testing.T) {
+	db := openTestDB(t)
+	verify := openVerifyDB(t)
+	providerID := insertTestProvider(t, db, testProviderSpec{})
+
+	now := time.Now().UTC()
+	insertTestAuditReceiptJIT(t, verify, providerID, now.Add(-1*time.Hour), "PASS")
+	insertTestAuditReceiptJIT(t, verify, providerID, now.Add(-2*time.Hour), "PASS")
+	insertTestAuditReceipt(t, verify, providerID, now.Add(-3*time.Hour), "PASS") // not JIT-flagged
+	refreshProviderScores(t, verify)
+
+	score, err := GetScore(context.Background(), db, providerID)
+	if err != nil {
+		t.Fatalf("GetScore: %v", err)
+	}
+	if !floatsClose(score.Score24h, 1.0) {
+		t.Errorf("Score24h = %v, want 1.0 — only 2 JIT flags, below the 3-flag ARCH §20 threshold", score.Score24h)
+	}
+}
+
+// TestJITPenaltyPersistsWithin30Days verifies the "stateless equivalent
+// framing" this session's mv_provider_scores change relies on: 3 JIT flags
+// clustered together 10 days ago (well outside the 7-day window as measured
+// from NOW, but the qualifying window is evaluated as of THOSE receipts' own
+// timestamps, per the view's jit_penalized CTE) must still apply the penalty
+// today, since ARCH §20's 30-day penalty period has not yet elapsed.
+func TestJITPenaltyPersistsWithin30Days(t *testing.T) {
+	db := openTestDB(t)
+	verify := openVerifyDB(t)
+	providerID := insertTestProvider(t, db, testProviderSpec{})
+
+	now := time.Now().UTC()
+	// 3 JIT-flagged receipts clustered within a few hours of each other,
+	// 10 days ago -- a qualifying 7-day window at THAT point in time.
+	for _, hoursAgo := range []int{240, 241, 242} { // ~10 days ago, +/- 2h
+		insertTestAuditReceiptJIT(t, verify, providerID, now.Add(-time.Duration(hoursAgo)*time.Hour), "PASS")
+	}
+	// A separate, recent, non-JIT PASS to actually populate the 24h window.
+	insertTestAuditReceipt(t, verify, providerID, now.Add(-1*time.Hour), "PASS")
+	refreshProviderScores(t, verify)
+
+	score, err := GetScore(context.Background(), db, providerID)
+	if err != nil {
+		t.Fatalf("GetScore: %v", err)
+	}
+	// pass_24h=1 (the recent one), weighted 0.5x since the provider is still
+	// under the 30-day penalty from the cluster 10 days ago -> 0.5/1 = 0.5.
+	if !floatsClose(score.Score24h, 0.5) {
+		t.Errorf("Score24h = %v, want 0.5 — the 30-day penalty from the cluster 10 days ago is still active", score.Score24h)
+	}
+}
+
+// TestJITPenaltyExpiresAfter30Days verifies the mirror image: 3 JIT flags
+// clustered 35 days ago — outside ARCH §20's 30-day penalty period — must
+// NOT apply any weighting today.
+func TestJITPenaltyExpiresAfter30Days(t *testing.T) {
+	db := openTestDB(t)
+	verify := openVerifyDB(t)
+	providerID := insertTestProvider(t, db, testProviderSpec{})
+
+	now := time.Now().UTC()
+	for _, hoursAgo := range []int{840, 841, 842} { // ~35 days ago, +/- 2h
+		insertTestAuditReceiptJIT(t, verify, providerID, now.Add(-time.Duration(hoursAgo)*time.Hour), "PASS")
+	}
+	insertTestAuditReceipt(t, verify, providerID, now.Add(-1*time.Hour), "PASS")
+	refreshProviderScores(t, verify)
+
+	score, err := GetScore(context.Background(), db, providerID)
+	if err != nil {
+		t.Fatalf("GetScore: %v", err)
+	}
+	if !floatsClose(score.Score24h, 1.0) {
+		t.Errorf("Score24h = %v, want 1.0 — the JIT cluster is 35 days old, past ARCH §20's 30-day penalty period", score.Score24h)
 	}
 }
 
