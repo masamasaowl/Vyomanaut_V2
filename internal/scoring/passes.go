@@ -43,6 +43,35 @@ import (
 // Goroutine-safe: yes — uses SELECT ... FOR UPDATE within a transaction so two
 // concurrent audit-PASS events for the same provider cannot both observe the
 // pre-increment count and both trigger the transition redundantly.
+//
+// ORDERING CONTRACT WITH ResetConsecutivePasses (Milestone 8 corrections
+// session): row-level locking (the FOR UPDATE above, and the implicit
+// single-statement lock ResetConsecutivePasses' own UPDATE takes) prevents a
+// LOST UPDATE between the two functions — whichever call reaches the row
+// second always sees the first call's committed write, never a stale
+// pre-write value. It does NOT prevent an OUT-OF-ORDER APPLICATION: if two
+// audit results for the same provider are ever in flight concurrently (e.g.
+// a retried request racing its own original), and the CALLER invokes
+// ResetConsecutivePasses for the chronologically OLDER of the two audit
+// events after already having invoked IncrementConsecutivePasses for the
+// chronologically NEWER one, this function has no way to detect that the
+// Reset it is about to be followed by is stale — the newer PASS's progress
+// is silently wiped by the older TIMEOUT/FAIL's reset. Today this is purely
+// hypothetical: nothing in this codebase yet calls either function (both are
+// unconsumed until Milestone 12's dispatch loop exists), so there is no
+// concrete calling pattern to design a real guard against without
+// speculating ahead of that interface. WHOEVER BUILDS THAT CALLER MUST
+// EITHER (a) guarantee strict per-provider serialization of audit-result
+// processing (e.g. a per-provider work queue), in which case this ordering
+// concern never arises, or (b) if concurrent processing for the same
+// provider is possible, thread a monotonic marker (server_challenge_ts is
+// the natural choice — every audit_receipts row already has one) through
+// both this function and ResetConsecutivePasses, storing the
+// highest-applied timestamp alongside consecutive_audit_passes and having
+// each call no-op if its own timestamp is older than what is already
+// stored. Not implemented here since it would require a schema change and a
+// concrete caller to design correctly against — flagged for whoever picks up
+// Milestone 12 rather than speculatively built now.
 func IncrementConsecutivePasses(ctx context.Context, db *sql.DB, providerID uuid.UUID, profile config.NetworkProfile) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -125,6 +154,12 @@ WHERE provider_id = $2`
 // row in hand when deciding whether to call this function at all.
 //
 // Goroutine-safe: yes.
+//
+// ORDERING CONTRACT WITH IncrementConsecutivePasses: see the ORDERING
+// CONTRACT note on IncrementConsecutivePasses' own doc comment above — it
+// applies symmetrically here. This function has no way to tell an
+// in-order reset from a stale, out-of-order one; that guarantee is the
+// caller's responsibility.
 func ResetConsecutivePasses(ctx context.Context, db *sql.DB, providerID uuid.UUID) error {
 	const resetCount = `
 UPDATE providers
