@@ -30,9 +30,11 @@
 //   - TestUpdateRTOSubsequentSampleBlends        second call blends via EWMA, does not overwrite
 //   - TestUpdateRTOIncrementsSampleCount         rto_sample_count += 1 each call
 //   - TestUpdateRTOThroughputNeverDefaultsToZero first sample's throughput is never silently zeroed
+//   - TestPoolMedianRTOReturnsErrNoPoolMedianAvailable  zero qualifying providers -> ErrNoPoolMedianAvailable
 //   - TestPoolMedianRTOIsTrueMedian               skewing outlier -> result tracks the median, not the mean
 //   - TestPoolMedianRTOExcludesLowSampleProviders low-sample outlier excluded from the pool
-//   - TestPoolMedianRTOCachedFor5Minutes           two calls within the TTL agree despite changed data
+//   - TestPoolMedianRTOCachedFor5Minutes           two calls within the TTL, SAME handle, agree despite changed data
+//   - TestPoolMedianRTOCacheIsPerHandle            two calls within the TTL, DIFFERENT handles, get independent cache entries
 //
 // [REF: IC §4.2, DM §4.2, DM §9, FR-040, ADR-006, build.md Phase 8.3 Session 8.3.1]
 
@@ -41,6 +43,7 @@ package scoring
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"testing"
 
 	"github.com/google/uuid"
@@ -191,6 +194,37 @@ func insertQualifyingRTOProvider(t *testing.T, db *sql.DB, avgRTT float64) {
 	})
 }
 
+// TestPoolMedianRTOReturnsErrNoPoolMedianAvailable verifies PoolMedianRTO
+// wraps queryPoolMedianRTO's "no qualifying rows" case in the
+// ErrNoPoolMedianAvailable sentinel (Milestone 8 corrections session)
+// rather than a bare, uncomparable-by-errors.Is error string.
+//
+// Requires the providers table to have zero ACTIVE + rto_sample_count>=5
+// rows at the moment this test runs — placed first among this file's
+// PoolMedianRTO tests specifically so it runs before any of them seed their
+// own qualifying providers (see file header: rows accumulate and are never
+// cleaned up). Skips, rather than failing, if that precondition no longer
+// holds by the time it runs — a pre-existing constraint of this file's
+// shared, accumulating fixture design (inherited, not introduced here), not
+// something this test can control on its own.
+func TestPoolMedianRTOReturnsErrNoPoolMedianAvailable(t *testing.T) {
+	db := openTestDB(t)
+
+	_, ok, err := queryPoolMedianRTO(context.Background(), db)
+	if err != nil {
+		t.Fatalf("queryPoolMedianRTO: %v", err)
+	}
+	if ok {
+		t.Skip("providers table already has qualifying rows (this file's fixtures accumulate " +
+			"and are never cleaned up — see file header); cannot exercise the zero-rows path from here")
+	}
+
+	_, err = PoolMedianRTO(context.Background(), db)
+	if !errors.Is(err, ErrNoPoolMedianAvailable) {
+		t.Errorf("PoolMedianRTO: got %v, want ErrNoPoolMedianAvailable", err)
+	}
+}
+
 // TestPoolMedianRTOIsTrueMedian seeds four providers clustered around 100-130
 // plus one extreme outlier (90000). A true median lands within the cluster;
 // an arithmetic mean would be dragged into the tens of thousands by the
@@ -288,5 +322,59 @@ func TestPoolMedianRTOCachedFor5Minutes(t *testing.T) {
 
 	if !floatsClose(first, second) {
 		t.Errorf("PoolMedianRTO changed from %v to %v within the cache TTL window despite underlying data changing — caching does not appear to be in effect", first, second)
+	}
+}
+
+// TestPoolMedianRTOCacheIsPerHandle verifies the Milestone 8 corrections
+// session's cache-keying fix directly against poolMedianCache's own state
+// (white-box — this file is in package scoring, not scoring_test): two
+// DIFFERENT *sql.DB handles must each get their own cache entry, not share
+// one. Before this fix, poolMedianCache held a single unkeyed value; calling
+// PoolMedianRTO with two different handles would have left exactly one
+// entry regardless of how many distinct handles were used — this test would
+// have failed the entryCount assertion below against the pre-fix code.
+//
+// Deliberately does not assert anything about the RETURNED median values:
+// this file's fixtures accumulate providers across tests (see file header),
+// so two handles querying the SAME underlying table would legitimately
+// often compute the same median even without any caching at all — that
+// would not distinguish "cache is keyed correctly" from "cache is broken
+// but the data happens to agree." Inspecting the cache map's own keys does.
+func TestPoolMedianRTOCacheIsPerHandle(t *testing.T) {
+	dbA := openTestDB(t)
+	dbB := openTestDB(t) // deliberately a SEPARATE *sql.DB handle, not dbA
+
+	for _, avgRTT := range []float64{100, 110, 120, 130, 140} {
+		v := avgRTT
+		insertTestProvider(t, dbA, testProviderSpec{
+			status:         "ACTIVE",
+			avgRTTMs:       &v,
+			varRTTMs:       0,
+			rtoSampleCount: 5,
+		})
+	}
+
+	if _, err := PoolMedianRTO(context.Background(), dbA); err != nil {
+		t.Fatalf("PoolMedianRTO (dbA): %v", err)
+	}
+	if _, err := PoolMedianRTO(context.Background(), dbB); err != nil {
+		t.Fatalf("PoolMedianRTO (dbB): %v", err)
+	}
+
+	poolMedianCache.mu.RLock()
+	_, hasA := poolMedianCache.entries[dbA]
+	_, hasB := poolMedianCache.entries[dbB]
+	entryCount := len(poolMedianCache.entries)
+	poolMedianCache.mu.RUnlock()
+
+	if !hasA {
+		t.Error("poolMedianCache has no entry for dbA after calling PoolMedianRTO(dbA)")
+	}
+	if !hasB {
+		t.Error("poolMedianCache has no entry for dbB after calling PoolMedianRTO(dbB)")
+	}
+	if entryCount < 2 {
+		t.Errorf("poolMedianCache has %d entries after two DIFFERENT handles were used, want >= 2 — "+
+			"a single unkeyed cache (the pre-Milestone-8 behavior) would show exactly 1 here", entryCount)
 	}
 }
