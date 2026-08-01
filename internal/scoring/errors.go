@@ -21,4 +21,12 @@ var (
 	// ErrProviderNotVetting is returned by IncrementConsecutivePasses when the
 	// provider is not in VETTING status (IC §5.6).
 	ErrProviderNotVetting = errors.New("scoring: provider is not in VETTING status")
+
+	// ErrNoPoolMedianAvailable is returned by PoolMedianRTO when no provider
+	// in the pool has an established RTT measurement yet
+	// (providers.avg_rtt_ms IS NULL for every row) — a genuinely empty pool
+	// median, not a database error. Milestone 8 corrections session: this
+	// case previously returned (0, nil), indistinguishable from a
+	// legitimately-computed zero-millisecond median.
+	ErrNoPoolMedianAvailable = errors.New("scoring: no pool median RTT available (no provider has an established measurement yet)")
 )
