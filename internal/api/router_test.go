@@ -109,12 +109,12 @@ func allRegisteredRoutes() []routeFixture {
 		{"DELETE", "/api/v1/file/11111111-1111-1111-1111-111111111111", authBearerOwner, true},
 		{"POST", "/api/v1/audit/challenge", authAdmin, false}, // cfg.ClusterSecretCache left nil in these tests -> still stub501
 		{"GET", "/api/v1/admin/readiness", authAdmin, false},  // cfg.Readiness left nil in these tests -> still stub501
-		{"GET", "/api/v1/admin/repair/queue", authAdmin, false},
-		{"POST", "/api/v1/admin/repair/trigger", authAdmin, false},
-		{"GET", "/api/v1/admin/providers", authAdmin, false},
-		{"GET", "/api/v1/admin/audit/stats", authAdmin, false},
-		{"GET", "/api/v1/admin/vetting/status", authAdmin, false},
-		{"POST", "/api/v1/admin/vetting/gc/retry", authAdmin, false},
+		{"GET", "/api/v1/admin/repair/queue", authAdmin, true},
+		{"POST", "/api/v1/admin/repair/trigger", authAdmin, true},
+		{"GET", "/api/v1/admin/providers", authAdmin, true},
+		{"GET", "/api/v1/admin/audit/stats", authAdmin, true},
+		{"GET", "/api/v1/admin/vetting/status", authAdmin, true},
+		{"POST", "/api/v1/admin/vetting/gc/retry", authAdmin, true},
 		{"POST", "/webhooks/razorpay", authNone, false},
 	}
 }
