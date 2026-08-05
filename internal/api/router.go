@@ -208,12 +208,19 @@ func NewRouter(cfg RouterConfig) *http.ServeMux {
 	} else {
 		mux.Handle("GET /api/v1/admin/readiness", admin(stub501))
 	}
-	mux.Handle("GET /api/v1/admin/repair/queue", admin(stub501))      // getRepairQueue
-	mux.Handle("POST /api/v1/admin/repair/trigger", admin(stub501))   // triggerRepair
-	mux.Handle("GET /api/v1/admin/providers", admin(stub501))         // listAdminProviders
-	mux.Handle("GET /api/v1/admin/audit/stats", admin(stub501))       // getAuditStats
-	mux.Handle("GET /api/v1/admin/vetting/status", admin(stub501))    // getVettingStatus
-	mux.Handle("POST /api/v1/admin/vetting/gc/retry", admin(stub501)) // retryVettingGC
+	adminProvidersHandler := NewAdminProvidersHandler(cfg.DB)
+	repairQueueHandler := NewRepairQueueHandler(cfg.DB)
+	manualRepairTriggerHandler := NewManualRepairTriggerHandler(cfg.DB, cfg.Profile)
+	auditStatsHandler := NewAuditStatsHandler(cfg.DB)
+	vettingStatusHandler := NewVettingStatusHandler(cfg.DB)
+	vettingGCRetryHandler := NewVettingGCRetryHandler(cfg.DB)
+
+	mux.Handle("GET /api/v1/admin/repair/queue", admin(repairQueueHandler.HandleQueue))              // getRepairQueue
+	mux.Handle("POST /api/v1/admin/repair/trigger", admin(manualRepairTriggerHandler.HandleTrigger)) // triggerRepair
+	mux.Handle("GET /api/v1/admin/providers", admin(adminProvidersHandler.HandleList))               // listAdminProviders
+	mux.Handle("GET /api/v1/admin/audit/stats", admin(auditStatsHandler.HandleStats))                // getAuditStats
+	mux.Handle("GET /api/v1/admin/vetting/status", admin(vettingStatusHandler.HandleStatus))         // getVettingStatus
+	mux.Handle("POST /api/v1/admin/vetting/gc/retry", admin(vettingGCRetryHandler.HandleRetry))      // retryVettingGC
 
 	// ── Webhook: signature auth (IC §7), confirmed absent from OAS by design ──
 	mux.HandleFunc("POST /webhooks/razorpay", stub501)
