@@ -412,6 +412,11 @@ func decodeRepairQueueCursor(cursor string) (priority string, ts time.Time, id u
 	return parts[0], time.Unix(0, nanos).UTC(), pid, nil
 }
 
+const (
+	cursorPriorityOffset = 2
+	cursorTimeOffset     = 1
+)
+
 // RepairQueueHandler serves GET /api/v1/admin/repair/queue.
 type RepairQueueHandler struct {
 	db *sql.DB
@@ -492,7 +497,16 @@ func (h *RepairQueueHandler) HandleQueue(w http.ResponseWriter, r *http.Request)
 			return
 		}
 		args = append(args, cp, cts, cid)
-		where = append(where, fmt.Sprintf("(priority, created_at, job_id) > ($%d::repair_priority, $%d, $%d)", len(args)-2, len(args)-1, len(args)))
+
+		priorityArg := len(args) - cursorPriorityOffset
+		timeArg := len(args) - cursorTimeOffset
+		jobArg := len(args)
+
+		where = append(where, fmt.Sprintf("(priority, created_at, job_id) > ($%d::repair_priority, $%d, $%d)",
+			priorityArg,
+			timeArg,
+			jobArg,
+		))
 	}
 
 	whereClause := strings.Join(where, " AND ")
@@ -856,6 +870,8 @@ type vettingStatusResponseBody struct {
 	Providers                     []vettingStatusProviderItem `json:"providers"`
 }
 
+const percentageScale = 100.0
+
 // VettingStatusHandler serves GET /api/v1/admin/vetting/status.
 type VettingStatusHandler struct {
 	db *sql.DB
@@ -942,7 +958,7 @@ func (h *VettingStatusHandler) HandleStatus(w http.ResponseWriter, r *http.Reque
 		chunkCap := declaredStorageGB * vettingChunksPerGB
 		var utilisation float64
 		if chunkCap > 0 {
-			utilisation = float64(chunksAssigned) / float64(chunkCap) * 100
+			utilisation = float64(chunksAssigned) / float64(chunkCap) * percentageScale
 		}
 		item.VettingSummary = vettingSummaryBody{
 			ChunksAssigned:    chunksAssigned,
