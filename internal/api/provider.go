@@ -194,6 +194,11 @@ type providerRegisterResponseBody struct {
 	Status               string    `json:"status"`
 	Token                string    `json:"token"`
 	RazorpayCoolingUntil time.Time `json:"razorpay_cooling_until"`
+	// StorageAdvisoryGB: NFR-044's per-provider chunk storage ceiling
+	// advisory (build.md Phase 11.11) — see upload.go's
+	// activeChunkStorageCeilingGB for why this is a single, uniform value
+	// today rather than genuinely per-provider.
+	StorageAdvisoryGB int `json:"storage_advisory_gb"`
 }
 
 // canonicalRegisterSigningInput builds the signing input for provider_sig:
@@ -333,6 +338,7 @@ func (h *ProviderRegisterHandler) HandleRegister(w http.ResponseWriter, r *http.
 		Status:               status,
 		Token:                token,
 		RazorpayCoolingUntil: razorpayCoolingUntil,
+		StorageAdvisoryGB:    activeChunkStorageCeilingGB(),
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -632,6 +638,11 @@ type providerStatusResponseBody struct {
 	VettingEligibleAt      *time.Time `json:"vetting_eligible_at"`
 	VettingGCPending       *bool      `json:"vetting_gc_pending"`
 	NetworkMode            string     `json:"network_mode"`
+	// StorageAdvisoryGB: NFR-044's per-provider chunk storage ceiling
+	// advisory (build.md Phase 11.11) — see upload.go's
+	// activeChunkStorageCeilingGB for why this is a single, uniform value
+	// today rather than genuinely per-provider.
+	StorageAdvisoryGB int `json:"storage_advisory_gb"`
 }
 
 // vettingChunksPerGB is ADR-030's synthetic vetting chunk cap formula:
@@ -745,6 +756,7 @@ func (h *ProviderStatusHandler) HandleStatus(w http.ResponseWriter, r *http.Requ
 		P95ThroughputKbps:      throughput,
 		AcceleratedReaudit:     acceleratedReaudit,
 		NetworkMode:            h.profile.Mode,
+		StorageAdvisoryGB:      activeChunkStorageCeilingGB(),
 	}
 	if lastHeartbeatTS.Valid {
 		resp.LastHeartbeatTS = &lastHeartbeatTS.Time
