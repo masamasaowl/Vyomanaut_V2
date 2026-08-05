@@ -247,10 +247,19 @@ func (h *UploadAssignHandler) HandleAssign(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// Check 2.5 — per-provider chunk storage ceiling (NFR-044): exclude
+	// providers already at/over the ceiling from every segment's candidate
+	// pool below, and reject the whole request if too few eligible ACTIVE
+	// providers remain once that exclusion is applied.
+	overCeiling, ok := enforceProviderCapacity(ctx, w, h.db, chunkCeilingMaxChunks(h.profile), h.profile.MinActiveProviders)
+	if !ok {
+		return
+	}
+
 	// Check 3 — ASN cap, enforced per-shard by repair.SelectReplacementProvider.
 	segments := make([]segmentAssignmentBody, 0, req.NumSegments)
 	for segIdx := 0; segIdx < req.NumSegments; segIdx++ {
-		segAssignment, availableASNs, err := h.assignSegment(ctx, req.FileID, segIdx)
+		segAssignment, availableASNs, err := h.assignSegment(ctx, req.FileID, segIdx, overCeiling)
 		if errors.Is(err, repair.ErrNoEligibleReplacement) {
 			writeInsufficientASNDiversityError(w, h.profile.TotalShards, availableASNs)
 			return
@@ -288,8 +297,12 @@ func (h *UploadAssignHandler) createPlaceholderFile(ctx context.Context, fileID,
 // assignments. shard_index 0..profile.DataShards-1 are the systematic AONT
 // data words; profile.DataShards..profile.TotalShards-1 are RS parity
 // (never the hardcoded "0-15/16-55" OAS's schema descriptions use — this
-// phase's own flagged note).
-func (h *UploadAssignHandler) assignSegment(ctx context.Context, fileID uuid.UUID, segIdx int) (segmentAssignmentBody, int, error) {
+// phase's own flagged note). excludeForCeiling seeds the exclude list with
+// every provider already at/over the chunk storage ceiling (NFR-044,
+// enforceProviderCapacity in HandleAssign) — computed once per request, not
+// per segment, since it reflects each provider's real chunk allocation
+// which a single new shard assignment (256 KB) does not meaningfully move.
+func (h *UploadAssignHandler) assignSegment(ctx context.Context, fileID uuid.UUID, segIdx int, excludeForCeiling []uuid.UUID) (segmentAssignmentBody, int, error) {
 	var segmentID uuid.UUID
 	if err := h.db.QueryRowContext(ctx, `INSERT INTO segments (file_id, segment_index) VALUES ($1, $2) RETURNING segment_id`,
 		fileID, segIdx).Scan(&segmentID); err != nil {
@@ -297,7 +310,7 @@ func (h *UploadAssignHandler) assignSegment(ctx context.Context, fileID uuid.UUI
 	}
 
 	shards := make([]ShardAssignmentBody, 0, h.profile.TotalShards)
-	var excludeIDs []uuid.UUID
+	excludeIDs := append([]uuid.UUID{}, excludeForCeiling...)
 	now := time.Now()
 
 	for shardIdx := 0; shardIdx < h.profile.TotalShards; shardIdx++ {
@@ -489,4 +502,208 @@ func writeInsufficientASNDiversityError(w http.ResponseWriter, totalShards, avai
 	WriteError(w, http.StatusServiceUnavailable, ErrInsufficientASNDiversity,
 		fmt.Sprintf("Cannot place %d shards while respecting the per-ASN cap. Current distinct ASNs: %d.", totalShards, availableASNs),
 		&retryAfter, "", &asns)
+}
+
+// ── Per-provider chunk storage ceiling (NFR-044, build.md Phase 11.11) ──
+//
+// [Flagged and corrected — the given formula doesn't reproduce its own
+// reference points] The originally-given task computed
+// storage_advisory_gb = ceil(mttf_days ÷ 300 × 130). At mttf_days=300 this
+// correctly gives 130 GB, but at mttf_days=180 it gives ceil(0.6*130) =
+// 78 GB — not architecture.md §27.3's documented ~70 GB. The MTTF-to-
+// storage-ceiling relationship is not linear (Giroire's formula scales
+// BWavg with D/N in a way that doesn't reduce to simple proportionality in
+// MTTF alone — ADR-004), so a straight-line formula between the two points
+// silently produces a wrong number at one of its own two anchors.
+// storageCeilingForMTTFDays below is a LOOKUP against the two documented
+// reference points instead.
+//
+// [Flagged — no per-provider MTTF field exists anywhere in this schema]
+// NFR-044's own text describes this ceiling as "derived from... the
+// provider's declared MTTF tier" — but neither providers (migrations/
+// 001_initial_schema.sql), ProviderRegisterRequest (OAS), nor
+// config.NetworkProfile has any MTTF-related field, and no provider ever
+// declares one at registration (checked all three directly). ADR-010
+// confirms V2 is desktop-only, and architecture.md §27.3 itself labels 180
+// days as "desktop minimum" / the V2 worst case — so the single ceiling
+// actually enforceable today, for every V2 provider uniformly, is the
+// 180-day/~70GB tier (activeChunkStorageCeilingGB). storageCeilingForMTTFDays
+// itself still supports and is independently correct at both documented
+// anchors (180d -> ~70GB, 300d -> ~130GB) — only "which MTTF tier applies to
+// a given provider" is the flagged gap, not the lookup table itself. The
+// 300-day/~130GB tier remains available for when a genuine per-provider
+// MTTF declaration mechanism exists — a schema/OAS addition outside this
+// session's file list.
+
+const (
+	// mttfTier180Days / mttfTier300Days / storageCeiling180DaysGB /
+	// storageCeiling300DaysGB are architecture.md §27.3's two documented
+	// reference points for the per-provider chunk storage ceiling.
+	mttfTier180Days         = 180 // desktop minimum / worst case for V2 (ADR-010)
+	mttfTier300Days         = 300 // planning target
+	storageCeiling180DaysGB = 70
+	storageCeiling300DaysGB = 130
+
+	// nearCeilingThresholdFraction: no ADR/FR/OAS text defines what "near"
+	// means for providers_near_ceiling_count (readiness.go) — 90% is an
+	// engineering choice, not a documented requirement, flagged here rather
+	// than left unimplemented.
+	nearCeilingThresholdFraction = 0.90
+
+	insufficientProviderCapacityRetryAfterSeconds = 3600
+)
+
+// storageCeilingForMTTFDays is architecture.md §27.3's two-point storage
+// ceiling table as a LOOKUP, not a formula (see this section's header
+// note). Values between the two documented anchors snap to the nearer one;
+// values outside [180, 300] clamp to the nearest anchor.
+func storageCeilingForMTTFDays(mttfDays int) int {
+	switch {
+	case mttfDays <= mttfTier180Days:
+		return storageCeiling180DaysGB
+	case mttfDays >= mttfTier300Days:
+		return storageCeiling300DaysGB
+	default:
+		mid := (mttfTier180Days + mttfTier300Days) / 2
+		if mttfDays < mid {
+			return storageCeiling180DaysGB
+		}
+		return storageCeiling300DaysGB
+	}
+}
+
+// activeChunkStorageCeilingGB returns the per-provider chunk storage
+// ceiling actually enforced today — see this section's header note on why
+// every V2 provider uniformly uses the 180-day tier absent a per-provider
+// MTTF declaration mechanism.
+func activeChunkStorageCeilingGB() int {
+	return storageCeilingForMTTFDays(mttfTier180Days)
+}
+
+// chunkCeilingMaxChunks converts activeChunkStorageCeilingGB into a real
+// (non-vetting) chunk_assignments count for profile's ShardSize (a
+// compile-time constant, not profile-variable — migrations/README.md).
+// Uses owner.go's existing bytesPerGB (2^30) — the same GB convention this
+// package already uses for storage cost math — rather than introducing a
+// second, conflicting "bytes per GB" constant for the same unit.
+func chunkCeilingMaxChunks(profile config.NetworkProfile) int64 {
+	ceilingBytes := int64(activeChunkStorageCeilingGB()) * bytesPerGB
+	return ceilingBytes / int64(profile.ShardSize)
+}
+
+// providersAtOrOverChunkCount returns every provider currently holding at
+// least maxChunks real (non-vetting), ACTIVE-or-REPAIRING chunk
+// assignments — candidates to exclude from new shard assignment (NFR-044).
+// maxChunks is an explicit parameter (rather than this function reading
+// activeChunkStorageCeilingGB itself) purely so tests can exercise it
+// against a small, practical count instead of architecture.md's real
+// ~267,000-chunk (70 GB) threshold; HandleAssign always calls this with
+// chunkCeilingMaxChunks(h.profile), the real value.
+func providersAtOrOverChunkCount(ctx context.Context, db *sql.DB, maxChunks int64) ([]uuid.UUID, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT provider_id
+		FROM chunk_assignments
+		WHERE is_vetting_chunk = FALSE AND status IN ('ACTIVE', 'REPAIRING')
+		GROUP BY provider_id
+		HAVING COUNT(*) >= $1`, maxChunks)
+	if err != nil {
+		return nil, fmt.Errorf("api: providersAtOrOverChunkCount: %w", err)
+	}
+	defer func() {
+		if err := rows.Close(); err != nil {
+			slog.Error("providersAtOrOverChunkCount: close rows", "error", err)
+		}
+	}()
+
+	var ids []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("api: providersAtOrOverChunkCount: scan: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// eligibleActiveProviderCountAtOrUnder returns the count of ACTIVE
+// providers NOT currently at/over maxChunks real chunk assignments — the
+// pool repair.SelectReplacementProvider draws real shard candidates from
+// once the ceiling exclusion (providersAtOrOverChunkCount) is applied.
+func eligibleActiveProviderCountAtOrUnder(ctx context.Context, db *sql.DB, maxChunks int64) (int, error) {
+	var count int
+	err := db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM providers p
+		WHERE p.status = 'ACTIVE'
+		  AND p.provider_id NOT IN (
+		      SELECT ca.provider_id FROM chunk_assignments ca
+		      WHERE ca.is_vetting_chunk = FALSE AND ca.status IN ('ACTIVE', 'REPAIRING')
+		      GROUP BY ca.provider_id
+		      HAVING COUNT(*) >= $1
+		  )`, maxChunks).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("api: eligibleActiveProviderCountAtOrUnder: %w", err)
+	}
+	return count, nil
+}
+
+// providersNearChunkCeilingCount returns the count of providers at or above
+// nearCeilingThresholdFraction of maxChunks — an informational
+// (non-gating) gauge surfaced on the readiness response (readiness.go).
+func providersNearChunkCeilingCount(ctx context.Context, db *sql.DB, maxChunks int64) (int, error) {
+	nearThreshold := int64(float64(maxChunks) * nearCeilingThresholdFraction)
+	var count int
+	err := db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM (
+			SELECT provider_id FROM chunk_assignments
+			WHERE is_vetting_chunk = FALSE AND status IN ('ACTIVE', 'REPAIRING')
+			GROUP BY provider_id
+			HAVING COUNT(*) >= $1
+		) near`, nearThreshold).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("api: providersNearChunkCeilingCount: %w", err)
+	}
+	return count, nil
+}
+
+// writeInsufficientProviderCapacityError writes the 503
+// INSUFFICIENT_PROVIDER_CAPACITY response — Session 11.1.1's
+// ErrInsufficientProviderCapacity, flagged there for an openapi.yaml
+// addition (still outstanding; this endpoint's own request/response
+// schema has no formal 503 entry for it either).
+func writeInsufficientProviderCapacityError(w http.ResponseWriter) {
+	retryAfter := insufficientProviderCapacityRetryAfterSeconds
+	WriteError(w, http.StatusServiceUnavailable, ErrInsufficientProviderCapacity,
+		"insufficient eligible provider capacity after applying the per-provider chunk storage ceiling (NFR-044)",
+		&retryAfter, "", nil)
+}
+
+// enforceProviderCapacity applies NFR-044's per-provider chunk storage
+// ceiling before shard assignment: it computes which ACTIVE providers are
+// currently at/over maxChunks (to exclude from every segment's candidate
+// pool below) and the resulting eligible pool size. If the eligible pool
+// drops below minActiveProviders, it writes the 503 response itself and
+// returns ok=false — the caller must stop processing the request without
+// generating any assignments or touching the database further.
+// maxChunks/minActiveProviders are explicit parameters (rather than this
+// function reading h.profile directly) purely so tests can exercise the
+// 503 path against a small, practical chunk count instead of
+// architecture.md's real ~267,000-chunk (70 GB) threshold — HandleAssign
+// always calls this with the real, profile-derived values.
+func enforceProviderCapacity(ctx context.Context, w http.ResponseWriter, db *sql.DB, maxChunks int64, minActiveProviders int) (overCeiling []uuid.UUID, ok bool) {
+	overCeiling, err := providersAtOrOverChunkCount(ctx, db, maxChunks)
+	if err != nil {
+		WriteError(w, http.StatusInternalServerError, ErrInternal, "provider capacity check failed", nil, "", nil)
+		return nil, false
+	}
+	eligible, err := eligibleActiveProviderCountAtOrUnder(ctx, db, maxChunks)
+	if err != nil {
+		WriteError(w, http.StatusInternalServerError, ErrInternal, "provider capacity check failed", nil, "", nil)
+		return nil, false
+	}
+	if eligible < minActiveProviders {
+		writeInsufficientProviderCapacityError(w)
+		return nil, false
+	}
+	return overCeiling, true
 }
