@@ -553,6 +553,11 @@ const (
 	insufficientProviderCapacityRetryAfterSeconds = 3600
 )
 
+// Remove calculation from the hot path
+const (
+	mttfMidpointDays = (mttfTier180Days + mttfTier300Days) / 2
+)
+
 // storageCeilingForMTTFDays is architecture.md §27.3's two-point storage
 // ceiling table as a LOOKUP, not a formula (see this section's header
 // note). Values between the two documented anchors snap to the nearer one;
@@ -564,8 +569,7 @@ func storageCeilingForMTTFDays(mttfDays int) int {
 	case mttfDays >= mttfTier300Days:
 		return storageCeiling300DaysGB
 	default:
-		mid := (mttfTier180Days + mttfTier300Days) / 2
-		if mttfDays < mid {
+		if mttfDays < mttfMidpointDays {
 			return storageCeiling180DaysGB
 		}
 		return storageCeiling300DaysGB
