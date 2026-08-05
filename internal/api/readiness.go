@@ -112,11 +112,17 @@ type ReadinessConditions struct {
 }
 
 // ReadinessResponse mirrors OAS components/schemas/ReadinessResponse.
+//
+// ProvidersNearCeilingCount (build.md Phase 11.11 Session 11.11.1, NFR-044)
+// is informational/non-gating — it does not participate in
+// AllConditionsMet — surfacing how many ACTIVE providers are approaching
+// the per-provider chunk storage ceiling upload/assign enforces (upload.go).
 type ReadinessResponse struct {
-	AllConditionsMet bool                `json:"all_conditions_met"`
-	EvaluatedAt      time.Time           `json:"evaluated_at"`
-	Mode             string              `json:"mode"`
-	Conditions       ReadinessConditions `json:"conditions"`
+	AllConditionsMet          bool                `json:"all_conditions_met"`
+	EvaluatedAt               time.Time           `json:"evaluated_at"`
+	Mode                      string              `json:"mode"`
+	Conditions                ReadinessConditions `json:"conditions"`
+	ProvidersNearCeilingCount int                 `json:"providers_near_ceiling_count"`
 }
 
 // ReadinessEvaluator evaluates all seven readiness conditions (ADR-029,
@@ -189,6 +195,14 @@ func (e *ReadinessEvaluator) Evaluate(ctx context.Context) (ReadinessResponse, e
 	}
 	secretCond := e.evaluateClusterAuditSecretLoaded()
 
+	// Informational/non-gating (NFR-044, build.md Phase 11.11) — computed
+	// alongside the seven gating conditions but deliberately excluded from
+	// allMet below.
+	nearCeilingCount, err := providersNearChunkCeilingCount(ctx, e.db, chunkCeilingMaxChunks(e.profile))
+	if err != nil {
+		return ReadinessResponse{}, fmt.Errorf("api.ReadinessEvaluator.Evaluate: providers_near_ceiling_count: %w", err)
+	}
+
 	conditions := ReadinessConditions{
 		ActiveVettedProviders:    activeVettedCond,
 		DistinctASNs:             asnCond,
@@ -203,10 +217,11 @@ func (e *ReadinessEvaluator) Evaluate(ctx context.Context) (ReadinessResponse, e
 		quorumCond.Satisfied && razorpayCond.Satisfied && relayCond.Satisfied && secretCond.Satisfied
 
 	return ReadinessResponse{
-		AllConditionsMet: allMet,
-		EvaluatedAt:      time.Now().UTC(),
-		Mode:             e.profile.Mode,
-		Conditions:       conditions,
+		AllConditionsMet:          allMet,
+		EvaluatedAt:               time.Now().UTC(),
+		Mode:                      e.profile.Mode,
+		Conditions:                conditions,
+		ProvidersNearCeilingCount: nearCeilingCount,
 	}, nil
 }
 
