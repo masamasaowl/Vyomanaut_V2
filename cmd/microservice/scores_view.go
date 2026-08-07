@@ -46,6 +46,26 @@ import (
 // correlated sub-window plus pass_7d/total_7d), %[3]s = ScoreWindowLong (was
 // '30 days', 3 occurrences: the JIT CTE's outer filter plus
 // pass_30d/total_30d).
+// [Bug fix, post-Phase-12.1] DROP MATERIALIZED VIEW followed by CREATE
+// produces a brand-new database object with a new OID — it does NOT
+// inherit the original migration's "GRANT SELECT ON mv_provider_scores TO
+// vyomanaut_app" (migrations/001_initial_schema.sql), because that GRANT
+// was bound to the object CREATE MATERIALIZED VIEW made at migration time,
+// not to the view's name. Without reissuing it, the first call to this
+// function against any given database (this session's own
+// TestRegenerateProviderScoresView included) silently revokes every
+// vyomanaut_app-authenticated query's ability to read scores at all —
+// scoring.GetScore, scoring.GetScoreFromPrimary,
+// repair.SelectReplacementProvider, and every HTTP handler that calls them,
+// all failing with "pq: permission denied for materialized view
+// mv_provider_scores (42501)". Caught in CI and reproduced locally: this
+// showed up across internal/api, internal/payment, internal/repair, and
+// internal/scoring immediately after cmd/microservice's own test suite ran
+// (and silently stripped the grant) against a database CI's
+// `go test -p 1 ./...` shares across every package, in alphabetical package
+// order — cmd/ always runs, and always struck the grant, before any
+// internal/* package's tests did. providerScoresViewTemplate's final
+// statement now reissues it every time.
 const providerScoresViewTemplate = `
 CREATE MATERIALIZED VIEW mv_provider_scores AS
 WITH jit_penalized AS (
@@ -105,6 +125,10 @@ FROM (
 ) scores;
 
 CREATE UNIQUE INDEX ON mv_provider_scores (provider_id);
+
+-- [Bug fix, post-Phase-12.1 — see this file's header note] Reissue the
+-- grant DROP+CREATE just silently destroyed.
+GRANT SELECT ON mv_provider_scores TO vyomanaut_app;
 `
 
 // intervalLiteral formats d as a Postgres interval literal string, e.g.
