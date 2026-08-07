@@ -50,12 +50,25 @@ type NetworkProfile struct {
 	ASNCapFraction float64
 
 	// ── Time windows ──────────────────────────────────────────────────────────
-	HeartbeatInterval    time.Duration // provider → microservice liveness signal interval [REF: ADR-028]
-	HeartbeatJitter      time.Duration // random jitter added to each heartbeat interval   [REF: ADR-028]
-	PollingInterval      time.Duration // audit-scheduler polling cadence                  [REF: ADR-006]
-	DHTRepublishInterval time.Duration // DHT key republication interval                   [REF: ADR-001]
-	DHTExpiryDuration    time.Duration // DHT record TTL                                   [REF: ADR-001]
-	DepartureThreshold   time.Duration // silence duration before a provider is DEPARTED   [REF: ADR-006, ADR-007]
+	HeartbeatInterval time.Duration // provider → microservice liveness signal interval [REF: ADR-028]
+	HeartbeatJitter   time.Duration // random jitter added to each heartbeat interval   [REF: ADR-028]
+	PollingInterval   time.Duration // audit-scheduler polling cadence                  [REF: ADR-006]
+	// DeparturePollingInterval is how often the departure detector
+	// (internal/repair.DepartureDetector.Run) scans for silently-departed
+	// providers. A dedicated field, not a reuse of PollingInterval — see
+	// [Added, M9 review Optional Fix B] on DepartureDetector.Run for why
+	// reusing the audit-scheduler's own cadence was flagged as an inference
+	// with a self-acknowledged mismatched detection-latency-to-threshold
+	// ratio (production PollingInterval:DepartureThreshold was 24h:72h =
+	// 1:3; demo was 2min:10min = 1:5 — the same field meant two different
+	// things at two different scales). No ADR or FR gives a concrete
+	// figure for this cadence either; the values chosen here keep a
+	// comparable samples-before-threshold count across both profiles
+	// (~72 prod, ~20 demo) rather than reusing an unrelated cadence.
+	DeparturePollingInterval time.Duration
+	DHTRepublishInterval     time.Duration // DHT key republication interval                   [REF: ADR-001]
+	DHTExpiryDuration        time.Duration // DHT record TTL                                   [REF: ADR-001]
+	DepartureThreshold       time.Duration // silence duration before a provider is DEPARTED   [REF: ADR-006, ADR-007]
 
 	// PromisedDowntimeMaximum is the maximum duration a provider may declare as
 	// planned maintenance before the network treats the absence as a departure.
