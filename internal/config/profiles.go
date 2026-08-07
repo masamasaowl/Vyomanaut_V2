@@ -42,18 +42,21 @@ var ProductionProfile = NetworkProfile{
 	ASNCapFraction: 0.20,
 
 	// ── Time windows ─────────────────────────────────────────────────────────
-	HeartbeatInterval:       4 * time.Hour,
-	HeartbeatJitter:         5 * time.Minute,
-	PollingInterval:         24 * time.Hour,
-	DHTRepublishInterval:    12 * time.Hour,
-	DHTExpiryDuration:       24 * time.Hour,
-	DepartureThreshold:      72 * time.Hour,
-	PromisedDowntimeMaximum: 72 * time.Hour,
-	AuditPeriodDuration:     30 * 24 * time.Hour,
-	EscrowHoldWindow:        30 * 24 * time.Hour,
-	VettingHoldWindow:       60 * 24 * time.Hour,
-	PendingReceiptGCAge:     48 * time.Hour,
-	RepairPromotionTimeout:  6 * time.Hour,
+	HeartbeatInterval: 4 * time.Hour,
+	HeartbeatJitter:   5 * time.Minute,
+	PollingInterval:   24 * time.Hour,
+	// 1h gives 72 samples across the 72h DepartureThreshold — prompt enough
+	// detection without hammering the DB. [REF: M9 review Optional Fix B]
+	DeparturePollingInterval: 1 * time.Hour,
+	DHTRepublishInterval:     12 * time.Hour,
+	DHTExpiryDuration:        24 * time.Hour,
+	DepartureThreshold:       72 * time.Hour,
+	PromisedDowntimeMaximum:  72 * time.Hour,
+	AuditPeriodDuration:      30 * 24 * time.Hour,
+	EscrowHoldWindow:         30 * 24 * time.Hour,
+	VettingHoldWindow:        60 * 24 * time.Hour,
+	PendingReceiptGCAge:      48 * time.Hour,
+	RepairPromotionTimeout:   6 * time.Hour,
 
 	// ── Scoring windows (ADR-008) ─────────────────────────────────────────────
 	ScoreWindowShort:  24 * time.Hour,
@@ -127,18 +130,21 @@ var DemoProfile = NetworkProfile{
 	ASNCapFraction: 0.20,
 
 	// ── Time windows ─────────────────────────────────────────────────────────
-	HeartbeatInterval:       30 * time.Second,
-	HeartbeatJitter:         5 * time.Second,
-	PollingInterval:         2 * time.Minute,
-	DHTRepublishInterval:    2 * time.Minute,
-	DHTExpiryDuration:       4 * time.Minute,
-	DepartureThreshold:      10 * time.Minute,
-	PromisedDowntimeMaximum: 10 * time.Minute,
-	AuditPeriodDuration:     2 * time.Minute,
-	EscrowHoldWindow:        1 * time.Minute,
-	VettingHoldWindow:       2 * time.Minute,
-	PendingReceiptGCAge:     5 * time.Minute,
-	RepairPromotionTimeout:  3 * time.Minute,
+	HeartbeatInterval: 30 * time.Second,
+	HeartbeatJitter:   5 * time.Second,
+	PollingInterval:   2 * time.Minute,
+	// 30s gives 20 samples across the 10-minute DepartureThreshold — fast
+	// enough for demo/CI cycles. [REF: M9 review Optional Fix B]
+	DeparturePollingInterval: 30 * time.Second,
+	DHTRepublishInterval:     2 * time.Minute,
+	DHTExpiryDuration:        4 * time.Minute,
+	DepartureThreshold:       10 * time.Minute,
+	PromisedDowntimeMaximum:  10 * time.Minute,
+	AuditPeriodDuration:      2 * time.Minute,
+	EscrowHoldWindow:         1 * time.Minute,
+	VettingHoldWindow:        2 * time.Minute,
+	PendingReceiptGCAge:      5 * time.Minute,
+	RepairPromotionTimeout:   3 * time.Minute,
 
 	// ── Scoring windows (ADR-008) ─────────────────────────────────────────────
 	ScoreWindowShort:  2 * time.Minute,
