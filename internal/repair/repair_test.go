@@ -9,19 +9,25 @@
 //   - TestASNCapAcrossRepairAndOriginalAssignment
 //   - TestEmergencyFloorBypassesQueueOrder
 //   - TestVettingExclusionEndToEnd
+//   - TestDepartureToRepairFullPipelineNoUniqueViolation (M9 review Finding #1,
+//     required test #2 — drives detection through to a completed repair via
+//     the real code paths, not a hand-built fixture)
 //
 // [REF: MVP §8.2, ADR-004, ADR-014, ADR-030, FR-045, FR-065,
-// build.md Phase 9.5 Session 9.5.1]
+// build.md Phase 9.5 Session 9.5.1, M9 review Finding #1]
 
 package repair
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/google/uuid"
 
 	"github.com/masamasaowl/Vyomanaut_V2/internal/config"
+	"github.com/masamasaowl/Vyomanaut_V2/internal/erasure"
 )
 
 // TestPriorityOrderingEndToEnd enqueues one job of each trigger type in
@@ -250,5 +256,168 @@ func TestVettingExclusionEndToEnd(t *testing.T) {
 	if repairJobsAfter != repairJobsBefore {
 		t.Errorf("repair_jobs count changed from %d to %d, want ZERO new rows (FR-065: a VETTING departure "+
 			"— all synthetic chunks — must never trigger repair)", repairJobsBefore, repairJobsAfter)
+	}
+}
+
+// TestDepartureToRepairFullPipelineNoUniqueViolation is the required
+// end-to-end regression test for M9 review Finding #1 (required test #2). It
+// reproduces the exact scenario the review's own reproduction steps
+// describe — a real ACTIVE provider with one live shard assignment, driven
+// through DepartureDetector.DetectOnce -> DequeueNextJob -> ExecuteRepairJob
+// using the REAL code paths (not a hand-built fixture, unlike
+// setupFullPipelineFixture in executor_test.go, which starts from an
+// already-dequeued synthetic job and never exercises EnqueueRepairForRealChunks
+// at all) — and asserts the whole pipeline completes with no error: the old
+// assignment ends DELETED, the new one ends ACTIVE.
+//
+// Before Fix 1, this test failed at the ExecuteRepairJob step with exactly
+// the error the review predicted:
+//
+//	pq: duplicate key value violates unique constraint
+//	"idx_chunk_assignments_one_active_per_shard"
+//
+// because the departed provider's old row was still status='ACTIVE' when
+// preRegisterChunkAssignment tried to INSERT the replacement's row for the
+// same (segment_id, shard_index) slot.
+//
+// Shard content is deterministic filler (randShardDataStable), not genuine
+// Reed-Solomon-consistent data — matching executor_test.go's own documented
+// choice: RS correctness is erasure package's own Milestone 3 concern; this
+// test exercises departure-to-repair database sequencing and the unique-index
+// collision specifically.
+//
+// [REF: ARCH §12, DM §4.5, IC §6, M9 review Finding #1]
+func TestDepartureToRepairFullPipelineNoUniqueViolation(t *testing.T) {
+	db := openTestDB(t)
+	verify := openVerifyDB(t)
+	drainQueue(t, db)
+
+	profile := config.DemoProfile // DataShards=3, TotalShards=5 — small, fast
+	engine, err := erasure.NewEngine(profile)
+	if err != nil {
+		t.Fatalf("erasure.NewEngine: %v", err)
+	}
+
+	exclude := allActiveProviderIDs(t, verify)
+	segmentID := insertTestSegmentChain(t, db)
+
+	// The provider about to silently depart, holding one ACTIVE real shard —
+	// the exact precondition Finding #1's collision requires.
+	const departingIndex = 4
+	departing := insertTestProvider(t, db, testProviderSpec{status: "ACTIVE", lastHeartbeatTs: staleHeartbeat(profile)})
+	departingShardIndex := departingIndex
+	chunkID := randChunkID()
+	insertTestChunkAssignment(t, db, testChunkAssignmentSpec{
+		chunkID:    chunkID,
+		segmentID:  &segmentID,
+		shardIndex: &departingShardIndex,
+		providerID: departing,
+		status:     "ACTIVE",
+	})
+	exclude = append(exclude, departing)
+
+	// Mocked surviving holders for every OTHER shard index (no real
+	// chunk_assignments rows needed for these — ExecuteRepairJob receives
+	// them as a caller-supplied SurvivingHolder list, exactly as
+	// executor_test.go's own fixtures do). Each is excluded from replacement
+	// selection so the test's replacement-provider assertion below is
+	// unambiguous.
+	holders := make([]SurvivingHolder, 0, profile.TotalShards-1)
+	shardsByPeer := map[string][]byte{}
+	for i := 0; i < profile.TotalShards; i++ {
+		if i == departingIndex {
+			continue
+		}
+		holderProviderID := insertTestProvider(t, db, testProviderSpec{})
+		peerID := "peer-" + holderProviderID.String()
+		holders = append(holders, SurvivingHolder{ProviderID: holderProviderID, PeerID: peerID, ShardIndex: i})
+		shardsByPeer[peerID] = randShardDataStable(i)
+		exclude = append(exclude, holderProviderID)
+	}
+
+	// A single fresh, eligible candidate for SelectReplacementProvider to draw.
+	insertTestProvider(t, db, testProviderSpec{})
+
+	// ── 1. Detection: DetectOnce must mark departing DEPARTED, soft-delete
+	// its old chunk_assignments row (Fix 1), and enqueue exactly one real
+	// repair job via EnqueueRepairForRealChunks.
+	var calls []penaliseCall
+	detector := NewDepartureDetector(db, profile, recordingPenalise(&calls))
+	if err := detector.DetectOnce(context.Background()); err != nil {
+		t.Fatalf("DetectOnce: %v", err)
+	}
+
+	var oldStatusAfterDetect string
+	if err := verify.QueryRow(`SELECT status FROM chunk_assignments WHERE chunk_id = $1 AND provider_id = $2`,
+		chunkID[:], departing).Scan(&oldStatusAfterDetect); err != nil {
+		t.Fatalf("query old assignment after DetectOnce: %v", err)
+	}
+	if oldStatusAfterDetect != "DELETED" {
+		t.Fatalf("old assignment status = %q immediately after DetectOnce, want DELETED (Fix 1) — "+
+			"the replacement INSERT below would otherwise collide", oldStatusAfterDetect)
+	}
+
+	// ── 2. Dequeue the real job DetectOnce enqueued.
+	job, err := DequeueNextJob(context.Background(), db)
+	if err != nil {
+		t.Fatalf("DequeueNextJob: %v", err)
+	}
+	if job == nil || job.ChunkID != chunkID {
+		t.Fatalf("DequeueNextJob did not return the freshly-enqueued departure job (queue contention from another test?)")
+	}
+
+	// ── 3. Mock transport for the repair-download / chunk-upload round trips.
+	var uploadedTo string
+	transport := &mockTransport{
+		fn: func(peerID, protocolID string) (RepairStream, error) {
+			switch protocolID {
+			case repairDownloadProtocolID:
+				return &mockStream{resp: bytes.NewReader(encodeRepairDownloadResponse(repairDownloadStatusOK, shardsByPeer[peerID]))}, nil
+			case chunkUploadProtocolID:
+				uploadedTo = peerID
+				return &mockStream{resp: bytes.NewReader(encodeUploadResponse(uploadStatusOK))}, nil
+			default:
+				return nil, fmt.Errorf("unexpected protocol %q", protocolID)
+			}
+		},
+	}
+	signingKey := genTestSigningKey(t)
+
+	// ── 4. Run the real pipeline. Before Fix 1, this is the exact step that
+	// failed with the unique-constraint violation.
+	if err := ExecuteRepairJob(context.Background(), db, profile, transport, engine, signingKey, "microservice-peer",
+		job, holders, exclude); err != nil {
+		t.Fatalf("ExecuteRepairJob: %v (this is exactly the failure Finding #1's fix closes)", err)
+	}
+
+	// ── 5. Final state: old row still DELETED, new row ACTIVE, job COMPLETED.
+	var finalOldStatus string
+	if err := verify.QueryRow(`SELECT status FROM chunk_assignments WHERE chunk_id = $1 AND provider_id = $2`,
+		chunkID[:], departing).Scan(&finalOldStatus); err != nil {
+		t.Fatalf("query old assignment (final): %v", err)
+	}
+	if finalOldStatus != "DELETED" {
+		t.Errorf("old assignment status = %q after full repair, want DELETED", finalOldStatus)
+	}
+
+	var newStatus string
+	var newProviderID uuid.UUID
+	if err := verify.QueryRow(`SELECT status, provider_id FROM chunk_assignments WHERE chunk_id = $1 AND status = 'ACTIVE'`,
+		chunkID[:]).Scan(&newStatus, &newProviderID); err != nil {
+		t.Fatalf("query new assignment: %v", err)
+	}
+	if newProviderID == departing {
+		t.Error("the new ACTIVE assignment is still on the departed provider — replacement never took")
+	}
+	if uploadedTo == "" {
+		t.Error("chunk-upload was never invoked")
+	}
+
+	var jobStatus string
+	if err := verify.QueryRow(`SELECT status FROM repair_jobs WHERE job_id = $1`, job.JobID).Scan(&jobStatus); err != nil {
+		t.Fatalf("query repair_jobs: %v", err)
+	}
+	if jobStatus != "COMPLETED" {
+		t.Errorf("repair_jobs.status = %q, want COMPLETED", jobStatus)
 	}
 }
