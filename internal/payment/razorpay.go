@@ -403,7 +403,9 @@ func (r *RazorpayProvider) ownerUPIHandle(ctx context.Context, ownerID uuid.UUID
 // calendar data this package has no access to. This function is a
 // weekend-only approximation; wiring in the real RBI table is a follow-up
 // once that data is available (same category of honest scope note as
-// internal/repair's departure detector reusing PollingInterval, Milestone 9).
+// internal/repair's departure detector previously reusing PollingInterval
+// before it got its own dedicated DeparturePollingInterval field — M9
+// review Optional Fix B).
 func lastBusinessDayOfMonth(t time.Time) time.Time {
 	firstOfNextMonth := time.Date(t.Year(), t.Month()+1, 1, 0, 0, 0, 0, t.Location())
 	lastDay := firstOfNextMonth.AddDate(0, 0, -1)
