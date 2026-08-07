@@ -45,6 +45,9 @@ import (
 // start)."
 const gossipMinPeerAcks = 2
 
+const shutdownTimeout = 5 * time.Second
+const databasePingTimeout = 5 * time.Second
+
 // app bundles every long-lived resource runMicroservice constructs, for
 // graceful shutdown and so tests can inspect the result without re-running
 // main().
@@ -64,7 +67,7 @@ type app struct {
 func (a *app) shutdown() {
 	a.cancel()
 	if a.httpServer != nil {
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
 		if err := a.httpServer.Shutdown(shutdownCtx); err != nil {
 			log.Printf("[SHUTDOWN] http server: %v", err)
@@ -373,7 +376,7 @@ func openDBPool(dsn string) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), databasePingTimeout)
 	defer cancel()
 	if err := db.PingContext(ctx); err != nil {
 		_ = db.Close()

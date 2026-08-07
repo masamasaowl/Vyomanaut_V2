@@ -319,7 +319,7 @@ func dispatchOneChallenge(
 		if err := scoring.IncrementConsecutivePasses(ctx, db, assignment.ProviderID, profile); err != nil && !errors.Is(err, scoring.ErrProviderNotVetting) {
 			log.Printf("[AUDIT] IncrementConsecutivePasses: %v", err)
 		}
-	} else if !(result == audit.AuditTimeout && assignment.MultiaddrStale) {
+	} else if result != audit.AuditTimeout || !assignment.MultiaddrStale {
 		if err := scoring.ResetConsecutivePasses(ctx, db, assignment.ProviderID); err != nil {
 			log.Printf("[AUDIT] ResetConsecutivePasses: %v", err)
 		}
@@ -473,8 +473,8 @@ func lookupProviderPubKey(ctx context.Context, db *sql.DB, providerID uuid.UUID)
 	if err := db.QueryRowContext(ctx, `SELECT ed25519_public_key FROM providers WHERE provider_id = $1`, providerID).Scan(&pubKey); err != nil {
 		return out, err
 	}
-	if len(pubKey) != 32 {
-		return out, fmt.Errorf("lookupProviderPubKey: provider %s: ed25519_public_key is %d bytes, want 32", providerID, len(pubKey))
+	if len(pubKey) != ed25519.PublicKeySize {
+		return out, fmt.Errorf("lookupProviderPubKey: provider %s: ed25519_public_key is %d bytes, want %d", providerID, len(pubKey), ed25519.PublicKeySize)
 	}
 	copy(out[:], pubKey)
 	return out, nil
@@ -490,6 +490,8 @@ func lookupProviderPubKey(ctx context.Context, db *sql.DB, providerID uuid.UUID)
 // moment any provider reaches rto_sample_count >= 5 and a real pool median
 // becomes available.
 const bootstrapFallbackRTO = 5 * time.Second
+
+const rtoVarianceMultiplier = 4
 
 // computeRTO returns the per-provider RTO timeout (IC §4.2): the pool-median
 // RTO for a provider with fewer than 5 samples, otherwise
@@ -522,7 +524,7 @@ func computeRTO(ctx context.Context, db *sql.DB, providerID uuid.UUID) (time.Dur
 		return time.Duration(medianMs * float64(time.Millisecond)), nil
 	}
 
-	rtoMs := avgRTT.Float64 + 4*varRTT.Float64
+	rtoMs := avgRTT.Float64 + rtoVarianceMultiplier*varRTT.Float64
 	return time.Duration(rtoMs * float64(time.Millisecond)), nil
 }
 
@@ -555,6 +557,11 @@ func computeThroughputKbps(profile config.NetworkProfile, responseLatencyMs int)
 	return chunkSizeKB / seconds
 }
 
+const (
+	auditResultByteLen = 1
+	unixMillisByteLen  = 8
+)
+
 // signServiceReceipt computes service_sig — the microservice's own
 // countersignature over the terminal audit result (analogous to
 // internal/api/provider.go's microservice_sig; no document in scope
@@ -564,7 +571,12 @@ func computeThroughputKbps(profile config.NetworkProfile, responseLatencyMs int)
 // service_countersign_ts_ms(8)).
 func signServiceReceipt(signingKey ed25519.PrivateKey, receiptID uuid.UUID, result audit.AuditResult) ([64]byte, time.Time) {
 	now := time.Now()
-	input := make([]byte, 0, 16+1+8)
+	input := make(
+		[]byte,
+		0,
+		len(receiptID)+
+			auditResultByteLen+
+			unixMillisByteLen)
 	input = append(input, receiptID[:]...)
 	input = append(input, byte(result))
 	var tsBuf [8]byte

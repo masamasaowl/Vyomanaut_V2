@@ -31,6 +31,7 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -59,8 +60,8 @@ func resolveProviderPeer(ctx context.Context, db *sql.DB, providerID uuid.UUID) 
 	if err != nil {
 		return "", nil, fmt.Errorf("resolveProviderPeer: look up provider %s: %w", providerID, err)
 	}
-	if len(pubKey) != 32 {
-		return "", nil, fmt.Errorf("resolveProviderPeer: provider %s: ed25519_public_key is %d bytes, want 32", providerID, len(pubKey))
+	if len(pubKey) != ed25519.PublicKeySize {
+		return "", nil, fmt.Errorf("resolveProviderPeer: provider %s: ed25519_public_key is %d bytes, want %d", providerID, len(pubKey), ed25519.PublicKeySize)
 	}
 	peerID, err := p2p.PeerIDFromEd25519PublicKey(pubKey)
 	if err != nil {

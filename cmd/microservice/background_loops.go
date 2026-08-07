@@ -71,8 +71,8 @@ func startReadinessMonitorLoop(ctx context.Context, evaluator *api.ReadinessEval
 // once latency drops back under 30ms.
 const (
 	backgroundThrottleSampleInterval = 60 * time.Second
-	backgroundThrottleHighWaterMs    = 50 * time.Millisecond
-	backgroundThrottleLowWaterMs     = 30 * time.Millisecond
+	backgroundThrottleHighWater      = 50 * time.Millisecond
+	backgroundThrottleLowWater       = 30 * time.Millisecond
 
 	// backgroundSemaphoreMaxSize and backgroundSemaphoreMinSize bound how far
 	// backgroundSemaphore's capacity can be throttled down and restored.
@@ -122,16 +122,16 @@ func runBackgroundThrottleLoop(ctx context.Context, db *sql.DB, probe dbReadP99P
 				continue
 			}
 			switch {
-			case p99 >= backgroundThrottleHighWaterMs && current > backgroundSemaphoreMinSize:
+			case p99 >= backgroundThrottleHighWater && current > backgroundSemaphoreMinSize:
 				current--
 				resizeBackgroundSemaphore(current)
 				log.Printf("[THROTTLE] foreground p99=%s >= %s: reduced background concurrency to %d",
-					p99, backgroundThrottleHighWaterMs, current)
-			case p99 < backgroundThrottleLowWaterMs && current < backgroundSemaphoreMaxSize:
+					p99, backgroundThrottleHighWater, current)
+			case p99 < backgroundThrottleLowWater && current < backgroundSemaphoreMaxSize:
 				current++
 				resizeBackgroundSemaphore(current)
 				log.Printf("[THROTTLE] foreground p99=%s < %s: restored background concurrency to %d",
-					p99, backgroundThrottleLowWaterMs, current)
+					p99, backgroundThrottleLowWater, current)
 			}
 		}
 	}
@@ -141,5 +141,7 @@ func runBackgroundThrottleLoop(ctx context.Context, db *sql.DB, probe dbReadP99P
 // given capacity. Only this loop ever calls it (single-writer), avoiding any
 // need for additional synchronization beyond the channel itself.
 func resizeBackgroundSemaphore(size int) {
+	// avoid unused var error
+	_ = cap(backgroundSemaphore)
 	backgroundSemaphore = make(chan struct{}, size)
 }

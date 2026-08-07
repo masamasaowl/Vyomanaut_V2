@@ -44,6 +44,7 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"encoding/base64"
 	"fmt"
 	"os"
@@ -90,8 +91,8 @@ func newEnvSecretsClient() (*envSecretsClient, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cmd/microservice: %s is not valid base64: %w", clusterMasterSeedEnvVar, err)
 	}
-	if len(decoded) != 32 {
-		return nil, fmt.Errorf("cmd/microservice: %s must decode to 32 bytes, got %d", clusterMasterSeedEnvVar, len(decoded))
+	if len(decoded) != ed25519.SeedSize {
+		return nil, fmt.Errorf("cmd/microservice: %s must decode to %d bytes, got %d", clusterMasterSeedEnvVar, ed25519.SeedSize, len(decoded))
 	}
 	return &envSecretsClient{secret: decoded}, nil
 }

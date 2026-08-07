@@ -159,7 +159,11 @@ func TestRegenerateProviderScoresView(t *testing.T) {
 	if err != nil {
 		t.Fatalf("query mv_provider_scores: %v", err)
 	}
-	defer rows.Close()
+	defer func() {
+		if err := rows.Close(); err != nil {
+			t.Fatalf("close mv_provider_scores rows: %v", err)
+		}
+	}()
 	for rows.Next() {
 		var id uuid.UUID
 		var composite float64

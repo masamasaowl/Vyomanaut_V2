@@ -67,7 +67,10 @@ func loadOrGenerateMicroserviceSigningKey(requireSecretsManager bool, seedHex st
 				microserviceSigningSeedEnvVar, ed25519.SeedSize, len(seed))
 		}
 		priv := ed25519.NewKeyFromSeed(seed)
-		return priv.Public().(ed25519.PublicKey), priv, nil
+		pub := make(ed25519.PublicKey, ed25519.PublicKeySize)
+		copy(pub, priv[ed25519.SeedSize:])
+
+		return pub, priv, nil
 	}
 
 	if requireSecretsManager {
@@ -98,6 +101,8 @@ const adminAPIKeyEnvVar = "VYOMANAUT_ADMIN_API_KEY"
 // startup error instead of every admin request failing after the fact.
 const adminAPIKeyMinHexLen = 64
 
+const hexCharsPerByte = 2
+
 // loadOrGenerateAdminAPIKey returns the admin API key. In prod, requires
 // keyHex to already be set and valid (fails closed — an ephemeral admin key
 // in production would be silently regenerated on every restart, locking out
@@ -120,7 +125,7 @@ func loadOrGenerateAdminAPIKey(requireSecretsManager bool, keyHex string) (strin
 		return "", fmt.Errorf("cmd/microservice: %s must be set in production", adminAPIKeyEnvVar)
 	}
 
-	buf := make([]byte, adminAPIKeyMinHexLen/2)
+	buf := make([]byte, adminAPIKeyMinHexLen/hexCharsPerByte)
 	if _, err := cryptorand.Read(buf); err != nil {
 		return "", fmt.Errorf("cmd/microservice: generate ephemeral admin API key: %w", err)
 	}
