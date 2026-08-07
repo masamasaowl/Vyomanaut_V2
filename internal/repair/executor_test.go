@@ -13,8 +13,13 @@
 //   - TestRepairExecutorPreRegistersBeforeUpload
 //   - TestRepairExecutorMarksCompleteOnSuccess
 //   - TestRepairExecutorMarksFailedOnExhaustedRetries
+//   - TestRepairExecutorRetriesOnStorageFullThenSucceeds (M9 review Optional
+//     Fix A)
+//   - TestRepairExecutorFailsAfterExhaustingStorageFullRetries (M9 review
+//     Optional Fix A)
 //
-// [REF: IC §4.1, IC §4.4.1, IC §4.4.2, build.md Phase 9.2 Session 9.2.1]
+// [REF: IC §4.1, IC §4.4.1, IC §4.4.2, build.md Phase 9.2 Session 9.2.1,
+// M9 review Optional Fix A]
 
 package repair
 
@@ -25,8 +30,10 @@ import (
 	cryptorand "crypto/rand"
 	"database/sql"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -462,5 +469,162 @@ func TestRepairExecutorMarksFailedOnExhaustedRetries(t *testing.T) {
 	}
 	if status != "FAILED" {
 		t.Errorf("repair_jobs.status = %q, want FAILED", status)
+	}
+}
+
+// ── STORAGE_FULL retry (M9 review Optional Fix A) ──────────────────────────────
+
+// TestRepairExecutorRetriesOnStorageFullThenSucceeds verifies that when the
+// first replacement candidate reports STORAGE_FULL (IC §4.1 status 0x04),
+// ExecuteRepairJob abandons that candidate's pre-registered assignment,
+// excludes it, and successfully completes against a second candidate — all
+// within one call, with no error surfaced to the caller.
+func TestRepairExecutorRetriesOnStorageFullThenSucceeds(t *testing.T) {
+	db := openTestDB(t)
+	verify := openVerifyDB(t)
+	exclude := allActiveProviderIDs(t, verify)
+
+	const missingIndex = 2
+	profile, engine, job, holders := setupFullPipelineFixture(t, db, missingIndex)
+	shardsByPeer := map[string][]byte{}
+	for _, h := range holders {
+		shardsByPeer[h.PeerID] = randShardDataStable(h.ShardIndex)
+	}
+
+	var mu sync.Mutex
+	var fullCandidate string // first peer we see on the upload protocol; gets STORAGE_FULL exactly once
+	var uploadAttempts []string
+
+	transport := &mockTransport{
+		fn: func(peerID, protocolID string) (RepairStream, error) {
+			switch protocolID {
+			case repairDownloadProtocolID:
+				return &mockStream{resp: bytes.NewReader(encodeRepairDownloadResponse(repairDownloadStatusOK, shardsByPeer[peerID]))}, nil
+			case chunkUploadProtocolID:
+				mu.Lock()
+				defer mu.Unlock()
+				uploadAttempts = append(uploadAttempts, peerID)
+				if fullCandidate == "" {
+					fullCandidate = peerID
+					return &mockStream{resp: bytes.NewReader(encodeUploadResponse(uploadStatusStorageFull))}, nil
+				}
+				return &mockStream{resp: bytes.NewReader(encodeUploadResponse(uploadStatusOK))}, nil
+			default:
+				return nil, fmt.Errorf("unexpected protocol %q", protocolID)
+			}
+		},
+	}
+
+	signingKey := genTestSigningKey(t)
+	if err := ExecuteRepairJob(context.Background(), db, profile, transport, engine, signingKey, "microservice-peer",
+		job, holders, exclude); err != nil {
+		t.Fatalf("ExecuteRepairJob: %v (a single STORAGE_FULL from one candidate must not fail the job)", err)
+	}
+
+	mu.Lock()
+	attempts := append([]string(nil), uploadAttempts...)
+	mu.Unlock()
+	if len(attempts) < 2 {
+		t.Fatalf("expected at least 2 upload attempts (one STORAGE_FULL, one success), got %d: %v", len(attempts), attempts)
+	}
+
+	fullCandidateID, err := uuid.Parse(fullCandidate)
+	if err != nil {
+		t.Fatalf("parse fullCandidate peer ID as UUID: %v", err)
+	}
+
+	// The abandoned candidate's REPAIRING row must have been soft-deleted —
+	// otherwise it would permanently block this shard slot.
+	var abandonedStatus string
+	if err := verify.QueryRow(`SELECT status FROM chunk_assignments WHERE chunk_id = $1 AND provider_id = $2`,
+		job.ChunkID[:], fullCandidateID).Scan(&abandonedStatus); err != nil {
+		t.Fatalf("query abandoned candidate's row: %v", err)
+	}
+	if abandonedStatus != "DELETED" {
+		t.Errorf("abandoned candidate's chunk_assignments.status = %q, want DELETED", abandonedStatus)
+	}
+
+	var finalStatus string
+	var finalProviderID uuid.UUID
+	if err := verify.QueryRow(`SELECT status, provider_id FROM chunk_assignments WHERE chunk_id = $1 AND status = 'ACTIVE'`,
+		job.ChunkID[:]).Scan(&finalStatus, &finalProviderID); err != nil {
+		t.Fatalf("query final ACTIVE assignment: %v", err)
+	}
+	if finalProviderID == fullCandidateID {
+		t.Error("final ACTIVE assignment is still on the candidate that reported STORAGE_FULL")
+	}
+
+	var jobStatus string
+	if err := verify.QueryRow(`SELECT status FROM repair_jobs WHERE job_id = $1`, job.JobID).Scan(&jobStatus); err != nil {
+		t.Fatalf("query repair_jobs: %v", err)
+	}
+	if jobStatus != "COMPLETED" {
+		t.Errorf("repair_jobs.status = %q, want COMPLETED", jobStatus)
+	}
+}
+
+// TestRepairExecutorFailsAfterExhaustingStorageFullRetries verifies that
+// when EVERY candidate reports STORAGE_FULL, ExecuteRepairJob gives up after
+// exactly maxRepairReplacementRetries attempts, marks the job FAILED, wraps
+// ErrReplacementStorageFull in the returned error, and leaves no dangling
+// ACTIVE/REPAIRING chunk_assignments row for the shard behind — every
+// attempted candidate's row must have been abandoned, not left to block a
+// future repair attempt at this slot.
+func TestRepairExecutorFailsAfterExhaustingStorageFullRetries(t *testing.T) {
+	db := openTestDB(t)
+	verify := openVerifyDB(t)
+	exclude := allActiveProviderIDs(t, verify)
+
+	const missingIndex = 1
+	profile, engine, job, holders := setupFullPipelineFixture(t, db, missingIndex)
+	shardsByPeer := map[string][]byte{}
+	for _, h := range holders {
+		shardsByPeer[h.PeerID] = randShardDataStable(h.ShardIndex)
+	}
+
+	var uploadAttempts int32
+	transport := &mockTransport{
+		fn: func(peerID, protocolID string) (RepairStream, error) {
+			switch protocolID {
+			case repairDownloadProtocolID:
+				return &mockStream{resp: bytes.NewReader(encodeRepairDownloadResponse(repairDownloadStatusOK, shardsByPeer[peerID]))}, nil
+			case chunkUploadProtocolID:
+				atomic.AddInt32(&uploadAttempts, 1)
+				return &mockStream{resp: bytes.NewReader(encodeUploadResponse(uploadStatusStorageFull))}, nil
+			default:
+				return nil, fmt.Errorf("unexpected protocol %q", protocolID)
+			}
+		},
+	}
+
+	signingKey := genTestSigningKey(t)
+	err := ExecuteRepairJob(context.Background(), db, profile, transport, engine, signingKey, "microservice-peer",
+		job, holders, exclude)
+	if err == nil {
+		t.Fatal("ExecuteRepairJob succeeded despite every candidate reporting STORAGE_FULL, want an error")
+	}
+	if !errors.Is(err, ErrReplacementStorageFull) {
+		t.Errorf("got %v, want an error wrapping ErrReplacementStorageFull", err)
+	}
+
+	if got := atomic.LoadInt32(&uploadAttempts); got != maxRepairReplacementRetries {
+		t.Errorf("upload attempts = %d, want exactly %d (the bounded retry budget)", got, maxRepairReplacementRetries)
+	}
+
+	var jobStatus string
+	if err := verify.QueryRow(`SELECT status FROM repair_jobs WHERE job_id = $1`, job.JobID).Scan(&jobStatus); err != nil {
+		t.Fatalf("query repair_jobs: %v", err)
+	}
+	if jobStatus != "FAILED" {
+		t.Errorf("repair_jobs.status = %q, want FAILED", jobStatus)
+	}
+
+	var danglingCount int
+	if err := verify.QueryRow(`SELECT COUNT(*) FROM chunk_assignments WHERE chunk_id = $1 AND status IN ('ACTIVE', 'REPAIRING')`,
+		job.ChunkID[:]).Scan(&danglingCount); err != nil {
+		t.Fatalf("count dangling assignments: %v", err)
+	}
+	if danglingCount != 0 {
+		t.Errorf("dangling ACTIVE/REPAIRING chunk_assignments rows for this chunk = %d, want 0 after exhausted retries", danglingCount)
 	}
 }
