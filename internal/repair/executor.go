@@ -45,6 +45,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"time"
@@ -98,6 +99,17 @@ const (
 	chunkUploadTimeout    = 5 * time.Second
 	capabilityTokenTTL    = 1 * time.Hour
 )
+
+// maxRepairReplacementRetries bounds how many different replacement
+// candidates ExecuteRepairJob will try before giving up, when a candidate
+// reports STORAGE_FULL (IC §4.1 status 0x04) rather than succeeding.
+// [Added, M9 review Optional Fix A] Mirrors the same "bounded retries, not
+// unbounded spinning" philosophy as assignment.go's own
+// maxReplacementSelectionAttempts (for the ASN-cap loser case) — a distinct
+// constant because the two retry loops bound different failure domains
+// (a candidate rejected before ever being asked, vs. one that was asked and
+// declined at capacity) and there is no reason their budgets need to match.
+const maxRepairReplacementRetries = 3
 
 // Wire-format field sizes (IC §4.4.1 Frame 1, IC §4.1 Frame 1) — named
 // rather than inlined so no raw byte-count literal appears in the framing
@@ -206,32 +218,70 @@ func ExecuteRepairJob(
 	replacementShard := regenerated[missingIndex]
 
 	// ── 3. Select replacement, pre-register, THEN upload ────────────────────
-	replacementProviderID, err := SelectReplacementProvider(ctx, db, profile, job.SegmentID, excludeProviderIDs)
-	if err != nil {
-		_ = MarkJobComplete(ctx, db, job.JobID, false)
-		return fmt.Errorf("repair.ExecuteRepairJob: select replacement: %w", err)
+	// [Added, M9 review Optional Fix A] Bounded retry on STORAGE_FULL
+	// (IC §4.1 status 0x04): uploadShard's status switch previously treated
+	// every non-OK/ALREADY_STORED code identically as a hard failure. A
+	// single unlucky Power-of-Two-Choices draw landing on a candidate that
+	// is momentarily full shouldn't fail the whole job — SelectReplacementProvider
+	// already gives the same self-healing treatment to an ASN-cap loser
+	// (assignment.go); this extends the same philosophy to a capacity
+	// loser. Each failed attempt's pre-registered REPAIRING row is soft-
+	// deleted before the next candidate is tried, so it never blocks
+	// idx_chunk_assignments_one_active_per_shard for the next attempt —
+	// the exact same soft-delete discipline Fix 1 established for departure
+	// cleanup. Bounded by maxRepairReplacementRetries; any other upload
+	// failure (not STORAGE_FULL) still fails the job immediately, unretried.
+	replacementExcluded := append([]uuid.UUID{}, excludeProviderIDs...)
+	var replacementProviderID uuid.UUID
+	var uploadErr error
+
+	for attempt := 0; attempt < maxRepairReplacementRetries; attempt++ {
+		candidateID, selectErr := SelectReplacementProvider(ctx, db, profile, job.SegmentID, replacementExcluded)
+		if selectErr != nil {
+			_ = MarkJobComplete(ctx, db, job.JobID, false)
+			return fmt.Errorf("repair.ExecuteRepairJob: select replacement: %w", selectErr)
+		}
+
+		if err := preRegisterChunkAssignment(ctx, db, job.ChunkID, job.SegmentID, missingIndex, candidateID); err != nil {
+			_ = MarkJobComplete(ctx, db, job.JobID, false)
+			return fmt.Errorf("repair.ExecuteRepairJob: pre-register: %w", err)
+		}
+
+		fileID, err := fileIDForSegment(ctx, db, job.SegmentID)
+		if err != nil {
+			_ = MarkJobComplete(ctx, db, job.JobID, false)
+			return fmt.Errorf("repair.ExecuteRepairJob: look up file_id: %w", err)
+		}
+		token := mintCapabilityToken(signingKey, job.ChunkID, candidateID, fileID, capabilityTokenTTL)
+
+		// See SurvivingHolder's doc comment: provider_id -> peer-ID resolution is
+		// out of this package's scope; Milestone 12's wiring supplies the real
+		// value inside RepairTransport's concrete implementation.
+		candidatePeerID := candidateID.String()
+
+		uploadErr = uploadShard(ctx, transport, candidatePeerID, job.ChunkID, missingIndex, token, replacementShard)
+		if uploadErr == nil {
+			replacementProviderID = candidateID
+			break
+		}
+		if !errors.Is(uploadErr, ErrReplacementStorageFull) {
+			_ = MarkJobComplete(ctx, db, job.JobID, false)
+			return fmt.Errorf("repair.ExecuteRepairJob: upload: %w", uploadErr)
+		}
+
+		// STORAGE_FULL: free the slot this candidate just claimed and never
+		// draw it again this job, then loop to try another candidate.
+		if cleanupErr := abandonFailedReplacementAssignment(ctx, db, job.ChunkID, candidateID); cleanupErr != nil {
+			_ = MarkJobComplete(ctx, db, job.JobID, false)
+			return fmt.Errorf("repair.ExecuteRepairJob: %w (cleaning up after STORAGE_FULL from %s)", cleanupErr, candidateID)
+		}
+		replacementExcluded = append(replacementExcluded, candidateID)
 	}
 
-	if err := preRegisterChunkAssignment(ctx, db, job.ChunkID, job.SegmentID, missingIndex, replacementProviderID); err != nil {
+	if uploadErr != nil {
 		_ = MarkJobComplete(ctx, db, job.JobID, false)
-		return fmt.Errorf("repair.ExecuteRepairJob: pre-register: %w", err)
-	}
-
-	fileID, err := fileIDForSegment(ctx, db, job.SegmentID)
-	if err != nil {
-		_ = MarkJobComplete(ctx, db, job.JobID, false)
-		return fmt.Errorf("repair.ExecuteRepairJob: look up file_id: %w", err)
-	}
-	token := mintCapabilityToken(signingKey, job.ChunkID, replacementProviderID, fileID, capabilityTokenTTL)
-
-	// See SurvivingHolder's doc comment: provider_id -> peer-ID resolution is
-	// out of this package's scope; Milestone 12's wiring supplies the real
-	// value inside RepairTransport's concrete implementation.
-	replacementPeerID := replacementProviderID.String()
-
-	if err := uploadShard(ctx, transport, replacementPeerID, job.ChunkID, missingIndex, token, replacementShard); err != nil {
-		_ = MarkJobComplete(ctx, db, job.JobID, false)
-		return fmt.Errorf("repair.ExecuteRepairJob: upload: %w", err)
+		return fmt.Errorf("repair.ExecuteRepairJob: upload: exhausted %d replacement attempts, last error: %w",
+			maxRepairReplacementRetries, uploadErr)
 	}
 
 	// ── 4. Confirm ───────────────────────────────────────────────────────────
@@ -240,6 +290,25 @@ func ExecuteRepairJob(
 	}
 	if err := MarkJobComplete(ctx, db, job.JobID, true); err != nil {
 		return fmt.Errorf("repair.ExecuteRepairJob: mark complete: %w", err)
+	}
+	return nil
+}
+
+// abandonFailedReplacementAssignment soft-deletes a replacement candidate's
+// pre-registered REPAIRING row after that candidate's upload attempt failed
+// with STORAGE_FULL — otherwise the row would permanently block
+// idx_chunk_assignments_one_active_per_shard for every subsequent candidate
+// this job tries. Mirrors departure.go's own soft-delete discipline (M9
+// review Fix 1): never a hard DELETE, always status='DELETED' + deleted_at.
+//
+// [Added, M9 review Optional Fix A]
+func abandonFailedReplacementAssignment(ctx context.Context, db *sql.DB, chunkID [32]byte, providerID uuid.UUID) error {
+	const query = `
+UPDATE chunk_assignments
+SET status = 'DELETED', deleted_at = NOW()
+WHERE chunk_id = $1 AND provider_id = $2 AND status = 'REPAIRING'`
+	if _, err := db.ExecContext(ctx, query, chunkID[:], providerID); err != nil {
+		return fmt.Errorf("abandon failed replacement assignment: %w", err)
 	}
 	return nil
 }
@@ -501,7 +570,26 @@ func uploadShard(
 
 	switch status := body[0]; status {
 	case uploadStatusOK, uploadStatusAlreadyStored:
+		// [Flagged, M9 review Finding #6] On status 0x00, body also carries
+		// a uploadProviderSigSize-byte provider_sig — IC §4.1 describes it
+		// as "the upload receipt that the initiator must retain as proof of
+		// acknowledged storage." It is read past (via the length-prefixed
+		// body already consumed above) but never parsed out or persisted
+		// here: no column exists anywhere in the schema to hold a repair
+		// upload's receipt signature, and chunk_assignments' own columns
+		// are fully accounted for elsewhere (see preRegisterChunkAssignment
+		// and activateChunkAssignment). This is left as an explicit,
+		// documented gap rather than a silent one — closing it needs a
+		// product/schema decision (a new column, most likely) that is out
+		// of this package's scope to make unilaterally.
 		return nil
+	case uploadStatusStorageFull:
+		// [Added, M9 review Optional Fix A] Distinguished from the default
+		// case below so ExecuteRepairJob's retry loop can catch exactly
+		// this one recoverable condition and try a different candidate,
+		// rather than failing the whole repair job on a single unlucky
+		// capacity draw.
+		return fmt.Errorf("%w", ErrReplacementStorageFull)
 	default:
 		return fmt.Errorf("UploadResponse: status 0x%02x", status)
 	}
