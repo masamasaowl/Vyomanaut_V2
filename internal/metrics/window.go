@@ -72,6 +72,8 @@ func (w *slidingWindowP99) pruneLocked(now time.Time) {
 	}
 }
 
+const p99Quantile = 0.99
+
 // P99 returns the 99th-percentile latency across samples currently inside
 // the trailing window, using the nearest-rank method. It returns 0 if no
 // samples have landed inside the window yet — e.g. during network
@@ -94,7 +96,7 @@ func (w *slidingWindowP99) P99() time.Duration {
 	}
 	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
 
-	rank := int(math.Ceil(0.99*float64(n))) - 1
+	rank := int(math.Ceil(p99Quantile*float64(n))) - 1
 	if rank < 0 {
 		rank = 0
 	}

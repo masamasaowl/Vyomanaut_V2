@@ -41,7 +41,16 @@ var dbReadLatencyBuckets = []float64{0.01, 0.025, 0.04, 0.05, 0.1}
 // Score7dBasisPoints, which multiply by 10000 — i.e. the underlying score
 // is normalized to [0,1]), so linear deciles across that range are the
 // natural fit for a reliability-distribution dashboard.
-var scoreHistogramBuckets = prometheus.LinearBuckets(0, 0.1, 11)
+const (
+	scoreHistogramBucketSize  = 0.1
+	scoreHistogramBucketCount = 11
+)
+
+var scoreHistogramBuckets = prometheus.LinearBuckets(
+	0,
+	scoreHistogramBucketSize,
+	scoreHistogramBucketCount,
+)
 
 var (
 	// AuditChallengesIssuedTotal counts every audit challenge the
