@@ -17,6 +17,11 @@ import (
 	"strings"
 )
 
+const (
+	minMemInfoFields = 2
+	bytesPerKiB      = 1024
+)
+
 // AvailableRAMBytes returns the currently free/available RAM in bytes.
 func AvailableRAMBytes() (uint64, error) {
 	f, err := os.Open("/proc/meminfo")
@@ -32,14 +37,14 @@ func AvailableRAMBytes() (uint64, error) {
 			continue
 		}
 		fields := strings.Fields(line)
-		if len(fields) < 2 {
+		if len(fields) < minMemInfoFields {
 			return 0, fmt.Errorf("storage: AvailableRAMBytes: malformed MemAvailable line %q", line)
 		}
 		kb, err := strconv.ParseUint(fields[1], 10, 64)
 		if err != nil {
 			return 0, fmt.Errorf("storage: AvailableRAMBytes: parse MemAvailable: %w", err)
 		}
-		return kb * 1024, nil
+		return kb * bytesPerKiB, nil
 	}
 	if err := scanner.Err(); err != nil {
 		return 0, fmt.Errorf("storage: AvailableRAMBytes: scanning /proc/meminfo: %w", err)
