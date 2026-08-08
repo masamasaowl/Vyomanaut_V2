@@ -57,13 +57,13 @@ const auditChallengeProtocolID = p2p.ProtocolID("/vyomanaut/audit-challenge/1.0.
 
 // ── Wire-format field sizes (IC §4.2 Frame 1) ────────────────────────────
 const (
-	auditLengthPrefixSize    = 4
-	auditChunkIDSize         = 32
-	auditChallengeNonceSize  = 33 // 1-byte version prefix || 32-byte HMAC-SHA256 (Invariant 5) — NEVER [32]byte
-	auditServerTsSize        = 8
-	auditFrame1PayloadBytes  = auditChunkIDSize + auditChallengeNonceSize + auditServerTsSize // 73 (IC §4.2)
-	auditResponseHashSize    = 32
-	auditProviderSigSize     = 64
+	auditLengthPrefixSize   = 4
+	auditChunkIDSize        = 32
+	auditChallengeNonceSize = 33 // 1-byte version prefix || 32-byte HMAC-SHA256 (Invariant 5) — NEVER [32]byte
+	auditServerTsSize       = 8
+	auditFrame1PayloadBytes = auditChunkIDSize + auditChallengeNonceSize + auditServerTsSize // 73 (IC §4.2)
+	auditResponseHashSize   = 32
+	auditProviderSigSize    = 64
 )
 
 // ── Frame 2 status codes (IC §4.2) ───────────────────────────────────────

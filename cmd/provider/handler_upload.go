@@ -62,11 +62,11 @@ const chunkUploadProtocolID = p2p.ProtocolID("/vyomanaut/chunk-upload/1.0.0")
 // Named rather than inlined so no raw byte-count literal appears in the
 // framing arithmetic below (this codebase's "no magic numbers" standard).
 const (
-	uploadLengthPrefixSize      = 4                        // uint32 big-endian frame length prefix
-	uploadChunkIDSize           = 32                        // SHA-256-shaped content address
-	uploadShardIndexSize        = 4                         // uint32 big-endian
-	uploadCapabilityTokenSize   = 72                        // expiry_unix_ms(8) || Ed25519 sig(64)
-	uploadChunkDataSize         = storage.ChunkDataSize     // 262144 (= erasure.ShardSize)
+	uploadLengthPrefixSize      = 4                     // uint32 big-endian frame length prefix
+	uploadChunkIDSize           = 32                    // SHA-256-shaped content address
+	uploadShardIndexSize        = 4                     // uint32 big-endian
+	uploadCapabilityTokenSize   = 72                    // expiry_unix_ms(8) || Ed25519 sig(64)
+	uploadChunkDataSize         = storage.ChunkDataSize // 262144 (= erasure.ShardSize)
 	uploadFrame1PayloadMaxBytes = uploadChunkIDSize + uploadShardIndexSize +
 		uploadCapabilityTokenSize + uploadChunkDataSize // 262252 (IC §4.1)
 	uploadProviderSigSize = 64 // Ed25519 signature (Frame 2, status 0x00/0x06)

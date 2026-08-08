@@ -29,8 +29,15 @@ func pickFreeLoopbackPort(t *testing.T) int {
 	if err != nil {
 		t.Fatalf("pickFreeLoopbackPort: %v", err)
 	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	_ = ln.Close()
+	addr, ok := ln.Addr().(*net.TCPAddr)
+	if !ok {
+		_ = ln.Close()
+		t.Fatalf("pickFreeLoopbackPort: listener address is not *net.TCPAddr")
+	}
+	port := addr.Port
+	if err := ln.Close(); err != nil {
+		t.Fatalf("pickFreeLoopbackPort: close listener: %v", err)
+	}
 	return port
 }
 
@@ -153,8 +160,10 @@ func TestUploadRejectsExpiredCapabilityToken(t *testing.T) {
 	writeCh := startTestChunkWriter(t, store)
 	_, msPriv, _ := ed25519.GenerateKey(rand.Reader)
 	_, providerPriv, _ := ed25519.GenerateKey(rand.Reader)
+	msPub := make(ed25519.PublicKey, ed25519.PublicKeySize)
+	copy(msPub, msPriv[ed25519.SeedSize:])
 
-	h := NewUploadHandler(store, writeCh, msPriv.Public().(ed25519.PublicKey), providerPriv, [16]byte{}, newProviderStatusHolder(providerStatusActive))
+	h := NewUploadHandler(store, writeCh, msPub, providerPriv, [16]byte{}, newProviderStatusHolder(providerStatusActive))
 	stream := setupUploadTestPair(t, h)
 
 	chunkData := make([]byte, uploadChunkDataSize)
@@ -180,8 +189,10 @@ func TestUploadRejectsContentHashMismatchBeforeWrite(t *testing.T) {
 	writeCh := startTestChunkWriter(t, store)
 	_, msPriv, _ := ed25519.GenerateKey(rand.Reader)
 	_, providerPriv, _ := ed25519.GenerateKey(rand.Reader)
+	msPub := make(ed25519.PublicKey, ed25519.PublicKeySize)
+	copy(msPub, msPriv[ed25519.SeedSize:])
 
-	h := NewUploadHandler(store, writeCh, msPriv.Public().(ed25519.PublicKey), providerPriv, [16]byte{}, newProviderStatusHolder(providerStatusActive))
+	h := NewUploadHandler(store, writeCh, msPub, providerPriv, [16]byte{}, newProviderStatusHolder(providerStatusActive))
 	stream := setupUploadTestPair(t, h)
 
 	chunkData := make([]byte, uploadChunkDataSize)
@@ -212,8 +223,10 @@ func TestUploadIdempotentAlreadyStored(t *testing.T) {
 	writeCh := startTestChunkWriter(t, store)
 	_, msPriv, _ := ed25519.GenerateKey(rand.Reader)
 	_, providerPriv, _ := ed25519.GenerateKey(rand.Reader)
+	msPub := make(ed25519.PublicKey, ed25519.PublicKeySize)
+	copy(msPub, msPriv[ed25519.SeedSize:])
 
-	h := NewUploadHandler(store, writeCh, msPriv.Public().(ed25519.PublicKey), providerPriv, [16]byte{}, newProviderStatusHolder(providerStatusActive))
+	h := NewUploadHandler(store, writeCh, msPub, providerPriv, [16]byte{}, newProviderStatusHolder(providerStatusActive))
 
 	chunkData := make([]byte, uploadChunkDataSize)
 	_, _ = rand.Read(chunkData)
@@ -253,8 +266,10 @@ func TestUploadRejectsDepartedProvider(t *testing.T) {
 	writeCh := startTestChunkWriter(t, store)
 	_, msPriv, _ := ed25519.GenerateKey(rand.Reader)
 	_, providerPriv, _ := ed25519.GenerateKey(rand.Reader)
+	msPub := make(ed25519.PublicKey, ed25519.PublicKeySize)
+	copy(msPub, msPriv[ed25519.SeedSize:])
 
-	h := NewUploadHandler(store, writeCh, msPriv.Public().(ed25519.PublicKey), providerPriv, [16]byte{}, newProviderStatusHolder(providerStatusDeparted))
+	h := NewUploadHandler(store, writeCh, msPub, providerPriv, [16]byte{}, newProviderStatusHolder(providerStatusDeparted))
 	stream := setupUploadTestPair(t, h)
 
 	chunkData := make([]byte, uploadChunkDataSize)

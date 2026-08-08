@@ -18,9 +18,11 @@ import "math"
 // erroneous ×400 factor is gone; see build.md's CORRECTED_CONSTANT_NOT_400
 // VERIFY check).
 const (
+	bytesPerGiB = 1 << 30
+	bytesPerMiB = 1 << 20
 	// ChunksPerGB is the number of ChunkDataSize-sized chunks in one GiB of
 	// declared storage: (1<<30) / 262144 = 4096.
-	ChunksPerGB = (1 << 30) / ChunkDataSize
+	ChunksPerGB = bytesPerGiB / ChunkDataSize
 
 	// DHTRecordSizeBytes is the estimated per-chunk DHT provider-record
 	// cache footprint.
@@ -42,6 +44,6 @@ const (
 // the prose's slightly-off 160MB example; TestDHTCacheRAMFormula asserts
 // the true computed values.
 func RequiredDHTCacheRAMMB(declaredStorageGB uint64) uint64 {
-	exact := float64(declaredStorageGB) * float64(ChunksPerGB) * float64(DHTRecordSizeBytes) / float64(1<<20)
+	exact := float64(declaredStorageGB) * float64(ChunksPerGB) * float64(DHTRecordSizeBytes) / float64(bytesPerMiB)
 	return uint64(math.Ceil(exact))
 }

@@ -21,6 +21,8 @@ import (
 	"strings"
 )
 
+const defaultDarwinPageSize = 4096
+
 // AvailableRAMBytes returns the currently free/available RAM in bytes,
 // computed as (free + inactive) pages × page size — inactive pages are
 // reclaimable without swapping, so they count as "available" the same way
@@ -31,7 +33,7 @@ func AvailableRAMBytes() (uint64, error) {
 		return 0, fmt.Errorf("storage: AvailableRAMBytes: vm_stat: %w", err)
 	}
 
-	pageSize := uint64(4096) // vm_stat's default; overridden below if stated explicitly
+	pageSize := uint64(defaultDarwinPageSize) // vm_stat's default; overridden below if stated explicitly
 	var freePages, inactivePages uint64
 
 	lines := strings.Split(string(out), "\n")
@@ -61,11 +63,13 @@ func AvailableRAMBytes() (uint64, error) {
 	return (freePages + inactivePages) * pageSize, nil
 }
 
+const minVMStatParts = 2
+
 // parseVMStatCount extracts the trailing numeric page count from a vm_stat
 // line of the form "Pages free:                              12345.".
 func parseVMStatCount(line string) uint64 {
 	parts := strings.Split(line, ":")
-	if len(parts) < 2 {
+	if len(parts) < minVMStatParts {
 		return 0
 	}
 	numeric := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(parts[1]), "."))

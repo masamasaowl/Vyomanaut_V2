@@ -35,11 +35,11 @@ const vettingGCProtocolID = p2p.ProtocolID("/vyomanaut/vetting-gc/1.0.0")
 // Frame 1 (ADR-036-extended): chunk_count(4) || chunk_ids(chunk_count×32) ||
 // request_ts_ms(8) || gc_auth_sig(64).
 const (
-	vettingGCLengthPrefixSize = 4
-	vettingGCChunkCountSize   = 4
-	vettingGCChunkIDSize      = 32
-	vettingGCRequestTsSize    = 8
-	vettingGCAuthSigSize      = 64
+	vettingGCLengthPrefixSize  = 4
+	vettingGCChunkCountSize    = 4
+	vettingGCChunkIDSize       = 32
+	vettingGCRequestTsSize     = 8
+	vettingGCAuthSigSize       = 64
 	vettingGCMaxChunksPerFrame = 10_000
 )
 
@@ -100,6 +100,8 @@ func (h *VettingGCHandler) HandleStream(s p2p.Stream) {
 		}
 	}
 }
+
+const bitsPerByte = 8
 
 // handleOneFrame processes exactly one VettingGCRequest/VettingGCResponse
 // pair. It returns false when the stream should end (clean EOF between
@@ -183,14 +185,14 @@ func (h *VettingGCHandler) handleOneFrame(s p2p.Stream) bool {
 	// §4.5); if only some failed, it is a partial, per-ID failure (0x01,
 	// targeted retry via failure_bitmap).
 	// failureBitmap size: ceil(chunk_count / 8) bytes (IC §4.5 Frame 2).
-	failureBitmap := make([]byte, (chunkCount+7)/8)
+	failureBitmap := make([]byte, (chunkCount+bitsPerByte-1)/bitsPerByte)
 	failCount := uint32(0)
 	for i := uint32(0); i < chunkCount; i++ {
 		var id [32]byte
 		copy(id[:], chunkIDsBytes[i*vettingGCChunkIDSize:(i+1)*vettingGCChunkIDSize])
 		if delErr := h.store.DeleteChunk(id); delErr != nil {
 			failCount++
-			failureBitmap[i/8] |= 1 << uint(i%8)
+			failureBitmap[i/bitsPerByte] |= 1 << uint(i%bitsPerByte)
 		}
 	}
 

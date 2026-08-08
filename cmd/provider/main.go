@@ -79,6 +79,11 @@ const daemonVersion = "v0.13.0"
 // not implemented in this session (see the --sim-count guard below).
 const defaultProviderListenPort = 4001
 
+const (
+	defaultSimBasePort = 4001
+	defaultSimASNCount = 5
+)
+
 // providerFlags holds every parsed cmd/provider/main.go flag (MVP §8.3).
 type providerFlags struct {
 	mode              string
@@ -103,14 +108,17 @@ func parseProviderFlags() providerFlags {
 	flag.IntVar(&f.declaredStorageGB, "declared-storage-gb", 0, "Required in normal mode.")
 	flag.StringVar(&f.relayAddrs, "relay-addrs", "", "Comma-separated relay node multiaddrs.")
 	flag.IntVar(&f.simCount, "sim-count", 0, "Simulation instances in a single process. 0 = normal mode.")
-	flag.IntVar(&f.simBasePort, "sim-base-port", 4001, "Base libp2p listen port for simulation instances.")
+	flag.IntVar(&f.simBasePort, "sim-base-port", defaultSimBasePort, "Base libp2p listen port for simulation instances.")
 	flag.StringVar(&f.simDataDir, "sim-data-dir", "/tmp/vyomanaut-sim", "Root directory for simulation instance data.")
-	flag.IntVar(&f.simASNCount, "sim-asn-count", 5, "Synthetic ASN count for simulation mode.")
+	flag.IntVar(&f.simASNCount, "sim-asn-count", defaultSimASNCount, "Synthetic ASN count for simulation mode.")
 	flag.Parse()
 	return f
 }
 
 // ── RAM check (Session 13.6.1, A1) ────────────────────────────────────────
+
+const bytesPerMiB = 1 << 20
+
 // Placed before main() deliberately: main() calls runRAMCheck at Step 3,
 // strictly before the ChunkStore/RecoverFromCrash sequence at Step 5 and
 // the writer-goroutine start that immediately follows it — keeping this
@@ -137,7 +145,7 @@ func runRAMCheck(declaredStorageGB int) (effectiveStorageGB int, constrained boo
 		log.Printf("[WARN] RAM check unavailable on this platform (%v); proceeding without a RAM guard", err)
 		return declaredStorageGB, false
 	}
-	availableMB := availableBytes / (1 << 20)
+	availableMB := availableBytes / bytesPerMiB
 
 	if availableMB >= requiredMB {
 		return declaredStorageGB, false
@@ -157,9 +165,12 @@ func safeDeclaredStorageGB(availableMB uint64) int {
 	// requiredMB = gb * ChunksPerGB * DHTRecordSizeBytes / (1<<20)
 	// => gb = availableMB * (1<<20) / (ChunksPerGB * DHTRecordSizeBytes)
 	denom := uint64(storage.ChunksPerGB) * uint64(storage.DHTRecordSizeBytes)
-	gb := (availableMB * (1 << 20)) / denom
+	gb := (availableMB * bytesPerMiB) / denom
 	return int(gb)
 }
+
+const privateDirPermissions = 0700
+const chunkWriteQueueSize = 64
 
 func main() {
 	flags := parseProviderFlags()
@@ -185,7 +196,7 @@ func main() {
 	if flags.microserviceURL == "" {
 		log.Fatalf("[STARTUP] FATAL: --microservice-url is required")
 	}
-	if err := os.MkdirAll(flags.dataDir, 0700); err != nil {
+	if err := os.MkdirAll(flags.dataDir, privateDirPermissions); err != nil {
 		log.Fatalf("[STARTUP] FATAL: create data-dir %s: %v", flags.dataDir, err)
 	}
 
@@ -258,7 +269,7 @@ func main() {
 	}
 
 	// ── Step 6: single writer goroutine (only caller of AppendChunk) ────
-	writeCh := make(chan chunkWriteRequest, 64)
+	writeCh := make(chan chunkWriteRequest, chunkWriteQueueSize)
 	go runChunkStoreWriter(store, writeCh)
 
 	// ── Step 7: NewHost ──────────────────────────────────────────────────
@@ -369,6 +380,7 @@ func runChunkStoreWriter(store storage.ChunkStore, writeCh <-chan chunkWriteRequ
 
 const ownerSeedFileName = "owner-seed.bin"
 const ownerSeedFileSize = 32 + 16 // masterSecret || ownerID
+const privateFilePermissions = 0600
 
 func loadOrGenerateOwnerSeed(dataDir string) (masterSecret [32]byte, ownerID [16]byte, err error) {
 	path := filepath.Join(dataDir, ownerSeedFileName)
@@ -396,7 +408,7 @@ func loadOrGenerateOwnerSeed(dataDir string) (masterSecret [32]byte, ownerID [16
 	out := make([]byte, 0, ownerSeedFileSize)
 	out = append(out, masterSecret[:]...)
 	out = append(out, ownerID[:]...)
-	if err := os.WriteFile(path, out, 0600); err != nil {
+	if err := os.WriteFile(path, out, privateFilePermissions); err != nil {
 		return masterSecret, ownerID, fmt.Errorf("cmd/provider: persist owner seed: %w", err)
 	}
 	return masterSecret, ownerID, nil
@@ -419,6 +431,8 @@ func deriveLocalProviderIDBytes(peerID p2p.PeerID) [16]byte {
 
 // ── microservice JWKS fetch ────────────────────────────────────────────
 
+const providerHTTPClientTimeout = 10 * time.Second
+
 type jwksKeyDTO struct {
 	Kty string `json:"kty"`
 	Crv string `json:"crv"`
@@ -439,7 +453,7 @@ func fetchMicroservicePublicKey(ctx context.Context, microserviceURL string) (ed
 	if err != nil {
 		return nil, fmt.Errorf("cmd/provider: build JWKS request: %w", err)
 	}
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{Timeout: providerHTTPClientTimeout}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("cmd/provider: fetch JWKS: %w", err)
