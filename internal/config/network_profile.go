@@ -120,6 +120,15 @@ type NetworkProfile struct {
 	// [REF: ADR-024, ADR-031]
 	ReleaseComputationInterval time.Duration
 
+	// ── Authenticated mutation-protocol freshness ────────────────────────────
+	// AuthRequestFreshnessWindow bounds the age of a signed request_ts_ms on
+	// the two provider-mutation protocols with irreversible/exfiltrating side
+	// effects: /vyomanaut/repair-download/1.0.0 (returns raw shard bytes) and
+	// /vyomanaut/vetting-gc/1.0.0 (permanently deletes chunks). A request
+	// older than this window is rejected even with a structurally valid
+	// signature. [REF: ADR-036]
+	AuthRequestFreshnessWindow time.Duration
+
 	// ── GC retry backoff ─────────────────────────────────────────────────────
 	// Fixed 3-step back-off schedule for vetting GC delivery retries. An array,
 	// not a slice: both canonical profiles always declare exactly 3 steps, and

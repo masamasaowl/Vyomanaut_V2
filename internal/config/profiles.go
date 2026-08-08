@@ -86,6 +86,9 @@ var ProductionProfile = NetworkProfile{
 	// 0 = calendar-driven (23rd of each month). [REF: ADR-024, ADR-031]
 	ReleaseComputationInterval: 0,
 
+	// ── Authenticated mutation-protocol freshness (ADR-036) ──────────────────
+	AuthRequestFreshnessWindow: 120 * time.Second,
+
 	// ── GC retry backoff (IC §4.5) ────────────────────────────────────────────
 	GCRetryBackoff: [3]time.Duration{
 		5 * time.Minute,
@@ -174,6 +177,11 @@ var DemoProfile = NetworkProfile{
 	// ── Release computation cycle ─────────────────────────────────────────────
 	// Non-zero = ticker-driven (every 2 minutes). [REF: ADR-024, ADR-031]
 	ReleaseComputationInterval: 2 * time.Minute,
+
+	// ── Authenticated mutation-protocol freshness (ADR-036) ──────────────────
+	// 120s in demo too — ADR-036 specifies the same value for both profiles
+	// (generous enough for clock skew + relay latency regardless of mode).
+	AuthRequestFreshnessWindow: 120 * time.Second,
 
 	// ── GC retry backoff (IC §4.5) ────────────────────────────────────────────
 	GCRetryBackoff: [3]time.Duration{
