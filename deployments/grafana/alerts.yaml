@@ -1,0 +1,183 @@
+# Grafana unified-alerting provisioning file (apiVersion 1 — the native
+# Grafana alert-rule provisioning schema; drop into Grafana's
+# provisioning/alerting/ directory, or point GF_PROVISIONING_PATH at
+# deployments/grafana/).
+#
+# Covers NFR-027's four mandatory alert thresholds (requirements.md §5.6;
+# architecture ref corrected to architecture.md §23 per A8). Rule names
+# match the frozen metric strings registered in internal/metrics/*.go
+# (OBS.1.1, OBS.1.2) exactly — NFR-046 makes a metric rename without a
+# simultaneous update here a breaking change, and OBS.4.1's
+# TestNoOrphanMetricName / TestGrafanaMetricNamesMatchRegistry CI checks
+# enforce that in both directions.
+#
+# [Decision — OBS.3.1, A10 option (b)] architecture.md §23 previously
+# listed a fifth alert ("Release multiplier 0.00 rate > 10% of active
+# providers") with no backing NFR-025/NFR-046 metric. This session's FILES
+# scope is Grafana YAML/JSON + the CI script only — it cannot add a new
+# metric to internal/metrics/*.go or wire a new call site in
+# internal/payment/release.go, so inventing an unfrozen metric name here
+# would itself become an orphan the moment OBS.4.1's CI gate runs. Deferred
+# to V3 and documented in architecture.md §26 instead; only four alerts
+# appear below, matching NFR-027 exactly.
+#
+# [Placeholder] datasourceUid values below are a placeholder
+# ("${VYOMANAUT_PROMETHEUS_DATASOURCE_UID}") rather than a fabricated
+# real one — the actual UID is assigned by whichever Grafana instance
+# provisions this file and isn't knowable from source alone. Substitute the
+# real datasource UID (or template it via Grafana's provisioning
+# variable substitution) before deploying. Every PromQL expression itself
+# is exact and deployable as written.
+
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: vyomanaut-nfr027-alerts
+    folder: Vyomanaut
+    interval: 1m
+    rules:
+      - uid: repair-queue-depth-high
+        title: RepairQueueDepthHigh
+        condition: threshold
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Repair queue depth exceeds 1,000 jobs"
+          description: >-
+            vyomanaut_repair_queue_depth is above the NFR-027 threshold.
+            Action (architecture.md §23): investigate provider departure
+            rate; check bandwidth budget.
+        data:
+          - refId: query
+            datasourceUid: "${VYOMANAUT_PROMETHEUS_DATASOURCE_UID}"
+            relativeTimeRange:
+              from: 600
+              to: 0
+            model:
+              refId: query
+              expr: vyomanaut_repair_queue_depth
+              instant: true
+          - refId: threshold
+            datasourceUid: "__expr__"
+            model:
+              refId: threshold
+              type: threshold
+              expression: query
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [1000]
+
+      - uid: audit-timeout-rate-high
+        title: AuditTimeoutRateHigh
+        condition: threshold
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Audit TIMEOUT rate exceeds 5% over the last hour"
+          description: >-
+            rate(vyomanaut_audit_results_total{result="TIMEOUT"}[1h]) /
+            rate(vyomanaut_audit_results_total[1h]) is above 0.05.
+            Action (architecture.md §23): check relay infrastructure; check
+            heartbeat address freshness.
+        data:
+          - refId: query
+            datasourceUid: "${VYOMANAUT_PROMETHEUS_DATASOURCE_UID}"
+            relativeTimeRange:
+              from: 3600
+              to: 0
+            model:
+              refId: query
+              expr: >-
+                rate(vyomanaut_audit_results_total{result="TIMEOUT"}[1h])
+                /
+                rate(vyomanaut_audit_results_total[1h])
+              instant: true
+          - refId: threshold
+            datasourceUid: "__expr__"
+            model:
+              refId: threshold
+              type: threshold
+              expression: query
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0.05]
+
+      - uid: content-hash-failure-detected
+        title: ContentHashFailureDetected
+        condition: threshold
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Content hash verification failure detected on a provider"
+          description: >-
+            increase(vyomanaut_daemon_content_hash_failures_total[7d]) is
+            above 0 for at least one provider. Action (architecture.md
+            §23): trigger accelerated re-audit of all that provider's
+            chunks.
+          note: >-
+            vyomanaut_daemon_content_hash_failures_total is registered on
+            the provider daemon's local-only status endpoint
+            (127.0.0.1:9091, OBS.2.1) — this rule assumes a separate
+            fleet-wide aggregation path (e.g. an OTel/Prometheus
+            remote_write agent per provider host) forwards it into the
+            same Prometheus this alert queries. That aggregation path is
+            not yet built (out of this session's FILES scope) — flagging
+            here rather than silently assuming it exists.
+        data:
+          - refId: query
+            datasourceUid: "${VYOMANAUT_PROMETHEUS_DATASOURCE_UID}"
+            relativeTimeRange:
+              from: 604800
+              to: 0
+            model:
+              refId: query
+              expr: increase(vyomanaut_daemon_content_hash_failures_total[7d])
+              instant: true
+          - refId: threshold
+            datasourceUid: "__expr__"
+            model:
+              refId: threshold
+              type: threshold
+              expression: query
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+
+      - uid: microservice-replicas-degraded
+        title: MicroserviceReplicasDegraded
+        condition: threshold
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Fewer than 3 healthy microservice replicas"
+          description: >-
+            vyomanaut_cluster_replica_count{state="healthy"} is below 3.
+            Action (architecture.md §23): investigate replica failure.
+        data:
+          - refId: query
+            datasourceUid: "${VYOMANAUT_PROMETHEUS_DATASOURCE_UID}"
+            relativeTimeRange:
+              from: 300
+              to: 0
+            model:
+              refId: query
+              expr: vyomanaut_cluster_replica_count{state="healthy"}
+              instant: true
+          - refId: threshold
+            datasourceUid: "__expr__"
+            model:
+              refId: threshold
+              type: threshold
+              expression: query
+              conditions:
+                - evaluator:
+                    type: lt
+                    params: [3]

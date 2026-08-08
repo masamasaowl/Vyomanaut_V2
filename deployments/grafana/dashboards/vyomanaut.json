@@ -1,0 +1,353 @@
+{
+  "id": null,
+  "uid": "vyomanaut-microservice-nfr025",
+  "title": "Vyomanaut V2 \u2014 Microservice (NFR-025)",
+  "description": "NFR-025's eight mandatory microservice metrics, exact names per internal/metrics/microservice.go (OBS.1.1/OBS.1.2). Provider-daemon metrics (NFR-026) are intentionally excluded \u2014 they are registered on each daemon's local-only status endpoint (127.0.0.1:9091, OBS.2.1) and this dashboard has no fleet-wide aggregation path to them yet (see alerts.yaml's ContentHashFailureDetected annotation for the same gap).",
+  "tags": [
+    "vyomanaut",
+    "nfr-025",
+    "microservice"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Audit challenges issued",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${VYOMANAUT_PROMETHEUS_DATASOURCE_UID}"
+      },
+      "description": "Challenge throughput (vyomanaut_audit_challenges_issued_total).",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(vyomanaut_audit_challenges_issued_total[5m])",
+          "legendFormat": ""
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 2,
+      "title": "Audit results by outcome",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${VYOMANAUT_PROMETHEUS_DATASOURCE_UID}"
+      },
+      "description": "Network reliability, split PASS/FAIL/TIMEOUT (vyomanaut_audit_results_total).",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(vyomanaut_audit_results_total[5m])",
+          "legendFormat": "{{result}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 3,
+      "title": "Audit TIMEOUT rate (1h)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${VYOMANAUT_PROMETHEUS_DATASOURCE_UID}"
+      },
+      "description": "NFR-027 AuditTimeoutRateHigh signal \u2014 alert fires above 0.05.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(vyomanaut_audit_results_total{result=\"TIMEOUT\"}[1h]) / rate(vyomanaut_audit_results_total[1h])",
+          "legendFormat": ""
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.05
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 4,
+      "title": "Provider score distribution",
+      "type": "heatmap",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${VYOMANAUT_PROMETHEUS_DATASOURCE_UID}"
+      },
+      "description": "Distribution of computed provider reliability scores (vyomanaut_scoring_provider_score).",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "vyomanaut_scoring_provider_score",
+          "legendFormat": ""
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 5,
+      "title": "Repair queue depth",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${VYOMANAUT_PROMETHEUS_DATASOURCE_UID}"
+      },
+      "description": "NFR-027 RepairQueueDepthHigh signal \u2014 alert fires above 1,000.",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 16
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "vyomanaut_repair_queue_depth",
+          "legendFormat": ""
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1000
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 6,
+      "title": "Repair jobs completed",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${VYOMANAUT_PROMETHEUS_DATASOURCE_UID}"
+      },
+      "description": "Repair throughput (vyomanaut_repair_jobs_completed_total).",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 16
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(vyomanaut_repair_jobs_completed_total[5m])",
+          "legendFormat": ""
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 7,
+      "title": "Escrow events by type",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${VYOMANAUT_PROMETHEUS_DATASOURCE_UID}"
+      },
+      "description": "Payment volume, split DEPOSIT/RELEASE/SEIZURE/REVERSAL (vyomanaut_payment_escrow_events_total).",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 16
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(vyomanaut_payment_escrow_events_total[1h])",
+          "legendFormat": "{{type}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 8,
+      "title": "Microservice replica count",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${VYOMANAUT_PROMETHEUS_DATASOURCE_UID}"
+      },
+      "description": "NFR-027 MicroserviceReplicasDegraded signal \u2014 alert fires when healthy < 3.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 24
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "vyomanaut_cluster_replica_count",
+          "legendFormat": "{{state}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 3
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 9,
+      "title": "Foreground DB read p99 (windowed)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${VYOMANAUT_PROMETHEUS_DATASOURCE_UID}"
+      },
+      "description": "Dashboard view of the ADR-033 cumulative histogram (vyomanaut_db_read_latency_seconds). NFR-028's actual background-throttle decision reads the process-local 60s sliding window (metrics.ForegroundReadP99Window in internal/metrics/window.go), not this PromQL quantile \u2014 the two will diverge under a very recent burst, by design.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 24
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.99, rate(vyomanaut_db_read_latency_seconds_bucket[1m]))",
+          "legendFormat": ""
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.04
+              },
+              {
+                "color": "red",
+                "value": 0.05
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {}
+    }
+  ],
+  "templating": {
+    "list": []
+  },
+  "annotations": {
+    "list": []
+  }
+}
