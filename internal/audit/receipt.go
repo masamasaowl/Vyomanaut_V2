@@ -46,6 +46,9 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/lib/pq"
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/masamasaowl/Vyomanaut_V2/internal/metrics"
 )
 
 // AuditResult is the terminal state of an audit receipt (IC §5.5).
@@ -406,7 +409,20 @@ WHERE receipt_id = $4 AND audit_result IS NULL AND abandoned_at IS NULL`
 	// under row-level security instead of surfacing a clear application
 	// error — RLS enforces the same boundary independently at the database
 	// engine level, so this is defense in depth, not the only guard.
+	//
+	// [Decision — OBS.1.2, ADR-033] internal/audit issues no SELECT queries
+	// today — every DB round trip in this file is a transactional write
+	// (see WriteReceiptPhase1's two INSERTs and WriteReceiptRecordResponse's
+	// UPDATE above). This UPDATE is nonetheless the ADR-033 "foreground DB
+	// read" instrumentation point: it is the one call guaranteed to execute
+	// exactly once for every terminal audit result (PASS, FAIL, or TIMEOUT),
+	// and its round-trip latency reflects the same connection-pool/DB
+	// contention NFR-028's throttle is watching for — the metric name
+	// (vyomanaut_db_read_latency_seconds) describes the throttle signal's
+	// origin in ARCH §23, not a restriction to SELECT statements.
+	start := time.Now()
 	res, err := db.ExecContext(ctx, updatePhase2, resultStr, serviceSig[:], serviceTS, receiptID)
+	metrics.ForegroundReadLatency.Observe(time.Since(start))
 	if err != nil {
 		return fmt.Errorf("audit.WriteReceiptPhase2: update: %w", err)
 	}
@@ -418,5 +434,9 @@ WHERE receipt_id = $4 AND audit_result IS NULL AND abandoned_at IS NULL`
 	if rowsAffected == 0 {
 		return ErrReceiptAlreadyFinal
 	}
+	// Only a genuinely new terminal result is counted — ErrReceiptAlreadyFinal
+	// above (an idempotent retry hitting an already-final row) must not
+	// double-count the same audit result a second time.
+	metrics.AuditResultsTotal.With(prometheus.Labels{"result": resultStr}).Inc()
 	return nil
 }

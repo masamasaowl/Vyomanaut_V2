@@ -17,6 +17,9 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/lib/pq"
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/masamasaowl/Vyomanaut_V2/internal/metrics"
 )
 
 // EscrowEventType mirrors the escrow_event_type DB enum (DM §4.8).
@@ -76,6 +79,11 @@ VALUES ($1, $2, $3, $4, $5)`
 		}
 		return fmt.Errorf("payment.InsertEscrowEvent: insert: %w", err)
 	}
+	// Only a genuinely new event is counted — ErrDuplicateIdempotencyKey
+	// above (an idempotent retry / duplicate webhook delivery) must not
+	// double-count the same escrow event a second time (NFR-025, ARCH §23:
+	// "Payment volume").
+	metrics.PaymentEscrowEventsTotal.With(prometheus.Labels{"type": string(eventType)}).Inc()
 	return nil
 }
 

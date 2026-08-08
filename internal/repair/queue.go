@@ -19,6 +19,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/masamasaowl/Vyomanaut_V2/internal/config"
+	"github.com/masamasaowl/Vyomanaut_V2/internal/metrics"
 )
 
 // Priority mirrors the repair_priority DB enum (DM §4.10) — all three values,
@@ -144,6 +145,31 @@ func triggerTypeFromDB(s string) TriggerType {
 	}
 }
 
+// refreshRepairQueueDepthGauge re-derives the current count of QUEUED
+// repair_jobs and publishes it to metrics.RepairQueueDepth (NFR-025,
+// ARCH §23 — the NFR-027 alert fires when this exceeds 1,000). Called after
+// every successful EnqueueJob and DequeueNextJob so the exported gauge
+// never needs a separate polling loop to stay current.
+//
+// [Decision — OBS.1.2] A failed depth query is deliberately swallowed
+// rather than surfaced: this is a best-effort observability refresh, not
+// part of either caller's correctness contract. EnqueueJob and
+// DequeueNextJob have already committed their own transaction by the time
+// this runs, so failing the caller over a COUNT(*) that couldn't complete
+// would turn a successful repair-queue operation into a reported failure.
+// The gauge simply keeps its last published value until the next
+// successful call — the same "no signal is not an error" posture
+// Phase 12.1's computeRTO fallback and background_loops.go's
+// dbReadP99Prober both already take.
+func refreshRepairQueueDepthGauge(ctx context.Context, db *sql.DB) {
+	const countQueued = `SELECT COUNT(*) FROM repair_jobs WHERE status = 'QUEUED'`
+	var depth int
+	if err := db.QueryRowContext(ctx, countQueued).Scan(&depth); err != nil {
+		return
+	}
+	metrics.RepairQueueDepth.Set(float64(depth))
+}
+
 // EnqueueJob inserts a repair job into repair_jobs. Priority is derived
 // automatically and completely from triggerType (DM §4.10
 // repair_jobs_priority_matches_trigger CHECK) via priorityForTrigger.
@@ -219,6 +245,7 @@ VALUES ($1, $2, $3, $4, $5, $6)`
 	if err != nil {
 		return fmt.Errorf("repair.EnqueueJob: insert: %w", err)
 	}
+	refreshRepairQueueDepthGauge(ctx, db)
 	return nil
 }
 
@@ -290,6 +317,7 @@ WHERE job_id = $1`
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("repair.DequeueNextJob: commit: %w", err)
 	}
+	refreshRepairQueueDepthGauge(ctx, db)
 
 	var chunkID [32]byte
 	copy(chunkID[:], chunkIDBytes)
